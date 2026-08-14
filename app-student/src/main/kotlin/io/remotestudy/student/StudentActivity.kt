@@ -87,7 +87,7 @@ class StudentActivity : ComponentActivity() {
     private var session = SessionStateMachine()
     private val sessionId = UUID.randomUUID().toString()
     private val handler = Handler(Looper.getMainLooper())
-    private val tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 70)
+    private val tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 45)
     private val fileExecutor = Executors.newSingleThreadExecutor()
     private var activityMonitor = StudyActivityMonitor()
     private var captureIntervalMs = DEFAULT_CAPTURE_INTERVAL_MS
@@ -361,7 +361,7 @@ class StudentActivity : ComponentActivity() {
                 eventLabel.text = "공부를 멈췄습니다 · 종료는 접힌 메뉴에서 선택하세요"
             }
             VoiceCommand.DAD_MESSAGE -> {
-                tone.startTone(ToneGenerator.TONE_PROP_ACK, 140)
+                tone.startTone(ToneGenerator.TONE_PROP_ACK, 55)
                 eventLabel.text = "메시지를 말씀해 주세요"
             }
         }
@@ -393,7 +393,7 @@ class StudentActivity : ComponentActivity() {
                 sentAtEpochMs = System.currentTimeMillis(),
             ),
         )
-        tone.startTone(ToneGenerator.TONE_PROP_BEEP2, 320)
+        tone.startTone(ToneGenerator.TONE_PROP_BEEP2, 85)
         eventLabel.text = if (queued) {
             "선생님께 메시지를 보냈습니다: ${clean.take(40)}"
         } else {
@@ -449,9 +449,9 @@ class StudentActivity : ComponentActivity() {
 
             is TransportEvent.PairingRequested -> {
                 pendingEndpointId = event.endpointId
-                pairingDigits.text = event.authenticationDigits
-                pairingPanel.visibility = View.VISIBLE
-                setConnectionState("연결 숫자 확인", COLOR_WARNING)
+                pairingPanel.visibility = View.GONE
+                setConnectionState("자동 연결 중", COLOR_WARNING)
+                transport.approve(event.endpointId)
             }
 
             is TransportEvent.Connected -> {
@@ -672,7 +672,7 @@ class StudentActivity : ComponentActivity() {
                         listenReplyButton.visibility = View.VISIBLE
                     }
                     eventLabel.text = "선생님 음성 답변이 도착했습니다"
-                    tone.startTone(ToneGenerator.TONE_PROP_ACK, 140)
+                    tone.startTone(ToneGenerator.TONE_PROP_ACK, 55)
                     handler.postDelayed({ playLatestTeacherReply() }, 220L)
                 }.onFailure {
                     if (!isDestroyed) {
@@ -730,6 +730,8 @@ class StudentActivity : ComponentActivity() {
             eventLabel.text = "한국어 음성 읽기를 사용할 수 없습니다"
             return
         }
+        textToSpeech.setSpeechRate(0.82f)
+        textToSpeech.setPitch(1.0f)
         textToSpeech.setOnUtteranceProgressListener(
             object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) = Unit
@@ -767,7 +769,7 @@ class StudentActivity : ComponentActivity() {
             return
         }
         val playbackId = beginReplyPlayback()
-        tone.startTone(ToneGenerator.TONE_PROP_ACK, 140)
+        tone.startTone(ToneGenerator.TONE_PROP_ACK, 55)
         eventLabel.text = "선생님 답변을 읽습니다"
         handler.postDelayed({
             if (activityDestroyed || activeReplyPlaybackId != playbackId) return@postDelayed
@@ -862,7 +864,7 @@ class StudentActivity : ComponentActivity() {
         resumeVoiceCommandsAfterMessage()
         pendingOutgoingVoiceMessages[messageId] = recorded
         val sent = trySendPendingVoiceMessage(messageId, recorded)
-        tone.startTone(ToneGenerator.TONE_PROP_BEEP2, 320)
+        tone.startTone(ToneGenerator.TONE_PROP_BEEP2, 85)
         eventLabel.text = when {
             sent && automaticallyStopped -> "60초 음성 메시지 전송 중입니다"
             sent -> "음성 메시지 전송 중입니다"
@@ -1160,10 +1162,8 @@ class StudentActivity : ComponentActivity() {
                         fileExecutor.execute { sentFile.delete() }
                     }
                 }
-                eventLabel.text = if (key.transfer.kind == AssetKind.THUMBNAIL) {
-                    "학습 썸네일을 선생님께 전송했습니다"
-                } else {
-                    "고화질 책 영역을 선생님께 전송했습니다"
+                if (key.transfer.kind != AssetKind.THUMBNAIL) {
+                    eventLabel.text = "고화질 책 영역을 선생님께 전송했습니다"
                 }
             }
 
@@ -1307,7 +1307,7 @@ class StudentActivity : ComponentActivity() {
                 latestProblemEventId = null
             }
         }, UNDO_WINDOW_MS)
-        tone.startTone(ToneGenerator.TONE_PROP_ACK, 120)
+        tone.startTone(ToneGenerator.TONE_PROP_ACK, 55)
         send(
             StudyMessage.ProblemCompleted(
                 messageId = UUID.randomUUID().toString(),
@@ -1358,7 +1358,7 @@ class StudentActivity : ComponentActivity() {
             (lastRenderedStatus == SessionStatus.READY ||
                 lastRenderedStatus == SessionStatus.START_COUNTDOWN)
         if (phaseChanged || meditationStarted) {
-            tone.startTone(ToneGenerator.TONE_PROP_BEEP2, 400)
+            tone.startTone(ToneGenerator.TONE_PROP_BEEP2, 100)
             vibrate(250)
         }
         lastRenderedPhase = snapshot.phase
@@ -1595,7 +1595,7 @@ class StudentActivity : ComponentActivity() {
 
     private fun actionButton(label: String, color: Int) = Button(this).apply {
         text = label
-        textSize = 15f
+        textSize = 12f
         setTextColor(
             ColorStateList(
                 arrayOf(intArrayOf(-android.R.attr.state_enabled), intArrayOf()),

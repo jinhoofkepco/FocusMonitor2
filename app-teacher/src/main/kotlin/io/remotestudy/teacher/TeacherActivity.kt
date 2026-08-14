@@ -81,6 +81,7 @@ class TeacherActivity : ComponentActivity() {
     private lateinit var timerLabel: TextView
     private lateinit var problemLabel: TextView
     private lateinit var eventLabel: TextView
+    private lateinit var conversationButton: Button
     private lateinit var pairingPanel: LinearLayout
     private lateinit var pairingDigits: TextView
     private lateinit var approveButton: Button
@@ -112,6 +113,7 @@ class TeacherActivity : ComponentActivity() {
     private val outgoingVoiceRetryCountByUserMessageId = mutableMapOf<String, Int>()
     private val outgoingVoiceRetryRunnableByUserMessageId = mutableMapOf<String, Runnable>()
     private val recentThumbnails = ArrayDeque<RecentThumbnail>()
+    private val conversationHistory = ArrayDeque<ConversationEntry>()
     private val pendingRoiAssetIds = mutableSetOf<String>()
     private var roiDialog: AlertDialog? = null
     private var fullScreenPhotoDialog: Dialog? = null
@@ -231,9 +233,9 @@ class TeacherActivity : ComponentActivity() {
             is TransportEvent.EndpointLost -> Unit
             is TransportEvent.PairingRequested -> {
                 pendingEndpointId = event.endpointId
-                pairingDigits.text = event.authenticationDigits
-                pairingPanel.visibility = View.VISIBLE
-                setConnectionState("연결 승인 필요", COLOR_WARNING)
+                pairingPanel.visibility = View.GONE
+                setConnectionState("자동 연결 중", COLOR_WARNING)
+                transport.approve(event.endpointId)
             }
 
             is TransportEvent.Connected -> {
@@ -367,7 +369,6 @@ class TeacherActivity : ComponentActivity() {
             AssetKind.THUMBNAIL -> {
                 latestThumbnail.setImageBitmap(bitmap)
                 latestThumbnail.rotation = 180f
-                thumbnailLabel.text = "최근 사진 · 눌러서 책 영역 고화질 보기"
                 latestThumbnail.contentDescription =
                     "가장 최근 학습 썸네일, 촬영 ${formatCapturedAt(metadata.capturedAtEpochMs)}, 고화질 요청"
                 latestThumbnail.setOnClickListener { requestBookRoi(metadata.assetId) }
@@ -469,6 +470,78 @@ class TeacherActivity : ComponentActivity() {
     private fun showTextMessage(message: StudyMessage.TextMessage) {
         val sender = if (message.sender == PeerRole.STUDENT) "학생" else "선생님"
         eventLabel.text = "$sender 텍스트: ${message.text.take(MAX_STATUS_TEXT_CHARS)}"
+        addConversation(sender, message.text, message.sentAtEpochMs)
+    }
+
+    private fun addConversation(
+        sender: String,
+        content: String,
+        sentAtEpochMs: Long,
+        voiceFile: File? = null,
+    ) {
+        conversationHistory.addLast(
+            ConversationEntry(sender, content, sentAtEpochMs, voiceFile),
+        )
+        while (conversationHistory.size > MAX_CONVERSATION_ENTRIES) {
+            conversationHistory.removeFirst()
+        }
+        if (::conversationButton.isInitialized) {
+            conversationButton.text = "대화 ${conversationHistory.size}"
+            conversationButton.contentDescription = "대화 기록 ${conversationHistory.size}개 열기"
+        }
+    }
+
+    private fun showConversationHistory() {
+        val list = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+        }
+        if (conversationHistory.isEmpty()) {
+            list.addView(TextView(this).apply {
+                text = "아직 주고받은 메시지가 없습니다"
+                textSize = 14f
+                setTextColor(COLOR_MUTED)
+                gravity = Gravity.CENTER
+                setPadding(0, dp(24), 0, dp(24))
+            })
+        } else {
+            conversationHistory.forEach { entry ->
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(dp(10), dp(8), dp(10), dp(8))
+                    background = rounded(
+                        if (entry.sender == "선생님") 0xFFEAF0FF.toInt() else 0xFFEAF8F2.toInt(),
+                        12f,
+                    )
+                }
+                val whenText = DateFormat.getTimeInstance(DateFormat.SHORT)
+                    .format(Date(entry.sentAtEpochMs))
+                row.addView(TextView(this).apply {
+                    text = "$whenText  ${entry.sender}\n${entry.content}"
+                    textSize = 14f
+                    setTextColor(COLOR_TEXT)
+                }, LinearLayout.LayoutParams(0, -2, 1f))
+                entry.voiceFile?.takeIf(File::isFile)?.let { file ->
+                    row.addView(actionButton("듣기", COLOR_SUCCESS).apply {
+                        setOnClickListener {
+                            voicePlayer.play(file) { result ->
+                                result.onFailure { error ->
+                                    eventLabel.text = "음성 재생 실패: ${error.message.orEmpty()}"
+                                }
+                            }
+                        }
+                    }, LinearLayout.LayoutParams(dp(64), dp(38)).apply { marginStart = dp(8) })
+                }
+                list.addView(row, matchWrap(bottom = 7))
+            }
+        }
+        val scroll = ScrollView(this).apply { addView(list) }
+        AlertDialog.Builder(this)
+            .setTitle("대화 기록")
+            .setView(scroll)
+            .setPositiveButton("닫기", null)
+            .show()
     }
 
     private fun registerVoiceTransfer(message: StudyMessage.VoiceTransfer) {
@@ -521,6 +594,12 @@ class TeacherActivity : ComponentActivity() {
         studentVoiceButton.isEnabled = true
         studentVoiceButton.text = "학생 음성 듣기"
         eventLabel.text = "학생 음성 메시지 도착 · ${formatVoiceDuration(metadata.durationMs)}"
+        addConversation(
+            sender = "학생",
+            content = "음성 메시지 · ${formatVoiceDuration(metadata.durationMs)}",
+            sentAtEpochMs = metadata.sentAtEpochMs,
+            voiceFile = file,
+        )
         notifyStudentVoiceMessage(metadata.durationMs)
     }
 
@@ -556,6 +635,7 @@ class TeacherActivity : ComponentActivity() {
                             SystemClock.elapsedRealtime(),
                         )
                         if (queued) {
+                            addConversation("선생님", text, System.currentTimeMillis())
                             eventLabel.text = if (transportConnected) {
                                 "텍스트 답장을 전송했습니다"
                             } else {
@@ -615,6 +695,11 @@ class TeacherActivity : ComponentActivity() {
             file = message.file,
             sentAtEpochMs = System.currentTimeMillis(),
             durationMs = message.durationMs.coerceIn(1, MAX_VOICE_DURATION_MS),
+        )
+        addConversation(
+            sender = "선생님",
+            content = "음성 메시지 · ${formatVoiceDuration(message.durationMs)}",
+            sentAtEpochMs = System.currentTimeMillis(),
         )
         flushPendingVoiceMessages()
         eventLabel.text = if (transportConnected) {
@@ -962,7 +1047,6 @@ class TeacherActivity : ComponentActivity() {
             setPadding(dp(14), dp(8), dp(14), dp(8))
         }
         setConnectionState("연결 준비 중", COLOR_MUTED)
-        root.addView(connectionPill, wrapWrap(bottom = 8))
 
         val statusCard = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -972,6 +1056,22 @@ class TeacherActivity : ComponentActivity() {
             elevation = dp(2).toFloat()
         }
         val statusText = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val statusHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        statusHeader.addView(connectionPill, LinearLayout.LayoutParams(-2, -2))
+        statusHeader.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+        conversationButton = actionButton("대화", COLOR_MUTED).apply {
+            textSize = 11f
+            minWidth = 0
+            setPadding(dp(10), 0, dp(10), 0)
+            setOnClickListener { showConversationHistory() }
+        }
+        statusHeader.addView(
+            conversationButton,
+            LinearLayout.LayoutParams(dp(62), dp(34)).apply { marginStart = dp(6) },
+        )
         phaseLabel = TextView(this).apply {
             text = "준비 전"
             textSize = 16f
@@ -995,7 +1095,8 @@ class TeacherActivity : ComponentActivity() {
             setTextColor(COLOR_MUTED)
             maxLines = 2
         }
-        statusText.addView(phaseLabel)
+        statusText.addView(statusHeader)
+        statusText.addView(phaseLabel, matchWrap(top = 5))
         statusText.addView(problemLabel, matchWrap(top = 3))
         statusText.addView(eventLabel, matchWrap(top = 4))
         statusCard.addView(statusText, LinearLayout.LayoutParams(0, -2, 1f))
@@ -1032,10 +1133,11 @@ class TeacherActivity : ComponentActivity() {
             addView(thumbnailStrip, FrameLayout.LayoutParams(-2, dp(148)))
         }
         thumbnailLabel = TextView(this).apply {
-            text = "명상·공부 시간에 최근 썸네일이 표시됩니다"
+            text = ""
             textSize = 13f
             setTextColor(COLOR_MUTED)
             gravity = Gravity.CENTER
+            visibility = View.GONE
         }
         mediaCard.addView(mainPhotoFrame, LinearLayout.LayoutParams(-1, 0, 1f))
         mediaCard.addView(thumbnailScroller, LinearLayout.LayoutParams(-1, dp(148)).apply {
@@ -1261,7 +1363,7 @@ class TeacherActivity : ComponentActivity() {
 
     private fun actionButton(label: String, color: Int) = Button(this).apply {
         text = label
-        textSize = 16f
+        textSize = 12f
         setTextColor(
             ColorStateList(
                 arrayOf(intArrayOf(-android.R.attr.state_enabled), intArrayOf()),
@@ -1328,6 +1430,13 @@ class TeacherActivity : ComponentActivity() {
         val bitmap: Bitmap,
     )
 
+    private data class ConversationEntry(
+        val sender: String,
+        val content: String,
+        val sentAtEpochMs: Long,
+        val voiceFile: File? = null,
+    )
+
     private data class TeacherStudySettings(
         val meditationMinutes: Int = 5,
         val studyMinutes: Int = 40,
@@ -1375,6 +1484,7 @@ class TeacherActivity : ComponentActivity() {
         private const val NOTIFICATION_STUDENT_VOICE = 104
         private const val MAX_RECEIVED_ASSETS = 40
         private const val MAX_RECENT_THUMBNAILS = 12
+        private const val MAX_CONVERSATION_ENTRIES = 100
         private const val MAX_RECEIVED_VOICE_MESSAGES = 20
         private const val MAX_STORED_OUTGOING_VOICE_MESSAGES = 20
         private const val MAX_PENDING_INCOMING_FILES = 64
