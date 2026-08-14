@@ -12,6 +12,20 @@ class SessionStateMachineTest {
     )
 
     @Test
+    fun `zero meditation advances directly to study`() {
+        val machine = SessionStateMachine(
+            schedule = StudySchedule(0L, 20_000L, 10_000L),
+        )
+
+        machine.dispatch(StartRequested("start", StartOrigin.STUDENT, 1_000L))
+        val snapshot = machine.dispatch(Tick(1_000L))
+
+        assertEquals(SessionStatus.RUNNING, snapshot.status)
+        assertEquals(SessionPhase.STUDY, snapshot.phase)
+        assertEquals(20_000L, snapshot.phaseRemainingMs)
+    }
+
+    @Test
     fun `default schedule is five forty fifteen minutes`() {
         val schedule = StudySchedule()
 

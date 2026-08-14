@@ -63,6 +63,12 @@ class KoreanVoiceCommandPhraseMatcherTest {
     }
 
     @Test
+    fun `matches the dad message wake phrase`() {
+        assertEquals(VoiceCommand.DAD_MESSAGE, matcher.match("아빠"))
+        assertNull(matcher.match("우리 아빠"))
+    }
+
+    @Test
     fun `normalizes unicode whitespace punctuation and case`() {
         assertEquals(VoiceCommand.STUDY_START, matcher.match("  공부, 시작해!!  "))
         assertEquals(VoiceCommand.UNDO, matcher.match("취소…"))

@@ -326,6 +326,13 @@ class BookCameraView @JvmOverloads constructor(
         runOnMain { guideView.editingEnabled = enabled }
     }
 
+    fun setGuideVisible(visible: Boolean) {
+        runOnMain {
+            guideView.visibility = if (visible) View.VISIBLE else View.GONE
+            hint.visibility = if (visible) View.VISIBLE else View.GONE
+        }
+    }
+
     fun setBookRegion(region: BookRegion) {
         runOnMain {
             bookRegion = region

@@ -30,6 +30,7 @@ class KoreanVoiceCommandPhraseMatcher {
         val NON_COMMAND_CHARACTERS = Regex("[\\s\\p{P}\\p{S}]+")
 
         val COMMAND_PATTERNS = listOf(
+            VoiceCommand.DAD_MESSAGE to Regex("^아빠$"),
             VoiceCommand.STUDY_START to Regex(
                 "^공부(를)?시작(해|해줘|해주세요|하자|할게|합니다|할까요)?$",
             ),

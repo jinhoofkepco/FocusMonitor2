@@ -26,7 +26,7 @@ data class StudySchedule(
     val breakDurationMs: Long = DEFAULT_BREAK_DURATION_MS,
 ) {
     init {
-        require(meditationDurationMs > 0) { "meditationDurationMs must be positive" }
+        require(meditationDurationMs >= 0) { "meditationDurationMs must not be negative" }
         require(studyDurationMs > 0) { "studyDurationMs must be positive" }
         require(breakDurationMs > 0) { "breakDurationMs must be positive" }
     }

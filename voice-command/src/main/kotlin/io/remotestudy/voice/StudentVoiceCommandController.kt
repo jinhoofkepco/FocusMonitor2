@@ -47,6 +47,7 @@ class StudentVoiceCommandController @JvmOverloads constructor(
     private var listening = false
     private var recognitionCycle = 0L
     private var consecutiveErrors = 0
+    private var awaitingMessage = false
 
     fun start() = onMainThread {
         if (destroyed) {
@@ -64,6 +65,7 @@ class StudentVoiceCommandController @JvmOverloads constructor(
         requestedActive = true
         consecutiveErrors = 0
         lastCommandAtMillis.clear()
+        awaitingMessage = false
         cancelScheduledRestart()
 
         if (!hasRecordAudioPermission()) {
@@ -83,6 +85,7 @@ class StudentVoiceCommandController @JvmOverloads constructor(
         if (destroyed) return@onMainThread
 
         requestedActive = false
+        awaitingMessage = false
         consecutiveErrors = 0
         cancelScheduledRestart()
         invalidateCurrentCycle()
@@ -99,6 +102,7 @@ class StudentVoiceCommandController @JvmOverloads constructor(
         if (destroyed) return@onMainThread
 
         requestedActive = false
+        awaitingMessage = false
         destroyed = true
         cancelScheduledRestart()
         invalidateCurrentCycle()
@@ -237,11 +241,36 @@ class StudentVoiceCommandController @JvmOverloads constructor(
             val hypotheses = results
                 ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 .orEmpty()
-            phraseMatcher.matchFirst(hypotheses)?.let(::emitIfNotDebounced)
+            val primary = hypotheses.firstOrNull { it.isNotBlank() }
+            if (awaitingMessage) {
+                if (primary != null) {
+                    awaitingMessage = false
+                    listener.onMessageRecognized(primary.trim())
+                }
+            } else {
+                val dadPhrase = primary?.trim()?.takeIf { it.startsWith("아빠") }?.indexOf("아빠") ?: -1
+                if (dadPhrase == 0) {
+                    emitIfNotDebounced(VoiceCommand.DAD_MESSAGE)
+                    val remainder = primary.orEmpty().substring(dadPhrase + 2).trim()
+                    if (remainder.isNotEmpty()) {
+                        awaitingMessage = false
+                        listener.onMessageRecognized(remainder)
+                    }
+                } else {
+                    phraseMatcher.matchFirst(hypotheses)?.let(::emitIfNotDebounced)
+                }
+            }
             scheduleRestart(BASE_RESTART_DELAY_MILLIS)
         }
 
-        override fun onPartialResults(partialResults: Bundle?) = Unit
+        override fun onPartialResults(partialResults: Bundle?) = handleCycle(cycle) {
+            val hypotheses = partialResults
+                ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                .orEmpty()
+            phraseMatcher.matchFirst(hypotheses)
+                ?.takeUnless { it == VoiceCommand.DAD_MESSAGE }
+                ?.let(::emitIfNotDebounced)
+        }
 
         override fun onEvent(eventType: Int, params: Bundle?) = Unit
     }
@@ -330,6 +359,7 @@ class StudentVoiceCommandController @JvmOverloads constructor(
         val previous = lastCommandAtMillis[command]
         if (previous == null || now - previous >= COMMAND_DEBOUNCE_MILLIS) {
             lastCommandAtMillis[command] = now
+            if (command == VoiceCommand.DAD_MESSAGE) awaitingMessage = true
             listener.onCommand(command)
         }
     }
@@ -383,7 +413,7 @@ class StudentVoiceCommandController @JvmOverloads constructor(
         putExtra(RecognizerIntent.EXTRA_LANGUAGE, KOREAN_LOCALE)
         putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, KOREAN_LOCALE)
         putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, MAX_RECOGNITION_RESULTS)
-        putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
+        putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
         putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
     }
 

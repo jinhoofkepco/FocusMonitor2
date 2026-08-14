@@ -123,7 +123,7 @@ class StudentActivity : ComponentActivity() {
     private var voiceStarted = false
     private var appInForeground = false
     private var activityDestroyed = false
-    private var calibrated = false
+    private var calibrated = true
     private var revision = 0L
     private var lastPublishedKey: String? = null
     private var lastRenderedPhase: SessionPhase? = null
@@ -186,6 +186,10 @@ class StudentActivity : ComponentActivity() {
             context = this,
             listener = object : StudentVoiceCommandListener {
                 override fun onCommand(command: VoiceCommand) = handleVoiceCommand(command)
+
+                override fun onMessageRecognized(text: String) {
+                    sendRecognizedMessage(text)
+                }
 
                 override fun onStatus(status: VoiceCommandStatus) = Unit
 
@@ -318,12 +322,14 @@ class StudentActivity : ComponentActivity() {
         cameraView.bind(this) { result ->
             result.onSuccess {
                 cameraReady = true
+                calibrated = true
+                cameraView.armPresenceBaseline()
                 cameraBindRetryCount = 0
                 calibrateButton.isEnabled = true
             }.onFailure {
                 cameraBound = false
                 cameraReady = false
-                calibrated = false
+                calibrated = true
                 calibrateButton.isEnabled = false
                 eventLabel.text = "카메라를 열 수 없습니다: ${it.message.orEmpty()}"
                 if (cameraBindRetryCount < MAX_CAMERA_BIND_RETRIES) {
@@ -354,6 +360,44 @@ class StudentActivity : ComponentActivity() {
                 if (session.snapshot().status == SessionStatus.RUNNING) togglePause()
                 eventLabel.text = "공부를 멈췄습니다 · 종료는 접힌 메뉴에서 선택하세요"
             }
+            VoiceCommand.DAD_MESSAGE -> {
+                tone.startTone(ToneGenerator.TONE_PROP_ACK, 140)
+                eventLabel.text = "메시지를 말씀해 주세요"
+            }
+        }
+    }
+
+    private fun sendRecognizedMessage(text: String) {
+        val clean = text.trim()
+        if (clean.isEmpty()) return
+        if (clean.replace(" ", "") in setOf("녹음", "음성", "음성메시지")) {
+            startVoiceMessageRecording()
+            val recordingId = activeOutgoingVoiceMessageId
+            if (recordingId != null) {
+                eventLabel.text = "음성 메시지를 말씀해 주세요 · 12초 뒤 자동 전송"
+                handler.postDelayed({
+                    if (activeOutgoingVoiceMessageId == recordingId &&
+                        voiceMessageRecorder.state == VoiceMessageRecorderState.RECORDING
+                    ) {
+                        stopVoiceMessageRecording()
+                    }
+                }, VOICE_DICTATION_DURATION_MS)
+            }
+            return
+        }
+        val queued = send(
+            StudyMessage.TextMessage(
+                messageId = UUID.randomUUID().toString(),
+                sender = PeerRole.STUDENT,
+                text = clean,
+                sentAtEpochMs = System.currentTimeMillis(),
+            ),
+        )
+        tone.startTone(ToneGenerator.TONE_PROP_BEEP2, 320)
+        eventLabel.text = if (queued) {
+            "선생님께 메시지를 보냈습니다: ${clean.take(40)}"
+        } else {
+            "메시지를 보관했습니다 · 연결되면 다시 전송합니다"
         }
     }
 
@@ -463,8 +507,8 @@ class StudentActivity : ComponentActivity() {
         } ?: return
         when (message) {
             is StudyMessage.StartRequest -> {
-                if (!cameraReady || !calibrated) {
-                    eventLabel.text = "선생님이 시작을 요청했습니다 · 먼저 배치를 완료하세요"
+                if (!cameraReady) {
+                    eventLabel.text = "카메라 준비 뒤 시작할 수 있습니다"
                     return
                 }
                 val snapshot = session.dispatch(
@@ -483,6 +527,7 @@ class StudentActivity : ComponentActivity() {
             is StudyMessage.TextMessage -> receiveTeacherText(message)
             is StudyMessage.VoiceTransfer -> registerVoiceTransfer(message)
             is StudyMessage.StudySettings -> applyStudySettings(message)
+            is StudyMessage.BookRegionSettings -> applyBookRegionSettings(message)
             is StudyMessage.AssetTransfer -> {
                 voiceTransferByPayloadId.remove(message.payloadId)
                 earlyVoiceFileUriByPayloadId.remove(message.payloadId)
@@ -497,6 +542,18 @@ class StudentActivity : ComponentActivity() {
             is StudyMessage.ProblemCompleted,
             is StudyMessage.SessionSnapshot,
             -> Unit
+        }
+    }
+
+    private fun applyBookRegionSettings(settings: StudyMessage.BookRegionSettings) {
+        runCatching {
+            BookRegion(settings.left, settings.top, settings.right, settings.bottom)
+        }.onSuccess { region ->
+            cameraView.setBookRegion(region)
+            cameraView.armPresenceBaseline()
+            eventLabel.text = "선생님이 책 영역을 변경했습니다"
+        }.onFailure {
+            eventLabel.text = "책 영역 설정을 적용할 수 없습니다"
         }
     }
 
@@ -615,6 +672,8 @@ class StudentActivity : ComponentActivity() {
                         listenReplyButton.visibility = View.VISIBLE
                     }
                     eventLabel.text = "선생님 음성 답변이 도착했습니다"
+                    tone.startTone(ToneGenerator.TONE_PROP_ACK, 140)
+                    handler.postDelayed({ playLatestTeacherReply() }, 220L)
                 }.onFailure {
                     if (!isDestroyed) {
                         eventLabel.text = "음성 답변 저장 실패: ${it.message.orEmpty()}"
@@ -708,18 +767,21 @@ class StudentActivity : ComponentActivity() {
             return
         }
         val playbackId = beginReplyPlayback()
-        val result = textToSpeech.speak(
-            text,
-            TextToSpeech.QUEUE_FLUSH,
-            null,
-            playbackId,
-        )
-        if (result != TextToSpeech.SUCCESS) finishReplyPlayback(playbackId)
-        eventLabel.text = if (result == TextToSpeech.SUCCESS) {
-            "선생님 답변을 읽고 있습니다"
-        } else {
-            "선생님 답변을 읽지 못했습니다"
-        }
+        tone.startTone(ToneGenerator.TONE_PROP_ACK, 140)
+        eventLabel.text = "선생님 답변을 읽습니다"
+        handler.postDelayed({
+            if (activityDestroyed || activeReplyPlaybackId != playbackId) return@postDelayed
+            val result = textToSpeech.speak(
+                text,
+                TextToSpeech.QUEUE_FLUSH,
+                null,
+                playbackId,
+            )
+            if (result != TextToSpeech.SUCCESS) {
+                finishReplyPlayback(playbackId)
+                eventLabel.text = "선생님 답변을 읽지 못했습니다"
+            }
+        }, 190L)
     }
 
     private fun playLatestTeacherReply() {
@@ -800,6 +862,7 @@ class StudentActivity : ComponentActivity() {
         resumeVoiceCommandsAfterMessage()
         pendingOutgoingVoiceMessages[messageId] = recorded
         val sent = trySendPendingVoiceMessage(messageId, recorded)
+        tone.startTone(ToneGenerator.TONE_PROP_BEEP2, 320)
         eventLabel.text = when {
             sent && automaticallyStopped -> "60초 음성 메시지 전송 중입니다"
             sent -> "음성 메시지 전송 중입니다"
@@ -939,7 +1002,8 @@ class StudentActivity : ComponentActivity() {
 
     private fun maybeCapture(snapshot: SessionSnapshot) {
         if (!appInForeground) return
-        val shouldCapture = snapshot.status == SessionStatus.RUNNING && snapshot.phase == SessionPhase.STUDY
+        val shouldCapture = snapshot.status == SessionStatus.RUNNING &&
+            snapshot.phase in setOf(SessionPhase.MEDITATION, SessionPhase.STUDY)
         if (!shouldCapture || captureInFlight) return
         val now = SystemClock.elapsedRealtime()
         val previousCapture = lastCaptureAtElapsedMs
@@ -1204,8 +1268,8 @@ class StudentActivity : ComponentActivity() {
     }
 
     private fun studentStart() {
-        if (!cameraReady || !calibrated) {
-            eventLabel.text = "책과 자리 판정 영역을 먼저 맞춰 주세요"
+        if (!cameraReady) {
+            eventLabel.text = "카메라를 준비하는 중입니다"
             return
         }
         if (session.snapshot().status != SessionStatus.READY) {
@@ -1219,9 +1283,10 @@ class StudentActivity : ComponentActivity() {
                 atElapsedMs = SystemClock.elapsedRealtime(),
             ),
         )
-        eventLabel.text = "명상을 시작합니다"
-        renderSession(snapshot)
-        publishSnapshotIfChanged(snapshot, force = true)
+        val advanced = session.dispatch(Tick(SystemClock.elapsedRealtime()))
+        eventLabel.text = if (advanced.phase == SessionPhase.STUDY) "공부를 시작합니다" else "명상을 시작합니다"
+        renderSession(advanced)
+        publishSnapshotIfChanged(advanced, force = true)
     }
 
     private fun completeProblem() {
@@ -1242,6 +1307,7 @@ class StudentActivity : ComponentActivity() {
                 latestProblemEventId = null
             }
         }, UNDO_WINDOW_MS)
+        tone.startTone(ToneGenerator.TONE_PROP_ACK, 120)
         send(
             StudyMessage.ProblemCompleted(
                 messageId = UUID.randomUUID().toString(),
@@ -1250,7 +1316,6 @@ class StudentActivity : ComponentActivity() {
             ),
         )
         publishSnapshotIfChanged(snapshot, force = true)
-        tone.startTone(ToneGenerator.TONE_PROP_ACK, 120)
         vibrate(70)
     }
 
@@ -1266,7 +1331,7 @@ class StudentActivity : ComponentActivity() {
 
     private fun renderSession(snapshot: SessionSnapshot) {
         phaseLabel.text = when (snapshot.status) {
-            SessionStatus.READY -> "배치 후 시작"
+            SessionStatus.READY -> "바로 시작 가능"
             SessionStatus.START_COUNTDOWN -> "곧 시작합니다"
             SessionStatus.PAUSED -> "잠시 멈춤"
             SessionStatus.COMPLETED -> "오늘 공부 완료"
@@ -1285,7 +1350,7 @@ class StudentActivity : ComponentActivity() {
         timerLabel.text = formatDuration(remaining)
         countLabel.text = "푼 문제 ${snapshot.completedProblemCount}개"
         problemButton.isEnabled = snapshot.status == SessionStatus.RUNNING && snapshot.phase == SessionPhase.STUDY
-        startButton.isEnabled = calibrated && snapshot.status == SessionStatus.READY
+        startButton.isEnabled = cameraReady && snapshot.status == SessionStatus.READY
 
         val phaseChanged = lastRenderedPhase != null && lastRenderedPhase != snapshot.phase
         val meditationStarted = snapshot.status == SessionStatus.RUNNING &&
@@ -1329,7 +1394,7 @@ class StudentActivity : ComponentActivity() {
 
     private fun buildContentView(): View {
         val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
-        cameraView = BookCameraView(this)
+        cameraView = BookCameraView(this).apply { setGuideVisible(false) }
         root.addView(cameraView, FrameLayout.LayoutParams(-1, -1))
 
         connectionPill = TextView(this).apply {
@@ -1378,7 +1443,7 @@ class StudentActivity : ComponentActivity() {
         statusPanel.addView(timerRow)
 
         eventLabel = TextView(this).apply {
-            text = "책과 자리 판정 영역을 맞춰 주세요"
+            text = "카메라 준비 후 음성으로 시작할 수 있습니다"
             textSize = 13f
             setTextColor(COLOR_MUTED)
         }
@@ -1392,9 +1457,7 @@ class StudentActivity : ComponentActivity() {
 
         val bottomPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(8), dp(8), dp(8), dp(8))
-            background = rounded(0xF2FFFFFF.toInt(), 16f)
-            elevation = dp(8).toFloat()
+            setPadding(0, 0, 0, 0)
         }
 
         pairingPanel = LinearLayout(this).apply {
@@ -1420,21 +1483,8 @@ class StudentActivity : ComponentActivity() {
             gravity = Gravity.CENTER_VERTICAL
             visibility = View.GONE
         }
-        calibrateButton = actionButton("배치 완료", COLOR_SECONDARY).apply {
+        calibrateButton = actionButton("책 영역은 선생님폰에서 설정", COLOR_SECONDARY).apply {
             isEnabled = false
-            setOnClickListener {
-                calibrated = !calibrated
-                cameraView.setCalibrated(calibrated)
-                cameraView.setBookRegionEditingEnabled(!calibrated)
-                if (calibrated) cameraView.armPresenceBaseline()
-                text = if (calibrated) "배치 다시 맞춤" else "배치 완료"
-                eventLabel.text = if (calibrated) {
-                    "준비 완료 · 자리 판정 구역의 현재 모습을 기준으로 저장했습니다"
-                } else {
-                    "판정 구역을 다시 맞춰 주세요"
-                }
-                renderSession(session.snapshot())
-            }
         }
         startButton = actionButton("공부 시작", COLOR_PRIMARY).apply {
             isEnabled = false
@@ -1455,7 +1505,7 @@ class StudentActivity : ComponentActivity() {
             visibility = View.GONE
             setOnClickListener { playLatestTeacherReply() }
         }
-        listOf(calibrateButton, startButton, problemButton, undoButton, voiceMessageButton, listenReplyButton)
+        listOf(startButton, problemButton, undoButton, voiceMessageButton, listenReplyButton)
             .forEach { button ->
                 actionRow.addView(button, LinearLayout.LayoutParams(dp(126), dp(48)).apply {
                     marginEnd = dp(6)
@@ -1465,17 +1515,24 @@ class StudentActivity : ComponentActivity() {
             isHorizontalScrollBarEnabled = false
             addView(actionRow, FrameLayout.LayoutParams(-2, dp(48)))
         }
-        bottomPanel.addView(actionScroller, LinearLayout.LayoutParams(-1, 0))
-        val menuToggle = actionButton("메뉴 열기 ︿", COLOR_MUTED).apply {
-            textSize = 12f
+        val menuLine = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL or Gravity.END
+        }
+        menuLine.addView(actionScroller, LinearLayout.LayoutParams(0, dp(48), 0f))
+        val menuToggle = actionButton("⋮", COLOR_MUTED).apply {
+            textSize = 22f
+            contentDescription = "메뉴 열기"
             setOnClickListener {
                 val opening = actionRow.visibility != View.VISIBLE
                 actionRow.visibility = if (opening) View.VISIBLE else View.GONE
-                actionScroller.layoutParams = LinearLayout.LayoutParams(-1, if (opening) dp(48) else 0)
-                text = if (opening) "메뉴 닫기 ﹀" else "메뉴 열기 ︿"
+                actionScroller.layoutParams = LinearLayout.LayoutParams(0, dp(48), if (opening) 1f else 0f)
+                text = if (opening) "×" else "⋮"
+                contentDescription = if (opening) "메뉴 닫기" else "메뉴 열기"
             }
         }
-        bottomPanel.addView(menuToggle, LinearLayout.LayoutParams(-1, dp(34)).apply { topMargin = dp(4) })
+        menuLine.addView(menuToggle, LinearLayout.LayoutParams(dp(44), dp(44)).apply { marginStart = dp(5) })
+        bottomPanel.addView(menuLine, LinearLayout.LayoutParams(-1, dp(48)))
 
         root.addView(
             bottomPanel,
@@ -1614,6 +1671,7 @@ class StudentActivity : ComponentActivity() {
         private const val MAX_RECEIVED_VOICE_MESSAGES = 20
         private const val MAX_STORED_OUTGOING_VOICE_MESSAGES = 20
         private const val MAX_VOICE_DURATION_MS = 60_000L
+        private const val VOICE_DICTATION_DURATION_MS = 12_000L
         private const val MAX_OUTGOING_FILE_RETRIES = 3
         private const val OUTGOING_FILE_RETRY_DELAY_MS = 2_000L
         private const val SESSION_SNAPSHOT_KEY = "session-snapshot"

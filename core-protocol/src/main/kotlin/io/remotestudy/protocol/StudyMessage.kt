@@ -113,6 +113,15 @@ sealed interface StudyMessage {
         val bookMovementThreshold: Float,
     ) : StudyMessage
 
+    /** Upright camera coordinates derived from the teacher's book selection. */
+    data class BookRegionSettings(
+        override val messageId: String,
+        val left: Float,
+        val top: Float,
+        val right: Float,
+        val bottom: Float,
+    ) : StudyMessage
+
     data class Ack(
         override val messageId: String,
         val acknowledgedMessageId: String,

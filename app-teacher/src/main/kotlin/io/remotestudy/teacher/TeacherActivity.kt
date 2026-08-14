@@ -10,7 +10,10 @@ import android.content.res.Configuration
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.StateListDrawable
@@ -22,12 +25,15 @@ import android.os.Looper
 import android.os.SystemClock
 import android.text.InputType
 import android.view.Gravity
+import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.view.View
 import android.widget.Button
 import android.widget.EditText
 import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.FrameLayout
+import android.widget.GridLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -83,7 +89,9 @@ class TeacherActivity : ComponentActivity() {
     private lateinit var latestThumbnail: ImageView
     private lateinit var thumbnailLabel: TextView
     private lateinit var thumbnailScroller: HorizontalScrollView
-    private lateinit var thumbnailStrip: LinearLayout
+    private lateinit var thumbnailStrip: GridLayout
+    private lateinit var bookRegionOverlay: TeacherBookRegionOverlay
+    private lateinit var bookRegionButton: Button
     private lateinit var studentVoiceButton: Button
     private lateinit var textReplyButton: Button
     private lateinit var voiceReplyButton: Button
@@ -293,6 +301,7 @@ class TeacherActivity : ComponentActivity() {
             is StudyMessage.TextMessage -> showTextMessage(message)
             is StudyMessage.VoiceTransfer -> registerVoiceTransfer(message)
             is StudyMessage.StudySettings -> Unit
+            is StudyMessage.BookRegionSettings -> Unit
             is StudyMessage.AssetRequest -> Unit
             is StudyMessage.Ack -> Unit
             is StudyMessage.StartRequest -> Unit
@@ -357,6 +366,7 @@ class TeacherActivity : ComponentActivity() {
         when (metadata.kind) {
             AssetKind.THUMBNAIL -> {
                 latestThumbnail.setImageBitmap(bitmap)
+                latestThumbnail.rotation = 180f
                 thumbnailLabel.text = "최근 사진 · 눌러서 책 영역 고화질 보기"
                 latestThumbnail.contentDescription =
                     "가장 최근 학습 썸네일, 촬영 ${formatCapturedAt(metadata.capturedAtEpochMs)}, 고화질 요청"
@@ -376,9 +386,9 @@ class TeacherActivity : ComponentActivity() {
         fullScreenPhotoDialog?.dismiss()
         val dialog = Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
         val frame = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
-        val image = ImageView(this).apply {
+        val image = ZoomableImageView(this).apply {
             setImageBitmap(bitmap)
-            scaleType = ImageView.ScaleType.FIT_CENTER
+            rotation = 180f
             contentDescription = description
         }
         frame.addView(image, FrameLayout.LayoutParams(-1, -1))
@@ -405,8 +415,9 @@ class TeacherActivity : ComponentActivity() {
         val image = ImageView(this).apply {
             setImageBitmap(bitmap)
             setBackgroundColor(0xFFE7EAF1.toInt())
-            scaleType = ImageView.ScaleType.CENTER_CROP
+            scaleType = ImageView.ScaleType.FIT_XY
             isFocusable = true
+            rotation = 180f
         }
         val entry = RecentThumbnail(
             assetId = metadata.assetId,
@@ -416,21 +427,31 @@ class TeacherActivity : ComponentActivity() {
         )
         image.setOnClickListener { requestBookRoi(entry.assetId) }
         recentThumbnails.addFirst(entry)
-        thumbnailStrip.addView(
-            image,
-            0,
-            LinearLayout.LayoutParams(dp(80), dp(80)).apply { marginEnd = dp(8) },
-        )
         while (recentThumbnails.size > MAX_RECENT_THUMBNAILS) {
             val oldest = recentThumbnails.removeLast()
             oldest.imageView.setImageDrawable(null)
             oldest.imageView.setOnClickListener(null)
-            thumbnailStrip.removeView(oldest.imageView)
             if (!oldest.bitmap.isRecycled) oldest.bitmap.recycle()
         }
+        rebuildThumbnailGrid()
         updateThumbnailDescriptions()
         thumbnailScroller.visibility = View.VISIBLE
         thumbnailScroller.post { thumbnailScroller.scrollTo(0, 0) }
+    }
+
+    private fun rebuildThumbnailGrid() {
+        thumbnailStrip.removeAllViews()
+        recentThumbnails.forEach { entry ->
+            (entry.imageView.parent as? android.view.ViewGroup)?.removeView(entry.imageView)
+            thumbnailStrip.addView(
+                entry.imageView,
+                GridLayout.LayoutParams().apply {
+                    width = dp(92)
+                    height = dp(68)
+                    setMargins(0, 0, dp(6), dp(6))
+                },
+            )
+        }
     }
 
     private fun updateThumbnailDescriptions() {
@@ -803,6 +824,34 @@ class TeacherActivity : ComponentActivity() {
         }
     }
 
+    private fun toggleBookRegionEditing() {
+        val editing = !bookRegionOverlay.editingEnabled
+        bookRegionOverlay.editingEnabled = editing
+        bookRegionButton.text = if (editing) "책 영역 저장" else "책 영역 설정"
+        if (editing) {
+            thumbnailLabel.text = "사각형 안쪽은 이동, 모서리는 크기 조절"
+            return
+        }
+        val displayRegion = bookRegionOverlay.region
+        // Teacher photos are displayed upside-down; map the selection back to camera coordinates.
+        val queued = reliableChannel.send(
+            StudyMessage.BookRegionSettings(
+                messageId = UUID.randomUUID().toString(),
+                left = 1f - displayRegion.right,
+                top = 1f - displayRegion.bottom,
+                right = 1f - displayRegion.left,
+                bottom = 1f - displayRegion.top,
+            ),
+            SystemClock.elapsedRealtime(),
+            "book-region",
+        )
+        thumbnailLabel.text = if (queued) {
+            "책 영역을 학생폰에 적용했습니다"
+        } else {
+            "연결 후 책 영역을 다시 저장해 주세요"
+        }
+    }
+
     private fun showSettingsDialog() {
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -961,26 +1010,35 @@ class TeacherActivity : ComponentActivity() {
         latestThumbnail = ImageView(this).apply {
             setBackgroundColor(0xFFE7EAF1.toInt())
             scaleType = ImageView.ScaleType.CENTER_CROP
+            rotation = 180f
             contentDescription = "아직 수신한 학습 사진이 없음"
         }
-        thumbnailStrip = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
+        bookRegionOverlay = TeacherBookRegionOverlay(this).apply {
+            editingEnabled = false
+        }
+        val mainPhotoFrame = FrameLayout(this).apply {
+            addView(latestThumbnail, FrameLayout.LayoutParams(-1, -1))
+            addView(bookRegionOverlay, FrameLayout.LayoutParams(-1, -1))
+        }
+        thumbnailStrip = GridLayout(this).apply {
+            rowCount = 2
+            orientation = GridLayout.VERTICAL
         }
         thumbnailScroller = HorizontalScrollView(this).apply {
             visibility = View.GONE
             isHorizontalScrollBarEnabled = false
             clipToPadding = false
             contentDescription = "최근 학습 사진 목록"
-            addView(thumbnailStrip, android.widget.FrameLayout.LayoutParams(-2, dp(80)))
+            addView(thumbnailStrip, FrameLayout.LayoutParams(-2, dp(148)))
         }
         thumbnailLabel = TextView(this).apply {
-            text = "공부 시간에 10초마다 최근 썸네일이 표시됩니다"
+            text = "명상·공부 시간에 최근 썸네일이 표시됩니다"
             textSize = 13f
             setTextColor(COLOR_MUTED)
             gravity = Gravity.CENTER
         }
-        mediaCard.addView(latestThumbnail, LinearLayout.LayoutParams(-1, 0, 1f))
-        mediaCard.addView(thumbnailScroller, LinearLayout.LayoutParams(-1, dp(82)).apply {
+        mediaCard.addView(mainPhotoFrame, LinearLayout.LayoutParams(-1, 0, 1f))
+        mediaCard.addView(thumbnailScroller, LinearLayout.LayoutParams(-1, dp(148)).apply {
             topMargin = dp(6)
         })
         mediaCard.addView(thumbnailLabel, matchWrap(top = 4))
@@ -1031,12 +1089,15 @@ class TeacherActivity : ComponentActivity() {
         val settingsButton = actionButton("설정", COLOR_MUTED).apply {
             setOnClickListener { showSettingsDialog() }
         }
+        bookRegionButton = actionButton("책 영역 설정", COLOR_SUCCESS).apply {
+            setOnClickListener { toggleBookRegionEditing() }
+        }
         val actionRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             visibility = View.GONE
         }
-        listOf(startButton, settingsButton, studentVoiceButton, textReplyButton, voiceReplyButton)
+        listOf(startButton, settingsButton, bookRegionButton, studentVoiceButton, textReplyButton, voiceReplyButton)
             .forEach { button ->
                 actionRow.addView(button, LinearLayout.LayoutParams(dp(128), dp(46)).apply { marginEnd = dp(6) })
             }
@@ -1046,22 +1107,27 @@ class TeacherActivity : ComponentActivity() {
         }
         val bottomPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(8), dp(6), dp(8), dp(6))
-            background = rounded(0xF7FFFFFF.toInt(), 14f)
-            elevation = dp(8).toFloat()
+            setPadding(0, 0, 0, 0)
             addView(pairingPanel, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(4) })
-            addView(actionScroller, LinearLayout.LayoutParams(-1, 0))
         }
-        val menuToggle = actionButton("메뉴 열기 ︿", COLOR_MUTED).apply {
-            textSize = 12f
+        val menuLine = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL or Gravity.END
+            addView(actionScroller, LinearLayout.LayoutParams(0, dp(46), 0f))
+        }
+        val menuToggle = actionButton("⋮", COLOR_MUTED).apply {
+            textSize = 22f
+            contentDescription = "메뉴 열기"
             setOnClickListener {
                 val opening = actionRow.visibility != View.VISIBLE
                 actionRow.visibility = if (opening) View.VISIBLE else View.GONE
-                actionScroller.layoutParams = LinearLayout.LayoutParams(-1, if (opening) dp(46) else 0)
-                text = if (opening) "메뉴 닫기 ﹀" else "메뉴 열기 ︿"
+                actionScroller.layoutParams = LinearLayout.LayoutParams(0, dp(46), if (opening) 1f else 0f)
+                text = if (opening) "×" else "⋮"
+                contentDescription = if (opening) "메뉴 닫기" else "메뉴 열기"
             }
         }
-        bottomPanel.addView(menuToggle, LinearLayout.LayoutParams(-1, dp(34)).apply { topMargin = dp(3) })
+        menuLine.addView(menuToggle, LinearLayout.LayoutParams(dp(44), dp(44)).apply { marginStart = dp(5) })
+        bottomPanel.addView(menuLine, LinearLayout.LayoutParams(-1, dp(46)))
         frame.addView(root, FrameLayout.LayoutParams(-1, -1))
         frame.addView(
             bottomPanel,
@@ -1172,7 +1238,7 @@ class TeacherActivity : ComponentActivity() {
     }
 
     private fun phaseText(phase: WireSessionPhase, status: WireSessionStatus): String {
-        if (status == WireSessionStatus.READY) return "배치 후 시작"
+        if (status == WireSessionStatus.READY) return "시작 대기"
         if (status == WireSessionStatus.START_COUNTDOWN) return "곧 공부 시작"
         if (status == WireSessionStatus.PAUSED) return "잠시 멈춤"
         return when (phase) {
@@ -1274,7 +1340,7 @@ class TeacherActivity : ComponentActivity() {
         val bookMovementThreshold: Float = 0.012f,
     ) {
         fun validated() = apply {
-            require(meditationMinutes in 1..1_440) { "명상 시간은 1~1440분" }
+            require(meditationMinutes in 0..1_440) { "명상 시간은 0~1440분" }
             require(studyMinutes in 1..1_440) { "공부 시간은 1~1440분" }
             require(breakMinutes in 1..1_440) { "쉬는 시간은 1~1440분" }
             require(countdownSeconds in 1..60) { "시작 대기는 1~60초" }
@@ -1325,5 +1391,155 @@ class TeacherActivity : ComponentActivity() {
         private const val COLOR_SUCCESS = 0xFF1B8A5A.toInt()
         private const val COLOR_WARNING = 0xFF9A6A00.toInt()
         private const val COLOR_DANGER = 0xFFB33A3A.toInt()
+    }
+}
+
+private data class DisplayBookRegion(
+    val left: Float = 0.07f,
+    val top: Float = 0.30f,
+    val right: Float = 0.93f,
+    val bottom: Float = 0.70f,
+)
+
+private class TeacherBookRegionOverlay(context: android.content.Context) : View(context) {
+    var region: DisplayBookRegion = DisplayBookRegion()
+        private set
+    var editingEnabled: Boolean = false
+        set(value) {
+            field = value
+            invalidate()
+        }
+
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = dp(3f)
+        color = Color.rgb(255, 196, 61)
+    }
+    private val handlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = Color.rgb(255, 196, 61)
+    }
+    private var mode = DragMode.NONE
+    private var lastX = 0f
+    private var lastY = 0f
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        if (!editingEnabled) return
+        val rect = rect()
+        canvas.drawRoundRect(rect, dp(10f), dp(10f), paint)
+        listOf(
+            rect.left to rect.top,
+            rect.right to rect.top,
+            rect.left to rect.bottom,
+            rect.right to rect.bottom,
+        ).forEach { (x, y) -> canvas.drawCircle(x, y, dp(10f), handlePaint) }
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (!editingEnabled || width == 0 || height == 0) return false
+        val x = event.x.coerceIn(0f, width.toFloat())
+        val y = event.y.coerceIn(0f, height.toFloat())
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                mode = hit(x, y, rect())
+                if (mode == DragMode.NONE) return false
+                lastX = x; lastY = y
+                parent?.requestDisallowInterceptTouchEvent(true)
+                return true
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (mode == DragMode.NONE) return false
+                update((x - lastX) / width, (y - lastY) / height)
+                lastX = x; lastY = y
+                return true
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                val handled = mode != DragMode.NONE
+                mode = DragMode.NONE
+                parent?.requestDisallowInterceptTouchEvent(false)
+                return handled
+            }
+        }
+        return false
+    }
+
+    private fun rect() = RectF(
+        region.left * width,
+        region.top * height,
+        region.right * width,
+        region.bottom * height,
+    )
+
+    private fun hit(x: Float, y: Float, rect: RectF): DragMode {
+        val r = dp(36f)
+        fun closeTo(px: Float, py: Float) = (x - px) * (x - px) + (y - py) * (y - py) <= r * r
+        if (closeTo(rect.left, rect.top)) return DragMode.TOP_LEFT
+        if (closeTo(rect.right, rect.top)) return DragMode.TOP_RIGHT
+        if (closeTo(rect.left, rect.bottom)) return DragMode.BOTTOM_LEFT
+        if (closeTo(rect.right, rect.bottom)) return DragMode.BOTTOM_RIGHT
+        return if (rect.contains(x, y)) DragMode.MOVE else DragMode.NONE
+    }
+
+    private fun update(dx: Float, dy: Float) {
+        val min = 0.12f
+        var left = region.left; var top = region.top; var right = region.right; var bottom = region.bottom
+        when (mode) {
+            DragMode.MOVE -> {
+                val moveX = dx.coerceIn(-left, 1f - right)
+                val moveY = dy.coerceIn(-top, 1f - bottom)
+                left += moveX; right += moveX; top += moveY; bottom += moveY
+            }
+            DragMode.TOP_LEFT -> { left = (left + dx).coerceIn(0f, right - min); top = (top + dy).coerceIn(0f, bottom - min) }
+            DragMode.TOP_RIGHT -> { right = (right + dx).coerceIn(left + min, 1f); top = (top + dy).coerceIn(0f, bottom - min) }
+            DragMode.BOTTOM_LEFT -> { left = (left + dx).coerceIn(0f, right - min); bottom = (bottom + dy).coerceIn(top + min, 1f) }
+            DragMode.BOTTOM_RIGHT -> { right = (right + dx).coerceIn(left + min, 1f); bottom = (bottom + dy).coerceIn(top + min, 1f) }
+            DragMode.NONE -> return
+        }
+        region = DisplayBookRegion(left, top, right, bottom)
+        invalidate()
+    }
+
+    private fun dp(value: Float) = value * resources.displayMetrics.density
+    private enum class DragMode { NONE, MOVE, TOP_LEFT, TOP_RIGHT, BOTTOM_LEFT, BOTTOM_RIGHT }
+}
+
+/** FIT_CENTER image that supports a second-stage pinch zoom and drag. */
+private class ZoomableImageView(context: android.content.Context) : ImageView(context) {
+    private var zoom = 1f
+    private var lastX = 0f
+    private var lastY = 0f
+    private val scaleDetector = ScaleGestureDetector(
+        context,
+        object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScale(detector: ScaleGestureDetector): Boolean {
+                zoom = (zoom * detector.scaleFactor).coerceIn(1f, 5f)
+                scaleX = zoom
+                scaleY = zoom
+                if (zoom == 1f) {
+                    translationX = 0f
+                    translationY = 0f
+                }
+                return true
+            }
+        },
+    )
+
+    init {
+        scaleType = ScaleType.FIT_CENTER
+        isClickable = true
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        scaleDetector.onTouchEvent(event)
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> { lastX = event.x; lastY = event.y }
+            MotionEvent.ACTION_MOVE -> if (!scaleDetector.isInProgress && zoom > 1f) {
+                translationX += event.x - lastX
+                translationY += event.y - lastY
+                lastX = event.x; lastY = event.y
+            }
+        }
+        return true
     }
 }

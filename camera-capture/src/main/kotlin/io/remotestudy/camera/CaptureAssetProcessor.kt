@@ -24,9 +24,9 @@ import kotlin.math.max
 internal object CaptureAssetProcessor {
     private const val BOOK_MAX_LONG_EDGE = 2_400
     private const val BOOK_JPEG_QUALITY = 92
-    private const val THUMBNAIL_MAX_LONG_EDGE = 480
-    private const val THUMBNAIL_JPEG_QUALITY = 55
-    private const val PIXEL_BLOCK_SIZE = 24
+    private const val THUMBNAIL_MAX_LONG_EDGE = 960
+    private const val THUMBNAIL_JPEG_QUALITY = 72
+    private const val PIXEL_BLOCK_SIZE = 20
 
     fun process(
         originalJpeg: File,

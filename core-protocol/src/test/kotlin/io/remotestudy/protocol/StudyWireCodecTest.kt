@@ -53,7 +53,8 @@ class StudyWireCodecTest {
                 "m15", 300_000, 2_400_000, 900_000, 5_000, 10_000,
                 10_000, 30_000, 0.18f, 0.012f,
             ),
-            StudyMessage.Ack("m16", "m14"),
+            StudyMessage.BookRegionSettings("m16", 0.1f, 0.2f, 0.9f, 0.8f),
+            StudyMessage.Ack("m17", "m14"),
         )
 
         messages.forEach { message ->
@@ -170,6 +171,16 @@ class StudyWireCodecTest {
                 )
             }
         }
+    }
+
+    @Test
+    fun `study settings allow zero meditation`() {
+        val settings = StudyMessage.StudySettings(
+            "settings", 0, 60_000, 60_000, 5_000, 10_000,
+            10_000, 30_000, 0.18f, 0.012f,
+        )
+
+        assertEquals(settings, StudyWireCodec.decode(StudyWireCodec.encode(settings)))
     }
 
     @Test

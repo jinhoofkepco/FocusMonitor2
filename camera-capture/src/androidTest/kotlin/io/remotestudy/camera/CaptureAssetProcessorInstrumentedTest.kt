@@ -45,7 +45,7 @@ class CaptureAssetProcessorInstrumentedTest {
         val thumbnail = checkNotNull(BitmapFactory.decodeFile(assets.thumbnailFile.absolutePath))
         val book = checkNotNull(BitmapFactory.decodeFile(assets.bookRoiFile.absolutePath))
         try {
-            assertTrue(maxOf(thumbnail.width, thumbnail.height) <= 480)
+            assertTrue(maxOf(thumbnail.width, thumbnail.height) <= 960)
             assertTrue(maxOf(book.width, book.height) <= 2_400)
             assertTrue(
                 "book ROI center should preserve the blue fixture",

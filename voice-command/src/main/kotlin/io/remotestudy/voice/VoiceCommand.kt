@@ -7,6 +7,7 @@ enum class VoiceCommand {
     UNDO,
     PAUSE,
     STOP,
+    DAD_MESSAGE,
 }
 
 enum class RecognitionMode {
@@ -61,6 +62,9 @@ data class VoiceCommandError(
 interface StudentVoiceCommandListener {
     /** Always called on the Android main thread. */
     fun onCommand(command: VoiceCommand)
+
+    /** Final Korean dictation captured after the "아빠" wake phrase. */
+    fun onMessageRecognized(text: String) = Unit
 
     /** Always called on the Android main thread. */
     fun onStatus(status: VoiceCommandStatus)
