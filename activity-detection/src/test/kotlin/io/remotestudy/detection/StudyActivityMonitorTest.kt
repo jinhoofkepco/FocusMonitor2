@@ -66,11 +66,12 @@ class StudyActivityMonitorTest {
             monitor.observe(frame(10_100L, presence = 0.19f)),
         )
         assertTrue(monitor.observe(frame(11_000L, presence = 1f)).isEmpty())
+        assertTrue(monitor.observe(frame(12_000L, presence = 0.12f)).isEmpty())
+        assertTrue(monitor.observe(frame(13_000L, presence = 0.12f)).isEmpty())
         assertEquals(
-            listOf(DetectionEvent(DetectionEventKind.PRESENCE_RESTORED, 11_900L)),
-            monitor.observe(frame(12_000L, presence = 0.18f)),
+            listOf(DetectionEvent(DetectionEventKind.PRESENCE_RESTORED, 13_900L)),
+            monitor.observe(frame(14_000L, presence = 0.12f)),
         )
-        assertTrue(monitor.observe(frame(13_000L, presence = 0f)).isEmpty())
     }
 
     @Test
@@ -80,6 +81,33 @@ class StudyActivityMonitorTest {
         assertTrue(monitor.observe(frame(1_000L, presence = 1f)).isEmpty())
         assertTrue(monitor.observe(frame(10_999L, presence = 0f)).isEmpty())
         assertTrue(monitor.observe(frame(20_000L, presence = 0f)).isEmpty())
+    }
+
+    @Test
+    fun `small frame motion keeps a still student present even when posture differs from baseline`() {
+        val monitor = activeMonitor()
+
+        assertTrue(monitor.observe(frame(0L, presence = 0.4f, presenceMotion = 0.01f)).isEmpty())
+        assertTrue(monitor.observe(frame(10_000L, presence = 0.4f, presenceMotion = 0.01f)).isEmpty())
+        assertTrue(monitor.observe(frame(60_000L, presence = 0.4f, presenceMotion = 0.01f)).isEmpty())
+    }
+
+    @Test
+    fun `restore requires three frames and cooldown suppresses rapid repeated away alert`() {
+        val monitor = activeMonitor()
+        monitor.observe(frame(0L, presence = 0.4f, presenceMotion = 0f))
+        assertEquals(
+            listOf(DetectionEvent(DetectionEventKind.AWAY, 10_000L)),
+            monitor.observe(frame(10_000L, presence = 0.4f, presenceMotion = 0f)),
+        )
+        assertTrue(monitor.observe(frame(11_000L, presence = 0.1f)).isEmpty())
+        assertTrue(monitor.observe(frame(12_000L, presence = 0.1f)).isEmpty())
+        assertEquals(
+            listOf(DetectionEvent(DetectionEventKind.PRESENCE_RESTORED, 13_000L)),
+            monitor.observe(frame(13_000L, presence = 0.1f)),
+        )
+        assertTrue(monitor.observe(frame(14_000L, presence = 0.4f, presenceMotion = 0f)).isEmpty())
+        assertTrue(monitor.observe(frame(24_000L, presence = 0.4f, presenceMotion = 0f)).isEmpty())
     }
 
     @Test
@@ -138,9 +166,11 @@ class StudyActivityMonitorTest {
         assertTrue(monitor.observe(frame(5_000L, presence = 0f, movement = 1f)).isEmpty())
         monitor.setActive(false, 5_000L)
 
+        assertTrue(monitor.observe(frame(12_000L, presence = 0f)).isEmpty())
+        assertTrue(monitor.observe(frame(13_000L, presence = 0f)).isEmpty())
         assertEquals(
-            listOf(DetectionEvent(DetectionEventKind.PRESENCE_RESTORED, 11_000L)),
-            monitor.observe(frame(12_000L, presence = 0f)),
+            listOf(DetectionEvent(DetectionEventKind.PRESENCE_RESTORED, 13_000L)),
+            monitor.observe(frame(14_000L, presence = 0f)),
         )
     }
 
@@ -187,10 +217,12 @@ class StudyActivityMonitorTest {
     private fun frame(
         at: Long,
         presence: Float? = null,
+        presenceMotion: Float? = null,
         movement: Float? = null,
     ) = FrameEvidence(
         observedAtElapsedMs = at,
         presenceDifference = presence,
+        presenceMotion = presenceMotion,
         bookMovement = movement,
     )
 }

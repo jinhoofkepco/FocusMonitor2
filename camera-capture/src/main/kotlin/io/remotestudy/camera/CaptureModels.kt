@@ -16,7 +16,21 @@ data class CaptureAssets(
 data class FrameObservation(
     val observedAtElapsedMs: Long,
     val presenceDifference: Float?,
+    val presenceMotion: Float?,
     val bookMovement: Float?,
+)
+
+enum class DetailCaptureMode {
+    STANDARD_12_MP,
+    ULTRA_50_MP,
+}
+
+data class CameraProfileResult(
+    val requestedMode: DetailCaptureMode,
+    val appliedMode: DetailCaptureMode,
+    val width: Int,
+    val height: Int,
+    val ultra50MpAvailable: Boolean,
 )
 
 /** Upright preview coordinates. Values are normalized so the region survives rotation. */
@@ -42,5 +56,5 @@ internal object CameraRegions {
     // The lower control card covers the bottom of the preview. Both regions stay
     // fully visible above it so calibration cannot silently hide presence input.
     val BOOK = BookRegion.DEFAULT.normalized()
-    val PRESENCE = NormalizedRegion(left = 0.55f, top = 0.14f, right = 0.94f, bottom = 0.27f)
+    val PRESENCE = NormalizedRegion(left = 0.05f, top = 0.05f, right = 0.95f, bottom = 0.48f)
 }

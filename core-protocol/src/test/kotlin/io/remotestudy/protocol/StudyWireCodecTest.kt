@@ -54,7 +54,11 @@ class StudyWireCodecTest {
                 10_000, 30_000, 0.18f, 0.012f,
             ),
             StudyMessage.BookRegionSettings("m16", 0.1f, 0.2f, 0.9f, 0.8f),
-            StudyMessage.Ack("m17", "m14"),
+            StudyMessage.CameraProfileStatus(
+                "m17", DetailCaptureMode.ULTRA_50_MP, DetailCaptureMode.STANDARD_12_MP,
+                4_000, 3_000, false,
+            ),
+            StudyMessage.Ack("m18", "m14"),
         )
 
         messages.forEach { message ->

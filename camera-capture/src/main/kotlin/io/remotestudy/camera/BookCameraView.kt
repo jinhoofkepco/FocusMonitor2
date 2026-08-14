@@ -20,6 +20,10 @@ import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
 import androidx.camera.core.UseCaseGroup
 import androidx.camera.core.ViewPort
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionFilter
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
@@ -70,6 +74,14 @@ class BookCameraView @JvmOverloads constructor(
     @Volatile
     private var cameraProvider: ProcessCameraProvider? = null
 
+    @Volatile
+    private var requestedDetailMode = DetailCaptureMode.STANDARD_12_MP
+
+    @Volatile
+    private var appliedDetailMode = DetailCaptureMode.STANDARD_12_MP
+
+    private var boundLifecycleOwner: LifecycleOwner? = null
+
     private val frameAnalyzer = FrameObservationAnalyzer { observation ->
         mainExecutor.execute {
             if (!closed.get()) frameObservationListener?.invoke(observation)
@@ -114,6 +126,7 @@ class BookCameraView @JvmOverloads constructor(
      * main, including a close while layout/provider work is pending.
      */
     fun bind(lifecycleOwner: LifecycleOwner, onResult: (Result<Unit>) -> Unit = {}) {
+        boundLifecycleOwner = lifecycleOwner
         val request = PendingBind(onResult)
         pendingBinds += request
         runOnMain {
@@ -186,7 +199,8 @@ class BookCameraView @JvmOverloads constructor(
                         .build()
                         .also { it.surfaceProvider = previewView.surfaceProvider }
                     val capture = ImageCapture.Builder()
-                        .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                        .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                        .setResolutionSelector(detailResolutionSelector(requestedDetailMode))
                         .setTargetRotation(targetRotation)
                         .build()
                     val analysis = ImageAnalysis.Builder()
@@ -215,6 +229,15 @@ class BookCameraView @JvmOverloads constructor(
                     imageCapture = capture
                     preview = candidatePreview
                     imageAnalysis = analysis
+                    val captureSize = capture.resolutionInfo?.resolution
+                    appliedDetailMode = if (
+                        requestedDetailMode == DetailCaptureMode.ULTRA_50_MP &&
+                        captureSize != null && captureSize.width.toLong() * captureSize.height >= 40_000_000L
+                    ) {
+                        DetailCaptureMode.ULTRA_50_MP
+                    } else {
+                        DetailCaptureMode.STANDARD_12_MP
+                    }
                     candidateProvider = null
                     candidateAnalysis = null
                 }.onSuccess {
@@ -290,9 +313,10 @@ class BookCameraView @JvmOverloads constructor(
                                     originalJpeg = original,
                                     outputDir = outputDir,
                                     assetId = assetId,
-                                    capturedAtEpochMs = capturedAtEpochMs,
-                                    bookRegion = bookRegion,
-                                )
+                                capturedAtEpochMs = capturedAtEpochMs,
+                                bookRegion = bookRegion,
+                                detailCaptureMode = appliedDetailMode,
+                            )
                             }
                             completeCapture(request, result)
                         }
@@ -342,6 +366,93 @@ class BookCameraView @JvmOverloads constructor(
     }
 
     fun currentBookRegion(): BookRegion = bookRegion
+
+    /** Rebinds only camera use cases; the host session timer continues independently. */
+    fun applyDetailCaptureMode(
+        mode: DetailCaptureMode,
+        callback: (Result<CameraProfileResult>) -> Unit,
+    ) {
+        runOnMain {
+            if (closed.get()) {
+                callback(Result.failure(IllegalStateException("BookCameraView is closed")))
+                return@runOnMain
+            }
+            val owner = boundLifecycleOwner
+            if (owner == null) {
+                requestedDetailMode = mode
+                callback(Result.failure(IllegalStateException("Camera is not bound")))
+                return@runOnMain
+            }
+            val currentSize = imageCapture?.resolutionInfo?.resolution
+            if (currentSize != null && requestedDetailMode == mode && appliedDetailMode == mode) {
+                callback(
+                    Result.success(
+                        CameraProfileResult(
+                            requestedMode = mode,
+                            appliedMode = mode,
+                            width = currentSize.width,
+                            height = currentSize.height,
+                            ultra50MpAvailable = mode == DetailCaptureMode.ULTRA_50_MP,
+                        ),
+                    ),
+                )
+                return@runOnMain
+            }
+            requestedDetailMode = mode
+            bind(owner) { result ->
+                result.fold(
+                    onSuccess = {
+                        val size = imageCapture?.resolutionInfo?.resolution
+                        if (size == null) {
+                            callback(Result.failure(IllegalStateException("Camera resolution is unavailable")))
+                        } else {
+                            callback(
+                                Result.success(
+                                    CameraProfileResult(
+                                        requestedMode = mode,
+                                        appliedMode = appliedDetailMode,
+                                        width = size.width,
+                                        height = size.height,
+                                        ultra50MpAvailable = appliedDetailMode == DetailCaptureMode.ULTRA_50_MP,
+                                    ),
+                                ),
+                            )
+                        }
+                    },
+                    onFailure = { failure ->
+                        if (mode != DetailCaptureMode.ULTRA_50_MP) {
+                            callback(Result.failure(failure))
+                            return@fold
+                        }
+                        requestedDetailMode = DetailCaptureMode.STANDARD_12_MP
+                        bind(owner) { fallback ->
+                            fallback.fold(
+                                onSuccess = {
+                                    val size = imageCapture?.resolutionInfo?.resolution
+                                    if (size == null) {
+                                        callback(Result.failure(failure))
+                                    } else {
+                                        callback(
+                                            Result.success(
+                                                CameraProfileResult(
+                                                    requestedMode = mode,
+                                                    appliedMode = DetailCaptureMode.STANDARD_12_MP,
+                                                    width = size.width,
+                                                    height = size.height,
+                                                    ultra50MpAvailable = false,
+                                                ),
+                                            ),
+                                        )
+                                    }
+                                },
+                                onFailure = { callback(Result.failure(it)) },
+                            )
+                        }
+                    },
+                )
+            }
+        }
+    }
 
     /** Keeps CameraX output upright when the host handles configuration changes itself. */
     fun updateTargetRotation(rotation: Int) {
@@ -421,6 +532,30 @@ class BookCameraView @JvmOverloads constructor(
 
     private fun runOnMain(block: () -> Unit) {
         if (Looper.myLooper() == Looper.getMainLooper()) block() else mainExecutor.execute(block)
+    }
+
+    private fun detailResolutionSelector(mode: DetailCaptureMode): ResolutionSelector {
+        val builder = ResolutionSelector.Builder()
+            .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+        return if (mode == DetailCaptureMode.ULTRA_50_MP) {
+            builder
+                .setAllowedResolutionMode(ResolutionSelector.PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE)
+                .setResolutionFilter(
+                    ResolutionFilter { sizes, _ ->
+                        sizes.sortedByDescending { it.width.toLong() * it.height }
+                    },
+                )
+                .build()
+        } else {
+            builder
+                .setResolutionStrategy(
+                    ResolutionStrategy(
+                        Size(4_000, 3_000),
+                        ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER,
+                    ),
+                )
+                .build()
+        }
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()

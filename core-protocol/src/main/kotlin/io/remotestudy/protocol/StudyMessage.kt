@@ -1,6 +1,6 @@
 package io.remotestudy.protocol
 
-const val STUDY_PROTOCOL_VERSION: Int = 1
+const val STUDY_PROTOCOL_VERSION: Int = 2
 
 enum class PeerRole { STUDENT, TEACHER }
 
@@ -31,6 +31,11 @@ enum class AlertKind {
 enum class AssetKind {
     THUMBNAIL,
     BOOK_ROI,
+}
+
+enum class DetailCaptureMode {
+    STANDARD_12_MP,
+    ULTRA_50_MP,
 }
 
 sealed interface StudyMessage {
@@ -111,6 +116,12 @@ sealed interface StudyMessage {
         val noMovementAfterMs: Long,
         val presenceThreshold: Float,
         val bookMovementThreshold: Float,
+        val presenceRestoreThreshold: Float = 0.12f,
+        val presenceMotionThreshold: Float = 0.006f,
+        val alertCooldownMs: Long = 300_000L,
+        val awayAlertEnabled: Boolean = true,
+        val noMovementAlertEnabled: Boolean = true,
+        val alertSoundEnabled: Boolean = false,
     ) : StudyMessage
 
     /** Upright camera coordinates derived from the teacher's book selection. */
@@ -120,6 +131,16 @@ sealed interface StudyMessage {
         val top: Float,
         val right: Float,
         val bottom: Float,
+        val detailCaptureMode: DetailCaptureMode = DetailCaptureMode.STANDARD_12_MP,
+    ) : StudyMessage
+
+    data class CameraProfileStatus(
+        override val messageId: String,
+        val requestedMode: DetailCaptureMode,
+        val appliedMode: DetailCaptureMode,
+        val width: Int,
+        val height: Int,
+        val ultra50MpAvailable: Boolean,
     ) : StudyMessage
 
     data class Ack(

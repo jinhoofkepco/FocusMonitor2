@@ -12,6 +12,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.Typeface
@@ -29,6 +30,7 @@ import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.HorizontalScrollView
 import android.widget.ImageView
@@ -42,6 +44,7 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import io.remotestudy.protocol.AlertKind
 import io.remotestudy.protocol.AssetKind
+import io.remotestudy.protocol.DetailCaptureMode
 import io.remotestudy.protocol.PeerRole
 import io.remotestudy.protocol.StudyMessage
 import io.remotestudy.protocol.WireSessionPhase
@@ -118,11 +121,13 @@ class TeacherActivity : ComponentActivity() {
     private var roiDialog: AlertDialog? = null
     private var fullScreenPhotoDialog: Dialog? = null
     private var studySettings = TeacherStudySettings()
+    private var detailCaptureMode = DetailCaptureMode.STANDARD_12_MP
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         createNotificationChannel()
         studySettings = loadStudySettings()
+        detailCaptureMode = loadDetailCaptureMode()
         setContentView(buildContentView())
 
         voicePlayer = VoiceMessagePlayer(this)
@@ -247,6 +252,12 @@ class TeacherActivity : ComponentActivity() {
                 setConnectionState("${event.displayName} 연결됨", COLOR_SUCCESS)
                 startButton.isEnabled = true
                 eventLabel.text = "연결 완료 · 학생의 배치 완료를 기다리는 중"
+                reliableChannel.send(
+                    studySettings.toMessage(UUID.randomUUID().toString()),
+                    SystemClock.elapsedRealtime(),
+                    "study-settings",
+                )
+                sendCurrentBookProfile()
             }
 
             is TransportEvent.Disconnected -> {
@@ -304,6 +315,7 @@ class TeacherActivity : ComponentActivity() {
             is StudyMessage.VoiceTransfer -> registerVoiceTransfer(message)
             is StudyMessage.StudySettings -> Unit
             is StudyMessage.BookRegionSettings -> Unit
+            is StudyMessage.CameraProfileStatus -> showCameraProfileStatus(message)
             is StudyMessage.AssetRequest -> Unit
             is StudyMessage.Ack -> Unit
             is StudyMessage.StartRequest -> Unit
@@ -347,7 +359,13 @@ class TeacherActivity : ComponentActivity() {
                     target.outputStream().use { destination -> source.copyTo(destination) }
                 }
                 pruneReceivedAssets(directory)
-                target to checkNotNull(BitmapFactory.decodeFile(target.absolutePath))
+                val decoded = checkNotNull(
+                    BitmapFactory.decodeFile(
+                        target.absolutePath,
+                        BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.RGB_565 },
+                    ),
+                )
+                target to rotateBitmap180(decoded)
             }
             runOnUiThread {
                 if (activityDestroyed || isDestroyed) {
@@ -368,7 +386,6 @@ class TeacherActivity : ComponentActivity() {
         when (metadata.kind) {
             AssetKind.THUMBNAIL -> {
                 latestThumbnail.setImageBitmap(bitmap)
-                latestThumbnail.rotation = 180f
                 latestThumbnail.contentDescription =
                     "가장 최근 학습 썸네일, 촬영 ${formatCapturedAt(metadata.capturedAtEpochMs)}, 고화질 요청"
                 latestThumbnail.setOnClickListener { requestBookRoi(metadata.assetId) }
@@ -389,7 +406,6 @@ class TeacherActivity : ComponentActivity() {
         val frame = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
         val image = ZoomableImageView(this).apply {
             setImageBitmap(bitmap)
-            rotation = 180f
             contentDescription = description
         }
         frame.addView(image, FrameLayout.LayoutParams(-1, -1))
@@ -418,7 +434,6 @@ class TeacherActivity : ComponentActivity() {
             setBackgroundColor(0xFFE7EAF1.toInt())
             scaleType = ImageView.ScaleType.FIT_XY
             isFocusable = true
-            rotation = 180f
         }
         val entry = RecentThumbnail(
             assetId = metadata.assetId,
@@ -466,6 +481,20 @@ class TeacherActivity : ComponentActivity() {
     private fun formatCapturedAt(capturedAtEpochMs: Long): String =
         DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
             .format(Date(capturedAtEpochMs))
+
+    private fun rotateBitmap180(source: Bitmap): Bitmap {
+        val rotated = Bitmap.createBitmap(
+            source,
+            0,
+            0,
+            source.width,
+            source.height,
+            Matrix().apply { postRotate(180f) },
+            true,
+        )
+        if (rotated !== source) source.recycle()
+        return rotated
+    }
 
     private fun showTextMessage(message: StudyMessage.TextMessage) {
         val sender = if (message.sender == PeerRole.STUDENT) "학생" else "선생님"
@@ -882,7 +911,12 @@ class TeacherActivity : ComponentActivity() {
             AlertKind.BOOK_MOVEMENT_RESTORED -> "책 영역 움직임이 다시 감지됨"
         }
         eventLabel.text = text
-        if (message.kind == AlertKind.AWAY || message.kind == AlertKind.NO_BOOK_MOVEMENT) {
+        val enabled = when (message.kind) {
+            AlertKind.AWAY -> studySettings.awayAlertEnabled
+            AlertKind.NO_BOOK_MOVEMENT -> studySettings.noMovementAlertEnabled
+            else -> false
+        }
+        if (enabled) {
             notifyStudyAlert(message.kind, text)
         }
     }
@@ -910,32 +944,92 @@ class TeacherActivity : ComponentActivity() {
     }
 
     private fun toggleBookRegionEditing() {
-        val editing = !bookRegionOverlay.editingEnabled
-        bookRegionOverlay.editingEnabled = editing
-        bookRegionButton.text = if (editing) "책 영역 저장" else "책 영역 설정"
-        if (editing) {
-            thumbnailLabel.text = "사각형 안쪽은 이동, 모서리는 크기 조절"
+        if (!bookRegionOverlay.editingEnabled) {
+            showBookRegionAndQualityDialog()
             return
         }
+        bookRegionOverlay.editingEnabled = false
+        bookRegionButton.text = "책 영역 설정"
         val displayRegion = bookRegionOverlay.region
         // Teacher photos are displayed upside-down; map the selection back to camera coordinates.
-        val queued = reliableChannel.send(
+        val queued = sendCurrentBookProfile()
+        thumbnailLabel.text = if (queued) {
+            "책 영역과 ${detailModeLabel(detailCaptureMode)} 적용 요청 중"
+        } else {
+            "연결 후 책 영역을 다시 저장해 주세요"
+        }
+        saveBookProfile(displayRegion)
+    }
+
+    private fun sendCurrentBookProfile(): Boolean {
+        if (!::bookRegionOverlay.isInitialized) return false
+        val displayRegion = bookRegionOverlay.region
+        return reliableChannel.send(
             StudyMessage.BookRegionSettings(
                 messageId = UUID.randomUUID().toString(),
                 left = 1f - displayRegion.right,
                 top = 1f - displayRegion.bottom,
                 right = 1f - displayRegion.left,
                 bottom = 1f - displayRegion.top,
+                detailCaptureMode = detailCaptureMode,
             ),
             SystemClock.elapsedRealtime(),
             "book-region",
         )
-        thumbnailLabel.text = if (queued) {
-            "책 영역을 학생폰에 적용했습니다"
+    }
+
+    private fun showBookRegionAndQualityDialog() {
+        var selected = detailCaptureMode.ordinal
+        AlertDialog.Builder(this)
+            .setTitle("책 영역 상세 화질")
+            .setSingleChoiceItems(
+                arrayOf("12MP 일반 · 빠르고 발열 적음", "50MP 초고화질 · 지원 기기만"),
+                selected,
+            ) { _, which -> selected = which }
+            .setNegativeButton("취소", null)
+            .setPositiveButton("영역 지정") { _, _ ->
+                detailCaptureMode = DetailCaptureMode.entries[selected]
+                bookRegionOverlay.editingEnabled = true
+                bookRegionButton.text = "책 영역 저장"
+                thumbnailLabel.visibility = View.VISIBLE
+                thumbnailLabel.text = "사각형 안쪽은 이동, 모서리는 크기 조절"
+            }
+            .show()
+    }
+
+    private fun showCameraProfileStatus(status: StudyMessage.CameraProfileStatus) {
+        val actualMegapixels = status.width.toLong() * status.height / 1_000_000.0
+        thumbnailLabel.visibility = View.VISIBLE
+        thumbnailLabel.text = if (status.requestedMode == status.appliedMode) {
+            "${detailModeLabel(status.appliedMode)} 적용 · ${status.width}×${status.height} " +
+                "(%.1fMP)".format(actualMegapixels)
         } else {
-            "연결 후 책 영역을 다시 저장해 주세요"
+            "50MP를 앱 카메라에서 사용할 수 없어 ${status.width}×${status.height}로 적용"
         }
     }
+
+    private fun detailModeLabel(mode: DetailCaptureMode): String = when (mode) {
+        DetailCaptureMode.STANDARD_12_MP -> "12MP 일반"
+        DetailCaptureMode.ULTRA_50_MP -> "50MP 초고화질"
+    }
+
+    private fun saveBookProfile(region: DisplayBookRegion) {
+        getSharedPreferences("book-profile", MODE_PRIVATE).edit()
+            .putFloat("left", region.left)
+            .putFloat("top", region.top)
+            .putFloat("right", region.right)
+            .putFloat("bottom", region.bottom)
+            .putString("detailMode", detailCaptureMode.name)
+            .apply()
+    }
+
+    private fun loadDetailCaptureMode(): DetailCaptureMode = runCatching {
+        DetailCaptureMode.valueOf(
+            getSharedPreferences("book-profile", MODE_PRIVATE)
+                .getString("detailMode", DetailCaptureMode.STANDARD_12_MP.name)
+                ?: DetailCaptureMode.STANDARD_12_MP.name,
+        )
+    }.getOrDefault(DetailCaptureMode.STANDARD_12_MP)
 
     private fun showSettingsDialog() {
         val container = LinearLayout(this).apply {
@@ -967,7 +1061,27 @@ class TeacherActivity : ComponentActivity() {
         val away = numberField("자리 비움 알림(초)", studySettings.awaySeconds.toString())
         val movement = numberField("책 움직임 없음 알림(초)", studySettings.noMovementSeconds.toString())
         val presence = numberField("자리 변화 감도(0~1)", studySettings.presenceThreshold.toString(), true)
+        val restore = numberField("자리 복귀 감도(0~1)", studySettings.presenceRestoreThreshold.toString(), true)
+        val presenceMotion = numberField(
+            "미세 움직임 감도(0~1)", studySettings.presenceMotionThreshold.toString(), true,
+        )
         val book = numberField("책 움직임 감도(0~1)", studySettings.bookMovementThreshold.toString(), true)
+        val cooldown = numberField("같은 알림 재발송 제한(초)", studySettings.alertCooldownSeconds.toString())
+        val awayEnabled = CheckBox(this).apply {
+            text = "자리 이탈 알림 사용"
+            isChecked = studySettings.awayAlertEnabled
+            container.addView(this, matchWrap(top = 8))
+        }
+        val movementEnabled = CheckBox(this).apply {
+            text = "책 움직임 없음 알림 사용"
+            isChecked = studySettings.noMovementAlertEnabled
+            container.addView(this, matchWrap(top = 4))
+        }
+        val soundEnabled = CheckBox(this).apply {
+            text = "자리·움직임 알림음 사용"
+            isChecked = studySettings.alertSoundEnabled
+            container.addView(this, matchWrap(top = 4))
+        }
         val scroll = ScrollView(this).apply { addView(container) }
         val dialog = AlertDialog.Builder(this)
             .setTitle("학습 설정")
@@ -987,13 +1101,32 @@ class TeacherActivity : ComponentActivity() {
                         awaySeconds = away.text.toString().toInt(),
                         noMovementSeconds = movement.text.toString().toInt(),
                         presenceThreshold = presence.text.toString().toFloat(),
+                        presenceRestoreThreshold = restore.text.toString().toFloat(),
+                        presenceMotionThreshold = presenceMotion.text.toString().toFloat(),
                         bookMovementThreshold = book.text.toString().toFloat(),
+                        alertCooldownSeconds = cooldown.text.toString().toInt(),
+                        awayAlertEnabled = awayEnabled.isChecked,
+                        noMovementAlertEnabled = movementEnabled.isChecked,
+                        alertSoundEnabled = soundEnabled.isChecked,
                     ).validated()
                 }
                 candidate.onSuccess {
                     studySettings = it
                     saveStudySettings(it)
-                    eventLabel.text = "설정을 저장했습니다 · 다음 시작부터 적용"
+                    val queued = reliableChannel.send(
+                        it.toMessage(UUID.randomUUID().toString()),
+                        SystemClock.elapsedRealtime(),
+                        "study-settings",
+                    )
+                    if (!it.alertSoundEnabled) {
+                        getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_AWAY)
+                        getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_NO_MOVEMENT)
+                    }
+                    eventLabel.text = if (queued) {
+                        "알림·촬영 설정은 즉시 적용 · 시간은 다음 시작부터 적용"
+                    } else {
+                        "설정 저장 완료 · 연결되면 학생폰에 적용"
+                    }
                     dialog.dismiss()
                 }.onFailure {
                     eventLabel.text = "설정값을 확인해 주세요: ${it.message.orEmpty()}"
@@ -1015,7 +1148,13 @@ class TeacherActivity : ComponentActivity() {
                 awaySeconds = preferences.getInt("away", 10),
                 noMovementSeconds = preferences.getInt("movement", 30),
                 presenceThreshold = preferences.getFloat("presenceThreshold", 0.18f),
+                presenceRestoreThreshold = preferences.getFloat("presenceRestoreThreshold", 0.12f),
+                presenceMotionThreshold = preferences.getFloat("presenceMotionThreshold", 0.006f),
                 bookMovementThreshold = preferences.getFloat("bookThreshold", 0.012f),
+                alertCooldownSeconds = preferences.getInt("alertCooldownSeconds", 300),
+                awayAlertEnabled = preferences.getBoolean("awayAlertEnabled", true),
+                noMovementAlertEnabled = preferences.getBoolean("noMovementAlertEnabled", true),
+                alertSoundEnabled = preferences.getBoolean("alertSoundEnabled", false),
             ).validated()
         }.getOrDefault(TeacherStudySettings())
     }
@@ -1030,7 +1169,13 @@ class TeacherActivity : ComponentActivity() {
             .putInt("away", settings.awaySeconds)
             .putInt("movement", settings.noMovementSeconds)
             .putFloat("presenceThreshold", settings.presenceThreshold)
+            .putFloat("presenceRestoreThreshold", settings.presenceRestoreThreshold)
+            .putFloat("presenceMotionThreshold", settings.presenceMotionThreshold)
             .putFloat("bookThreshold", settings.bookMovementThreshold)
+            .putInt("alertCooldownSeconds", settings.alertCooldownSeconds)
+            .putBoolean("awayAlertEnabled", settings.awayAlertEnabled)
+            .putBoolean("noMovementAlertEnabled", settings.noMovementAlertEnabled)
+            .putBoolean("alertSoundEnabled", settings.alertSoundEnabled)
             .apply()
     }
 
@@ -1111,11 +1256,21 @@ class TeacherActivity : ComponentActivity() {
         latestThumbnail = ImageView(this).apply {
             setBackgroundColor(0xFFE7EAF1.toInt())
             scaleType = ImageView.ScaleType.CENTER_CROP
-            rotation = 180f
             contentDescription = "아직 수신한 학습 사진이 없음"
         }
         bookRegionOverlay = TeacherBookRegionOverlay(this).apply {
             editingEnabled = false
+            val preferences = getSharedPreferences("book-profile", MODE_PRIVATE)
+            if (preferences.contains("left")) {
+                setRegion(
+                    DisplayBookRegion(
+                        preferences.getFloat("left", 0.07f),
+                        preferences.getFloat("top", 0.30f),
+                        preferences.getFloat("right", 0.93f),
+                        preferences.getFloat("bottom", 0.70f),
+                    ),
+                )
+            }
         }
         val mainPhotoFrame = FrameLayout(this).apply {
             addView(latestThumbnail, FrameLayout.LayoutParams(-1, -1))
@@ -1276,7 +1431,12 @@ class TeacherActivity : ComponentActivity() {
             AlertKind.NO_BOOK_MOVEMENT -> "책 영역 확인 필요"
             else -> "학습 상태"
         }
-        val notification = android.app.Notification.Builder(this, NOTIFICATION_CHANNEL)
+        val channel = if (studySettings.alertSoundEnabled) {
+            NOTIFICATION_CHANNEL
+        } else {
+            NOTIFICATION_CHANNEL_SILENT
+        }
+        val notification = android.app.Notification.Builder(this, channel)
             .setSmallIcon(android.R.drawable.ic_dialog_alert)
             .setContentTitle(title)
             .setContentText(text)
@@ -1336,6 +1496,16 @@ class TeacherActivity : ComponentActivity() {
                 "학습 이벤트",
                 NotificationManager.IMPORTANCE_DEFAULT,
             ),
+        )
+        manager.createNotificationChannel(
+            NotificationChannel(
+                NOTIFICATION_CHANNEL_SILENT,
+                "학습 상태 알림(무음)",
+                NotificationManager.IMPORTANCE_LOW,
+            ).apply {
+                setSound(null, null)
+                enableVibration(false)
+            },
         )
     }
 
@@ -1446,7 +1616,13 @@ class TeacherActivity : ComponentActivity() {
         val awaySeconds: Int = 10,
         val noMovementSeconds: Int = 30,
         val presenceThreshold: Float = 0.18f,
+        val presenceRestoreThreshold: Float = 0.12f,
+        val presenceMotionThreshold: Float = 0.006f,
         val bookMovementThreshold: Float = 0.012f,
+        val alertCooldownSeconds: Int = 300,
+        val awayAlertEnabled: Boolean = true,
+        val noMovementAlertEnabled: Boolean = true,
+        val alertSoundEnabled: Boolean = false,
     ) {
         fun validated() = apply {
             require(meditationMinutes in 0..1_440) { "명상 시간은 0~1440분" }
@@ -1457,7 +1633,14 @@ class TeacherActivity : ComponentActivity() {
             require(awaySeconds in 1..3_600) { "자리 알림은 1~3600초" }
             require(noMovementSeconds in 1..3_600) { "움직임 알림은 1~3600초" }
             require(presenceThreshold.isFinite() && presenceThreshold in 0f..1f) { "자리 감도는 0~1" }
+            require(presenceRestoreThreshold.isFinite() && presenceRestoreThreshold in 0f..presenceThreshold) {
+                "자리 복귀 감도는 0~자리 변화 감도"
+            }
+            require(presenceMotionThreshold.isFinite() && presenceMotionThreshold in 0f..1f) {
+                "미세 움직임 감도는 0~1"
+            }
             require(bookMovementThreshold.isFinite() && bookMovementThreshold in 0f..1f) { "책 감도는 0~1" }
+            require(alertCooldownSeconds in 0..3_600) { "재알림 제한은 0~3600초" }
         }
 
         fun toMessage(messageId: String) = StudyMessage.StudySettings(
@@ -1471,6 +1654,12 @@ class TeacherActivity : ComponentActivity() {
             noMovementAfterMs = noMovementSeconds * 1_000L,
             presenceThreshold = presenceThreshold,
             bookMovementThreshold = bookMovementThreshold,
+            presenceRestoreThreshold = presenceRestoreThreshold,
+            presenceMotionThreshold = presenceMotionThreshold,
+            alertCooldownMs = alertCooldownSeconds * 1_000L,
+            awayAlertEnabled = awayAlertEnabled,
+            noMovementAlertEnabled = noMovementAlertEnabled,
+            alertSoundEnabled = alertSoundEnabled,
         )
     }
 
@@ -1478,6 +1667,7 @@ class TeacherActivity : ComponentActivity() {
         private const val REQUEST_PERMISSIONS = 400
         private const val REQUEST_RECORD_AUDIO = 401
         private const val NOTIFICATION_CHANNEL = "study-events"
+        private const val NOTIFICATION_CHANNEL_SILENT = "study-events-silent"
         private const val NOTIFICATION_PROBLEM = 101
         private const val NOTIFICATION_AWAY = 102
         private const val NOTIFICATION_NO_MOVEMENT = 103
@@ -1532,6 +1722,11 @@ private class TeacherBookRegionOverlay(context: android.content.Context) : View(
     private var mode = DragMode.NONE
     private var lastX = 0f
     private var lastY = 0f
+
+    fun setRegion(value: DisplayBookRegion) {
+        region = value
+        invalidate()
+    }
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)

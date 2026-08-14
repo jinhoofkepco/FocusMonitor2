@@ -15,6 +15,7 @@ internal class FrameObservationAnalyzer(
 
     private var lastAnalyzedAtElapsedMs: Long? = null
     private var presenceBaseline: FloatArray? = null
+    private var previousPresenceSignature: FloatArray? = null
     private var previousBookSignature: FloatArray? = null
 
     @Volatile
@@ -32,6 +33,7 @@ internal class FrameObservationAnalyzer(
     fun reset() {
         lastAnalyzedAtElapsedMs = null
         presenceBaseline = null
+        previousPresenceSignature = null
         previousBookSignature = null
         baselineRequested.set(false)
     }
@@ -83,15 +85,20 @@ internal class FrameObservationAnalyzer(
             val presenceDifference = presenceBaseline?.let {
                 LuminanceSignatureComparator.meanAbsoluteDifference(it, presenceSignature)
             }
+            val presenceMotion = previousPresenceSignature?.let {
+                LuminanceSignatureComparator.meanAbsoluteDifference(it, presenceSignature)
+            }
             val bookMovement = previousBookSignature?.let {
                 LuminanceSignatureComparator.meanAbsoluteDifference(it, bookSignature)
             }
             previousBookSignature = bookSignature
+            previousPresenceSignature = presenceSignature
 
             onObservation(
                 FrameObservation(
                     observedAtElapsedMs = observedAt,
                     presenceDifference = presenceDifference,
+                    presenceMotion = presenceMotion,
                     bookMovement = bookMovement,
                 ),
             )
@@ -104,6 +111,7 @@ internal class FrameObservationAnalyzer(
         closed = true
         baselineRequested.set(false)
         presenceBaseline = null
+        previousPresenceSignature = null
         previousBookSignature = null
     }
 

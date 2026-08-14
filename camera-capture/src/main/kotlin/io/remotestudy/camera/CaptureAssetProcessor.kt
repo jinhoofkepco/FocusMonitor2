@@ -22,10 +22,11 @@ import kotlin.math.max
  * normalized regions below are relative to the upright cropped JPEG.
  */
 internal object CaptureAssetProcessor {
-    private const val BOOK_MAX_LONG_EDGE = 2_400
-    private const val BOOK_JPEG_QUALITY = 92
-    private const val THUMBNAIL_MAX_LONG_EDGE = 960
-    private const val THUMBNAIL_JPEG_QUALITY = 72
+    private const val STANDARD_BOOK_MAX_LONG_EDGE = 4_000
+    private const val ULTRA_BOOK_MAX_LONG_EDGE = 4_600
+    private const val BOOK_JPEG_QUALITY = 95
+    private const val THUMBNAIL_MAX_LONG_EDGE = 1_440
+    private const val THUMBNAIL_JPEG_QUALITY = 82
     private const val PIXEL_BLOCK_SIZE = 20
 
     fun process(
@@ -34,11 +35,14 @@ internal object CaptureAssetProcessor {
         assetId: String,
         capturedAtEpochMs: Long,
         bookRegion: BookRegion = BookRegion.DEFAULT,
+        detailCaptureMode: DetailCaptureMode = DetailCaptureMode.STANDARD_12_MP,
     ): CaptureAssets {
         var committedAssets: CaptureAssets? = null
         var processingFailure: Throwable? = null
         try {
-            committedAssets = createAssets(originalJpeg, outputDir, assetId, capturedAtEpochMs, bookRegion)
+            committedAssets = createAssets(
+                originalJpeg, outputDir, assetId, capturedAtEpochMs, bookRegion, detailCaptureMode,
+            )
             return committedAssets
         } catch (failure: Throwable) {
             processingFailure = failure
@@ -62,6 +66,7 @@ internal object CaptureAssetProcessor {
         assetId: String,
         capturedAtEpochMs: Long,
         bookRegion: BookRegion,
+        detailCaptureMode: DetailCaptureMode,
     ): CaptureAssets {
         require(originalJpeg.isFile) { "temporary camera original is missing" }
         require(assetId.matches(Regex("[A-Za-z0-9._-]{1,96}"))) {
@@ -85,7 +90,14 @@ internal object CaptureAssetProcessor {
         var bookCommitted = false
         try {
             val orientation = readExifOrientation(originalJpeg)
-            writeBookRoi(originalJpeg, orientation, bookRegion.normalized(), bookStaging)
+            val bookMaxLongEdge = if (detailCaptureMode == DetailCaptureMode.ULTRA_50_MP) {
+                ULTRA_BOOK_MAX_LONG_EDGE
+            } else {
+                STANDARD_BOOK_MAX_LONG_EDGE
+            }
+            writeBookRoi(
+                originalJpeg, orientation, bookRegion.normalized(), bookStaging, bookMaxLongEdge,
+            )
             writeThumbnail(originalJpeg, orientation, bookRegion.normalized(), thumbnailStaging)
 
             if (!bookStaging.renameTo(bookRoiFile)) {
@@ -118,6 +130,7 @@ internal object CaptureAssetProcessor {
         orientation: Int,
         bookRegion: NormalizedRegion,
         destination: File,
+        maxLongEdge: Int,
     ) {
         val bounds = decodeBounds(originalJpeg)
         val rawRegion = rawRegionForUprightNormalized(
@@ -126,7 +139,7 @@ internal object CaptureAssetProcessor {
             orientation = orientation,
             uprightRegion = bookRegion,
         )
-        val sampleSize = sampleSizeFor(rawRegion.width(), rawRegion.height(), BOOK_MAX_LONG_EDGE)
+        val sampleSize = sampleSizeFor(rawRegion.width(), rawRegion.height(), maxLongEdge)
         val decoder = BitmapRegionDecoder.newInstance(originalJpeg.absolutePath, false)
             ?: throw IOException("Unable to create JPEG region decoder")
         val rawCrop = try {
@@ -138,7 +151,7 @@ internal object CaptureAssetProcessor {
             decoder.recycle()
         }
 
-        val uprightCrop = orientAndLimit(rawCrop, orientation, BOOK_MAX_LONG_EDGE)
+        val uprightCrop = orientAndLimit(rawCrop, orientation, maxLongEdge)
         try {
             writeJpeg(uprightCrop, destination, BOOK_JPEG_QUALITY)
         } finally {

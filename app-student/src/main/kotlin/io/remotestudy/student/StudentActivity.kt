@@ -34,6 +34,7 @@ import io.remotestudy.camera.BookCameraView
 import io.remotestudy.camera.BookRegion
 import io.remotestudy.camera.CaptureAssets
 import io.remotestudy.camera.FrameObservation
+import io.remotestudy.camera.DetailCaptureMode as CameraDetailCaptureMode
 import io.remotestudy.detection.DetectionEventKind
 import io.remotestudy.detection.DetectionConfig
 import io.remotestudy.detection.FrameEvidence
@@ -54,6 +55,7 @@ import io.remotestudy.protocol.PeerRole
 import io.remotestudy.protocol.AlertKind
 import io.remotestudy.protocol.AssetKind
 import io.remotestudy.protocol.StudyMessage
+import io.remotestudy.protocol.DetailCaptureMode as WireDetailCaptureMode
 import io.remotestudy.protocol.WireSessionPhase
 import io.remotestudy.protocol.WireSessionStatus
 import io.remotestudy.transport.TransportEvent
@@ -150,6 +152,10 @@ class StudentActivity : ComponentActivity() {
     private var pendingInitialTeacherTextAtEpochMs = Long.MIN_VALUE
     private var textToSpeechReady = false
     private var activeReplyPlaybackId: String? = null
+    private var awayAlertEnabled = true
+    private var noMovementAlertEnabled = true
+    private var requestedDetailMode = CameraDetailCaptureMode.STANDARD_12_MP
+    private var pendingCameraProfileApply = false
 
     private val ticker = object : Runnable {
         override fun run() {
@@ -176,6 +182,24 @@ class StudentActivity : ComponentActivity() {
                     state.getFloat(STATE_BOOK_BOTTOM),
                 )
             }.onSuccess(cameraView::setBookRegion)
+        }
+        getSharedPreferences("camera-profile", MODE_PRIVATE).let { preferences ->
+            if (preferences.contains("left")) {
+                runCatching {
+                    BookRegion(
+                        preferences.getFloat("left", BookRegion.DEFAULT.left),
+                        preferences.getFloat("top", BookRegion.DEFAULT.top),
+                        preferences.getFloat("right", BookRegion.DEFAULT.right),
+                        preferences.getFloat("bottom", BookRegion.DEFAULT.bottom),
+                    )
+                }.onSuccess(cameraView::setBookRegion)
+            }
+            requestedDetailMode = runCatching {
+                CameraDetailCaptureMode.valueOf(
+                    preferences.getString("detailMode", CameraDetailCaptureMode.STANDARD_12_MP.name)
+                        ?: CameraDetailCaptureMode.STANDARD_12_MP.name,
+                )
+            }.getOrDefault(CameraDetailCaptureMode.STANDARD_12_MP)
         }
 
         transport = NearbyStudyTransport(this).also { nearby ->
@@ -326,6 +350,11 @@ class StudentActivity : ComponentActivity() {
                 cameraView.armPresenceBaseline()
                 cameraBindRetryCount = 0
                 calibrateButton.isEnabled = true
+                if (pendingCameraProfileApply) {
+                    applyRequestedCameraProfile(reportToTeacher = true)
+                } else if (requestedDetailMode != CameraDetailCaptureMode.STANDARD_12_MP) {
+                    applyRequestedCameraProfile(reportToTeacher = false)
+                }
             }.onFailure {
                 cameraBound = false
                 cameraReady = false
@@ -541,6 +570,7 @@ class StudentActivity : ComponentActivity() {
             is StudyMessage.Hello,
             is StudyMessage.ProblemCompleted,
             is StudyMessage.SessionSnapshot,
+            is StudyMessage.CameraProfileStatus,
             -> Unit
         }
     }
@@ -551,38 +581,93 @@ class StudentActivity : ComponentActivity() {
         }.onSuccess { region ->
             cameraView.setBookRegion(region)
             cameraView.armPresenceBaseline()
-            eventLabel.text = "선생님이 책 영역을 변경했습니다"
+            requestedDetailMode = settings.detailCaptureMode.toCameraMode()
+            getSharedPreferences("camera-profile", MODE_PRIVATE).edit()
+                .putFloat("left", region.left)
+                .putFloat("top", region.top)
+                .putFloat("right", region.right)
+                .putFloat("bottom", region.bottom)
+                .putString("detailMode", requestedDetailMode.name)
+                .apply()
+            eventLabel.text = "책 영역과 상세 화질 적용 중"
+            pendingCameraProfileApply = true
+            if (cameraReady) applyRequestedCameraProfile(reportToTeacher = true)
         }.onFailure {
             eventLabel.text = "책 영역 설정을 적용할 수 없습니다"
         }
     }
 
-    private fun applyStudySettings(settings: StudyMessage.StudySettings) {
-        if (session.snapshot().status != SessionStatus.READY) {
-            eventLabel.text = "진행 중에는 시간 설정을 바꿀 수 없습니다"
+    private fun applyRequestedCameraProfile(reportToTeacher: Boolean) {
+        if (!cameraReady) {
+            pendingCameraProfileApply = pendingCameraProfileApply || reportToTeacher
+            eventLabel.text = "카메라 준비 뒤 책 상세 화질을 적용합니다"
             return
         }
-        session = SessionStateMachine(
-            schedule = StudySchedule(
-                meditationDurationMs = settings.meditationDurationMs,
-                studyDurationMs = settings.studyDurationMs,
-                breakDurationMs = settings.breakDurationMs,
-            ),
-            teacherCountdownDurationMs = settings.teacherCountdownMs,
-        )
+        val shouldReport = reportToTeacher || pendingCameraProfileApply
+        pendingCameraProfileApply = false
+        cameraView.applyDetailCaptureMode(requestedDetailMode) { result ->
+            result.onSuccess { profile ->
+                cameraView.armPresenceBaseline()
+                if (shouldReport) {
+                    send(
+                        StudyMessage.CameraProfileStatus(
+                            messageId = UUID.randomUUID().toString(),
+                            requestedMode = profile.requestedMode.toWireMode(),
+                            appliedMode = profile.appliedMode.toWireMode(),
+                            width = profile.width,
+                            height = profile.height,
+                            ultra50MpAvailable = profile.ultra50MpAvailable,
+                        ),
+                        coalesceKey = "camera-profile-status",
+                    )
+                }
+                eventLabel.text = if (profile.requestedMode == profile.appliedMode) {
+                    "책 상세 ${profile.width}×${profile.height} 적용 완료"
+                } else {
+                    "50MP 미지원 · ${profile.width}×${profile.height}로 적용"
+                }
+            }.onFailure {
+                pendingCameraProfileApply = shouldReport
+                eventLabel.text = "책 상세 화질 적용 실패: ${it.message.orEmpty()}"
+            }
+        }
+    }
+
+    private fun applyStudySettings(settings: StudyMessage.StudySettings) {
+        val scheduleApplied = session.snapshot().status == SessionStatus.READY
+        if (scheduleApplied) {
+            session = SessionStateMachine(
+                schedule = StudySchedule(
+                    meditationDurationMs = settings.meditationDurationMs,
+                    studyDurationMs = settings.studyDurationMs,
+                    breakDurationMs = settings.breakDurationMs,
+                ),
+                teacherCountdownDurationMs = settings.teacherCountdownMs,
+            )
+        }
         activityMonitor = StudyActivityMonitor(
             DetectionConfig(
                 presenceAbsenceThreshold = settings.presenceThreshold,
+                presenceRestoreThreshold = settings.presenceRestoreThreshold,
+                presenceMotionThreshold = settings.presenceMotionThreshold,
                 bookMovementThreshold = settings.bookMovementThreshold,
                 awayAfterMs = settings.awayAfterMs,
                 noMovementAfterMs = settings.noMovementAfterMs,
+                alertCooldownMs = settings.alertCooldownMs,
             ),
         )
+        awayAlertEnabled = settings.awayAlertEnabled
+        noMovementAlertEnabled = settings.noMovementAlertEnabled
         captureIntervalMs = settings.captureIntervalMs
+        if (monitoringActive) activityMonitor.setActive(true, SystemClock.elapsedRealtime())
         lastPublishedKey = null
         renderSession(session.snapshot())
         publishSnapshotIfChanged(session.snapshot(), force = true)
-        eventLabel.text = "선생님 설정 적용 완료"
+        eventLabel.text = if (scheduleApplied) {
+            "시간·알림 설정 적용 완료"
+        } else {
+            "알림·촬영 설정 즉시 적용 완료 · 시간은 다음 시작부터 적용"
+        }
     }
 
     private fun receiveTeacherText(message: StudyMessage.TextMessage) {
@@ -963,6 +1048,7 @@ class StudentActivity : ComponentActivity() {
     private fun setMonitoringActive(active: Boolean) {
         if (active == monitoringActive) return
         monitoringActive = active
+        if (active) cameraView.armPresenceBaseline()
         activityMonitor.setActive(active, SystemClock.elapsedRealtime())
         if (!active) lastCaptureAtElapsedMs = null
     }
@@ -973,6 +1059,7 @@ class StudentActivity : ComponentActivity() {
             FrameEvidence(
                 observedAtElapsedMs = observation.observedAtElapsedMs,
                 presenceDifference = observation.presenceDifference,
+                presenceMotion = observation.presenceMotion,
                 bookMovement = observation.bookMovement,
             ),
         ).forEach { event ->
@@ -982,6 +1069,12 @@ class StudentActivity : ComponentActivity() {
                 DetectionEventKind.PRESENCE_RESTORED -> AlertKind.PRESENCE_RESTORED
                 DetectionEventKind.BOOK_MOVEMENT_RESTORED -> AlertKind.BOOK_MOVEMENT_RESTORED
             }
+            val enabled = when (event.kind) {
+                DetectionEventKind.AWAY, DetectionEventKind.PRESENCE_RESTORED -> awayAlertEnabled
+                DetectionEventKind.NO_BOOK_MOVEMENT, DetectionEventKind.BOOK_MOVEMENT_RESTORED ->
+                    noMovementAlertEnabled
+            }
+            if (!enabled) return@forEach
             sendAlert(alertKind, event.observedDurationMs)
             eventLabel.text = when (event.kind) {
                 DetectionEventKind.AWAY -> "자리 판정 구역 이탈 알림을 전송했습니다"
@@ -1654,6 +1747,16 @@ class StudentActivity : ComponentActivity() {
         val metadata: StudyMessage,
         val fileSent: Boolean,
     )
+
+    private fun WireDetailCaptureMode.toCameraMode(): CameraDetailCaptureMode = when (this) {
+        WireDetailCaptureMode.STANDARD_12_MP -> CameraDetailCaptureMode.STANDARD_12_MP
+        WireDetailCaptureMode.ULTRA_50_MP -> CameraDetailCaptureMode.ULTRA_50_MP
+    }
+
+    private fun CameraDetailCaptureMode.toWireMode(): WireDetailCaptureMode = when (this) {
+        CameraDetailCaptureMode.STANDARD_12_MP -> WireDetailCaptureMode.STANDARD_12_MP
+        CameraDetailCaptureMode.ULTRA_50_MP -> WireDetailCaptureMode.ULTRA_50_MP
+    }
 
     companion object {
         private const val REQUEST_PERMISSIONS = 401

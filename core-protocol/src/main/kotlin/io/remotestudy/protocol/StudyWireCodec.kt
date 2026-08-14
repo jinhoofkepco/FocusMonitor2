@@ -23,6 +23,7 @@ object StudyWireCodec {
     private const val TYPE_VOICE_TRANSFER = 10
     private const val TYPE_STUDY_SETTINGS = 11
     private const val TYPE_BOOK_REGION_SETTINGS = 12
+    private const val TYPE_CAMERA_PROFILE_STATUS = 13
 
     fun encode(message: StudyMessage): ByteArray {
         require(message.messageId.isNotBlank()) { "messageId must not be blank" }
@@ -106,6 +107,12 @@ object StudyWireCodec {
                     data.writeLong(message.noMovementAfterMs)
                     data.writeFloat(message.presenceThreshold)
                     data.writeFloat(message.bookMovementThreshold)
+                    data.writeFloat(message.presenceRestoreThreshold)
+                    data.writeFloat(message.presenceMotionThreshold)
+                    data.writeLong(message.alertCooldownMs)
+                    data.writeBoolean(message.awayAlertEnabled)
+                    data.writeBoolean(message.noMovementAlertEnabled)
+                    data.writeBoolean(message.alertSoundEnabled)
                 }
 
                 is StudyMessage.BookRegionSettings -> {
@@ -114,6 +121,16 @@ object StudyWireCodec {
                     data.writeFloat(message.top)
                     data.writeFloat(message.right)
                     data.writeFloat(message.bottom)
+                    data.writeByte(message.detailCaptureMode.ordinal)
+                }
+
+                is StudyMessage.CameraProfileStatus -> {
+                    validateCameraProfileStatus(message)
+                    data.writeByte(message.requestedMode.ordinal)
+                    data.writeByte(message.appliedMode.ordinal)
+                    data.writeInt(message.width)
+                    data.writeInt(message.height)
+                    data.writeBoolean(message.ultra50MpAvailable)
                 }
 
                 is StudyMessage.Ack -> {
@@ -215,6 +232,12 @@ object StudyWireCodec {
                     noMovementAfterMs = data.readLong(),
                     presenceThreshold = data.readFloat(),
                     bookMovementThreshold = data.readFloat(),
+                    presenceRestoreThreshold = data.readFloat(),
+                    presenceMotionThreshold = data.readFloat(),
+                    alertCooldownMs = data.readLong(),
+                    awayAlertEnabled = data.readBoolean(),
+                    noMovementAlertEnabled = data.readBoolean(),
+                    alertSoundEnabled = data.readBoolean(),
                 ).also(::validateSettings)
 
                 TYPE_BOOK_REGION_SETTINGS -> StudyMessage.BookRegionSettings(
@@ -223,7 +246,23 @@ object StudyWireCodec {
                     top = data.readFloat(),
                     right = data.readFloat(),
                     bottom = data.readFloat(),
+                    detailCaptureMode = enumValue(
+                        data.readUnsignedByte(), DetailCaptureMode.entries, "detail capture mode",
+                    ),
                 ).also(::validateBookRegion)
+
+                TYPE_CAMERA_PROFILE_STATUS -> StudyMessage.CameraProfileStatus(
+                    messageId = messageId,
+                    requestedMode = enumValue(
+                        data.readUnsignedByte(), DetailCaptureMode.entries, "requested capture mode",
+                    ),
+                    appliedMode = enumValue(
+                        data.readUnsignedByte(), DetailCaptureMode.entries, "applied capture mode",
+                    ),
+                    width = data.readInt(),
+                    height = data.readInt(),
+                    ultra50MpAvailable = data.readBoolean(),
+                ).also(::validateCameraProfileStatus)
 
                 TYPE_ACK -> StudyMessage.Ack(
                     messageId = messageId,
@@ -249,6 +288,7 @@ object StudyWireCodec {
         is StudyMessage.VoiceTransfer -> TYPE_VOICE_TRANSFER
         is StudyMessage.StudySettings -> TYPE_STUDY_SETTINGS
         is StudyMessage.BookRegionSettings -> TYPE_BOOK_REGION_SETTINGS
+        is StudyMessage.CameraProfileStatus -> TYPE_CAMERA_PROFILE_STATUS
         is StudyMessage.Ack -> TYPE_ACK
     }
 
@@ -262,6 +302,14 @@ object StudyWireCodec {
         require(settings.noMovementAfterMs in 1_000L..3_600_000L)
         require(settings.presenceThreshold.isFinite() && settings.presenceThreshold in 0f..1f)
         require(settings.bookMovementThreshold.isFinite() && settings.bookMovementThreshold in 0f..1f)
+        require(settings.presenceRestoreThreshold.isFinite() && settings.presenceRestoreThreshold in 0f..1f)
+        require(settings.presenceRestoreThreshold <= settings.presenceThreshold)
+        require(settings.presenceMotionThreshold.isFinite() && settings.presenceMotionThreshold in 0f..1f)
+        require(settings.alertCooldownMs in 0L..3_600_000L)
+    }
+
+    private fun validateCameraProfileStatus(status: StudyMessage.CameraProfileStatus) {
+        require(status.width > 0 && status.height > 0)
     }
 
     private fun validateBookRegion(region: StudyMessage.BookRegionSettings) {

@@ -15,9 +15,13 @@ class StudyActivityMonitor(
 
     private var absenceStartedAtElapsedMs: Long? = null
     private var awayEmitted = false
+    private var awayNotificationEmitted = false
+    private var lastAwayNotificationAtElapsedMs: Long? = null
+    private var presenceConfirmationFrames = 0
 
     private var lastBookMovementAtElapsedMs: Long? = null
     private var noMovementEmitted = false
+    private var lastNoMovementNotificationAtElapsedMs: Long? = null
 
     @Synchronized
     fun setActive(active: Boolean, atElapsedMs: Long) {
@@ -28,6 +32,10 @@ class StudyActivityMonitor(
         this.active = active
         resetPresenceState()
         noMovementEmitted = false
+        if (!active) {
+            lastAwayNotificationAtElapsedMs = null
+            lastNoMovementNotificationAtElapsedMs = null
+        }
         lastBookMovementAtElapsedMs = if (active) atElapsedMs else null
     }
 
@@ -45,27 +53,47 @@ class StudyActivityMonitor(
     private fun observePresence(evidence: FrameEvidence): DetectionEvent? {
         val difference = evidence.presenceDifference ?: return null
         val observedAt = evidence.observedAtElapsedMs
+        val motion = evidence.presenceMotion ?: 0f
+        val bookMotion = evidence.bookMovement ?: 0f
+        val presenceEvidence = difference <= config.presenceRestoreThreshold ||
+            motion >= config.presenceMotionThreshold ||
+            bookMotion >= config.bookMovementThreshold
 
-        if (difference > config.presenceAbsenceThreshold) {
+        if (awayEmitted) {
+            presenceConfirmationFrames = if (presenceEvidence) presenceConfirmationFrames + 1 else 0
+            if (presenceConfirmationFrames < PRESENCE_CONFIRMATION_FRAMES) return null
+            val absenceStartedAt = absenceStartedAtElapsedMs
+            val duration = absenceStartedAt?.let { nonnegativeDuration(it, observedAt) } ?: 0L
+            val shouldRestore = awayNotificationEmitted
+            resetPresenceState()
+            return if (shouldRestore) {
+                DetectionEvent(DetectionEventKind.PRESENCE_RESTORED, duration)
+            } else {
+                null
+            }
+        }
+
+        if (difference > config.presenceAbsenceThreshold && !presenceEvidence) {
             val absenceStartedAt = absenceStartedAtElapsedMs
                 ?: observedAt.also { absenceStartedAtElapsedMs = it }
             val duration = nonnegativeDuration(absenceStartedAt, observedAt)
             if (!awayEmitted && duration >= config.awayAfterMs) {
                 awayEmitted = true
-                return DetectionEvent(DetectionEventKind.AWAY, duration)
+                val lastAlertAt = lastAwayNotificationAtElapsedMs
+                val cooldownPassed = lastAlertAt == null ||
+                    observedAt - lastAlertAt >= config.alertCooldownMs
+                if (cooldownPassed) {
+                    lastAwayNotificationAtElapsedMs = observedAt
+                    awayNotificationEmitted = true
+                    return DetectionEvent(DetectionEventKind.AWAY, duration)
+                }
             }
             return null
         }
 
-        val absenceStartedAt = absenceStartedAtElapsedMs
-        val shouldRestore = awayEmitted && absenceStartedAt != null
-        val duration = absenceStartedAt?.let { nonnegativeDuration(it, observedAt) } ?: 0L
-        resetPresenceState()
-        return if (shouldRestore) {
-            DetectionEvent(DetectionEventKind.PRESENCE_RESTORED, duration)
-        } else {
-            null
-        }
+        absenceStartedAtElapsedMs = null
+        presenceConfirmationFrames = 0
+        return null
     }
 
     private fun observeBookMovement(evidence: FrameEvidence): DetectionEvent? {
@@ -90,7 +118,12 @@ class StudyActivityMonitor(
         val duration = nonnegativeDuration(lastMovementAt, observedAt)
         if (!noMovementEmitted && duration >= config.noMovementAfterMs) {
             noMovementEmitted = true
-            return DetectionEvent(DetectionEventKind.NO_BOOK_MOVEMENT, duration)
+            val lastAlertAt = lastNoMovementNotificationAtElapsedMs
+            val cooldownPassed = lastAlertAt == null || observedAt - lastAlertAt >= config.alertCooldownMs
+            if (cooldownPassed) {
+                lastNoMovementNotificationAtElapsedMs = observedAt
+                return DetectionEvent(DetectionEventKind.NO_BOOK_MOVEMENT, duration)
+            }
         }
         return null
     }
@@ -105,8 +138,14 @@ class StudyActivityMonitor(
     private fun resetPresenceState() {
         absenceStartedAtElapsedMs = null
         awayEmitted = false
+        awayNotificationEmitted = false
+        presenceConfirmationFrames = 0
     }
 
     private fun nonnegativeDuration(startedAt: Long, observedAt: Long): Long =
         (observedAt - startedAt).coerceAtLeast(0L)
+
+    companion object {
+        private const val PRESENCE_CONFIRMATION_FRAMES = 3
+    }
 }
