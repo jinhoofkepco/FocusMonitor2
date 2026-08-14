@@ -17,6 +17,14 @@ internal class FrameObservationAnalyzer(
     private var presenceBaseline: FloatArray? = null
     private var previousBookSignature: FloatArray? = null
 
+    @Volatile
+    private var bookRegion: NormalizedRegion = CameraRegions.BOOK
+
+    fun setBookRegion(region: BookRegion) {
+        bookRegion = region.normalized()
+        previousBookSignature = null
+    }
+
     fun armPresenceBaseline() {
         if (!closed) baselineRequested.set(true)
     }
@@ -44,7 +52,7 @@ internal class FrameObservationAnalyzer(
                 PixelRegion(crop.left, crop.top, crop.right, crop.bottom)
                     .requireInside(image.width, image.height)
             }
-            val sourceBookRegion = CameraRegions.BOOK.inSourceCrop(
+            val sourceBookRegion = bookRegion.inSourceCrop(
                 sourceCrop = sourceCrop,
                 rotationDegrees = image.imageInfo.rotationDegrees,
             )

@@ -21,6 +21,7 @@ object StudyWireCodec {
     private const val TYPE_ASSET_REQUEST = 8
     private const val TYPE_TEXT_MESSAGE = 9
     private const val TYPE_VOICE_TRANSFER = 10
+    private const val TYPE_STUDY_SETTINGS = 11
 
     fun encode(message: StudyMessage): ByteArray {
         require(message.messageId.isNotBlank()) { "messageId must not be blank" }
@@ -91,6 +92,19 @@ object StudyWireCodec {
                     data.writeLong(message.payloadId)
                     data.writeLong(message.sentAtEpochMs)
                     data.writeLong(message.durationMs)
+                }
+
+                is StudyMessage.StudySettings -> {
+                    validateSettings(message)
+                    data.writeLong(message.meditationDurationMs)
+                    data.writeLong(message.studyDurationMs)
+                    data.writeLong(message.breakDurationMs)
+                    data.writeLong(message.teacherCountdownMs)
+                    data.writeLong(message.captureIntervalMs)
+                    data.writeLong(message.awayAfterMs)
+                    data.writeLong(message.noMovementAfterMs)
+                    data.writeFloat(message.presenceThreshold)
+                    data.writeFloat(message.bookMovementThreshold)
                 }
 
                 is StudyMessage.Ack -> {
@@ -181,6 +195,19 @@ object StudyWireCodec {
                     durationMs = data.readLong().also { require(it in 1..60_000) },
                 )
 
+                TYPE_STUDY_SETTINGS -> StudyMessage.StudySettings(
+                    messageId = messageId,
+                    meditationDurationMs = data.readLong(),
+                    studyDurationMs = data.readLong(),
+                    breakDurationMs = data.readLong(),
+                    teacherCountdownMs = data.readLong(),
+                    captureIntervalMs = data.readLong(),
+                    awayAfterMs = data.readLong(),
+                    noMovementAfterMs = data.readLong(),
+                    presenceThreshold = data.readFloat(),
+                    bookMovementThreshold = data.readFloat(),
+                ).also(::validateSettings)
+
                 TYPE_ACK -> StudyMessage.Ack(
                     messageId = messageId,
                     acknowledgedMessageId = data.readSizedString().also { require(it.isNotBlank()) },
@@ -203,7 +230,20 @@ object StudyWireCodec {
         is StudyMessage.AssetRequest -> TYPE_ASSET_REQUEST
         is StudyMessage.TextMessage -> TYPE_TEXT_MESSAGE
         is StudyMessage.VoiceTransfer -> TYPE_VOICE_TRANSFER
+        is StudyMessage.StudySettings -> TYPE_STUDY_SETTINGS
         is StudyMessage.Ack -> TYPE_ACK
+    }
+
+    private fun validateSettings(settings: StudyMessage.StudySettings) {
+        require(settings.meditationDurationMs in 1_000L..86_400_000L)
+        require(settings.studyDurationMs in 1_000L..86_400_000L)
+        require(settings.breakDurationMs in 1_000L..86_400_000L)
+        require(settings.teacherCountdownMs in 1_000L..60_000L)
+        require(settings.captureIntervalMs in 1_000L..3_600_000L)
+        require(settings.awayAfterMs in 1_000L..3_600_000L)
+        require(settings.noMovementAfterMs in 1_000L..3_600_000L)
+        require(settings.presenceThreshold.isFinite() && settings.presenceThreshold in 0f..1f)
+        require(settings.bookMovementThreshold.isFinite() && settings.bookMovementThreshold in 0f..1f)
     }
 
     private fun DataOutputStream.writeSizedString(value: String) {

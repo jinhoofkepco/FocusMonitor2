@@ -3,6 +3,7 @@ package io.remotestudy.student
 import android.Manifest
 import android.content.res.ColorStateList
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -23,15 +24,18 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import io.remotestudy.camera.BookCameraView
+import io.remotestudy.camera.BookRegion
 import io.remotestudy.camera.CaptureAssets
 import io.remotestudy.camera.FrameObservation
 import io.remotestudy.detection.DetectionEventKind
+import io.remotestudy.detection.DetectionConfig
 import io.remotestudy.detection.FrameEvidence
 import io.remotestudy.detection.StudyActivityMonitor
 import io.remotestudy.domain.session.ProblemCompleted
@@ -40,6 +44,7 @@ import io.remotestudy.domain.session.Resume
 import io.remotestudy.domain.session.SessionPhase
 import io.remotestudy.domain.session.SessionSnapshot
 import io.remotestudy.domain.session.SessionStateMachine
+import io.remotestudy.domain.session.StudySchedule
 import io.remotestudy.domain.session.SessionStatus
 import io.remotestudy.domain.session.StartOrigin
 import io.remotestudy.domain.session.StartRequested
@@ -79,12 +84,13 @@ class StudentActivity : ComponentActivity() {
         data class Voice(val file: File) : TeacherReply
     }
 
-    private val session = SessionStateMachine()
+    private var session = SessionStateMachine()
     private val sessionId = UUID.randomUUID().toString()
     private val handler = Handler(Looper.getMainLooper())
     private val tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 70)
     private val fileExecutor = Executors.newSingleThreadExecutor()
-    private val activityMonitor = StudyActivityMonitor()
+    private var activityMonitor = StudyActivityMonitor()
+    private var captureIntervalMs = DEFAULT_CAPTURE_INTERVAL_MS
 
     private lateinit var transport: NearbyStudyTransport
     private lateinit var reliableChannel: ReliableMessageChannel
@@ -161,6 +167,16 @@ class StudentActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContentView(buildContentView())
+        savedInstanceState?.let { state ->
+            runCatching {
+                BookRegion(
+                    state.getFloat(STATE_BOOK_LEFT),
+                    state.getFloat(STATE_BOOK_TOP),
+                    state.getFloat(STATE_BOOK_RIGHT),
+                    state.getFloat(STATE_BOOK_BOTTOM),
+                )
+            }.onSuccess(cameraView::setBookRegion)
+        }
 
         transport = NearbyStudyTransport(this).also { nearby ->
             nearby.setListener { event -> runOnUiThread { handleTransportEvent(event) } }
@@ -249,6 +265,20 @@ class StudentActivity : ComponentActivity() {
         fileExecutor.shutdownNow()
         tone.release()
         super.onDestroy()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        val region = cameraView.currentBookRegion()
+        outState.putFloat(STATE_BOOK_LEFT, region.left)
+        outState.putFloat(STATE_BOOK_TOP, region.top)
+        outState.putFloat(STATE_BOOK_RIGHT, region.right)
+        outState.putFloat(STATE_BOOK_BOTTOM, region.bottom)
+        super.onSaveInstanceState(outState)
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        cameraView.updateTargetRotation(cameraView.display?.rotation ?: android.view.Surface.ROTATION_0)
     }
 
     override fun onRequestPermissionsResult(
@@ -444,7 +474,7 @@ class StudentActivity : ComponentActivity() {
                         atElapsedMs = SystemClock.elapsedRealtime(),
                     ),
                 )
-                eventLabel.text = "선생님 시작 요청 · 5초 뒤 명상 시작"
+                eventLabel.text = "선생님 시작 요청 · 첫 명상 사이클부터 시작합니다"
                 renderSession(snapshot)
                 publishSnapshotIfChanged(snapshot, force = true)
             }
@@ -452,6 +482,7 @@ class StudentActivity : ComponentActivity() {
             is StudyMessage.AssetRequest -> handleAssetRequest(message)
             is StudyMessage.TextMessage -> receiveTeacherText(message)
             is StudyMessage.VoiceTransfer -> registerVoiceTransfer(message)
+            is StudyMessage.StudySettings -> applyStudySettings(message)
             is StudyMessage.AssetTransfer -> {
                 voiceTransferByPayloadId.remove(message.payloadId)
                 earlyVoiceFileUriByPayloadId.remove(message.payloadId)
@@ -467,6 +498,34 @@ class StudentActivity : ComponentActivity() {
             is StudyMessage.SessionSnapshot,
             -> Unit
         }
+    }
+
+    private fun applyStudySettings(settings: StudyMessage.StudySettings) {
+        if (session.snapshot().status != SessionStatus.READY) {
+            eventLabel.text = "진행 중에는 시간 설정을 바꿀 수 없습니다"
+            return
+        }
+        session = SessionStateMachine(
+            schedule = StudySchedule(
+                meditationDurationMs = settings.meditationDurationMs,
+                studyDurationMs = settings.studyDurationMs,
+                breakDurationMs = settings.breakDurationMs,
+            ),
+            teacherCountdownDurationMs = settings.teacherCountdownMs,
+        )
+        activityMonitor = StudyActivityMonitor(
+            DetectionConfig(
+                presenceAbsenceThreshold = settings.presenceThreshold,
+                bookMovementThreshold = settings.bookMovementThreshold,
+                awayAfterMs = settings.awayAfterMs,
+                noMovementAfterMs = settings.noMovementAfterMs,
+            ),
+        )
+        captureIntervalMs = settings.captureIntervalMs
+        lastPublishedKey = null
+        renderSession(session.snapshot())
+        publishSnapshotIfChanged(session.snapshot(), force = true)
+        eventLabel.text = "선생님 설정 적용 완료"
     }
 
     private fun receiveTeacherText(message: StudyMessage.TextMessage) {
@@ -860,8 +919,8 @@ class StudentActivity : ComponentActivity() {
             }
             sendAlert(alertKind, event.observedDurationMs)
             eventLabel.text = when (event.kind) {
-                DetectionEventKind.AWAY -> "자리 판정 구역에서 10초 동안 보이지 않음(추정)"
-                DetectionEventKind.NO_BOOK_MOVEMENT -> "책 영역 움직임이 30초 동안 감지되지 않았습니다"
+                DetectionEventKind.AWAY -> "자리 판정 구역 이탈 알림을 전송했습니다"
+                DetectionEventKind.NO_BOOK_MOVEMENT -> "책 영역 움직임 없음 알림을 전송했습니다"
                 DetectionEventKind.PRESENCE_RESTORED -> "자리 판정 구역에 다시 보입니다"
                 DetectionEventKind.BOOK_MOVEMENT_RESTORED -> "책 영역 움직임이 다시 감지됐습니다"
             }
@@ -884,7 +943,7 @@ class StudentActivity : ComponentActivity() {
         if (!shouldCapture || captureInFlight) return
         val now = SystemClock.elapsedRealtime()
         val previousCapture = lastCaptureAtElapsedMs
-        if (previousCapture != null && now - previousCapture < CAPTURE_INTERVAL_MS) return
+        if (previousCapture != null && now - previousCapture < captureIntervalMs) return
 
         lastCaptureAtElapsedMs = now
         captureInFlight = true
@@ -1287,11 +1346,10 @@ class StudentActivity : ComponentActivity() {
             },
         )
 
-        val bottomPanel = LinearLayout(this).apply {
+        val statusPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(18), dp(16), dp(18), dp(18))
-            background = rounded(0xF7FFFFFF.toInt(), 22f)
-            elevation = dp(8).toFloat()
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = rounded(0xDFFFFFFF.toInt(), 15f)
         }
         val timerRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -1317,14 +1375,27 @@ class StudentActivity : ComponentActivity() {
         }
         timerRow.addView(labels, LinearLayout.LayoutParams(0, -2, 1f))
         timerRow.addView(timerLabel)
-        bottomPanel.addView(timerRow)
+        statusPanel.addView(timerRow)
 
         eventLabel = TextView(this).apply {
             text = "책과 자리 판정 영역을 맞춰 주세요"
             textSize = 13f
             setTextColor(COLOR_MUTED)
         }
-        bottomPanel.addView(eventLabel, matchWrap(top = 7, bottom = 12))
+        statusPanel.addView(eventLabel, matchWrap(top = 4))
+        root.addView(
+            statusPanel,
+            FrameLayout.LayoutParams(-1, -2, Gravity.TOP).apply {
+                marginStart = dp(12); marginEnd = dp(12); topMargin = dp(68)
+            },
+        )
+
+        val bottomPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+            background = rounded(0xF2FFFFFF.toInt(), 16f)
+            elevation = dp(8).toFloat()
+        }
 
         pairingPanel = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -1342,14 +1413,19 @@ class StudentActivity : ComponentActivity() {
         pairingPanel.addView(actionButton("승인", COLOR_PRIMARY).apply {
             setOnClickListener { pendingEndpointId?.let(transport::approve) }
         }, LinearLayout.LayoutParams(dp(88), dp(48)))
-        bottomPanel.addView(pairingPanel, matchWrap(bottom = 12))
+        bottomPanel.addView(pairingPanel, matchWrap(bottom = 6))
 
-        val primaryRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val actionRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+        }
         calibrateButton = actionButton("배치 완료", COLOR_SECONDARY).apply {
             isEnabled = false
             setOnClickListener {
                 calibrated = !calibrated
                 cameraView.setCalibrated(calibrated)
+                cameraView.setBookRegionEditingEnabled(!calibrated)
                 if (calibrated) cameraView.armPresenceBaseline()
                 text = if (calibrated) "배치 다시 맞춤" else "배치 완료"
                 eventLabel.text = if (calibrated) {
@@ -1364,14 +1440,6 @@ class StudentActivity : ComponentActivity() {
             isEnabled = false
             setOnClickListener { studentStart() }
         }
-        primaryRow.addView(calibrateButton, weightWrap(1f, end = 5))
-        primaryRow.addView(startButton, weightWrap(1f, start = 5))
-        bottomPanel.addView(primaryRow)
-
-        val problemRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
         problemButton = actionButton("문제 풀었어", COLOR_SUCCESS).apply {
             isEnabled = false
             setOnClickListener { completeProblem() }
@@ -1380,24 +1448,34 @@ class StudentActivity : ComponentActivity() {
             visibility = View.GONE
             setOnClickListener { undoProblem() }
         }
-        problemRow.addView(problemButton, LinearLayout.LayoutParams(0, dp(52), 1f))
-        problemRow.addView(undoButton, LinearLayout.LayoutParams(dp(92), dp(52)).apply { marginStart = dp(10) })
-        bottomPanel.addView(problemRow, matchWrap(top = 10))
         voiceMessageButton = actionButton("선생님께 음성 메시지", COLOR_PRIMARY).apply {
             setOnClickListener { toggleVoiceMessageRecording() }
         }
-        bottomPanel.addView(voiceMessageButton, matchWrap(top = 10))
         listenReplyButton = actionButton("선생님 답변 듣기", COLOR_SECONDARY).apply {
             visibility = View.GONE
             setOnClickListener { playLatestTeacherReply() }
         }
-        bottomPanel.addView(listenReplyButton, matchWrap(top = 8))
-        bottomPanel.addView(TextView(this).apply {
-            text = "기록 · 설정 ︿"
-            textSize = 13f
-            gravity = Gravity.CENTER
-            setTextColor(COLOR_MUTED)
-        }, matchWrap(top = 9))
+        listOf(calibrateButton, startButton, problemButton, undoButton, voiceMessageButton, listenReplyButton)
+            .forEach { button ->
+                actionRow.addView(button, LinearLayout.LayoutParams(dp(126), dp(48)).apply {
+                    marginEnd = dp(6)
+                })
+            }
+        val actionScroller = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            addView(actionRow, FrameLayout.LayoutParams(-2, dp(48)))
+        }
+        bottomPanel.addView(actionScroller, LinearLayout.LayoutParams(-1, 0))
+        val menuToggle = actionButton("메뉴 열기 ︿", COLOR_MUTED).apply {
+            textSize = 12f
+            setOnClickListener {
+                val opening = actionRow.visibility != View.VISIBLE
+                actionRow.visibility = if (opening) View.VISIBLE else View.GONE
+                actionScroller.layoutParams = LinearLayout.LayoutParams(-1, if (opening) dp(48) else 0)
+                text = if (opening) "메뉴 닫기 ﹀" else "메뉴 열기 ︿"
+            }
+        }
+        bottomPanel.addView(menuToggle, LinearLayout.LayoutParams(-1, dp(34)).apply { topMargin = dp(4) })
 
         root.addView(
             bottomPanel,
@@ -1416,6 +1494,10 @@ class StudentActivity : ComponentActivity() {
             (bottomPanel.layoutParams as FrameLayout.LayoutParams).let { params ->
                 params.bottomMargin = systemBars.bottom + dp(12)
                 bottomPanel.layoutParams = params
+            }
+            (statusPanel.layoutParams as FrameLayout.LayoutParams).let { params ->
+                params.topMargin = systemBars.top + dp(62)
+                statusPanel.layoutParams = params
             }
             insets
         }
@@ -1518,9 +1600,13 @@ class StudentActivity : ComponentActivity() {
 
     companion object {
         private const val REQUEST_PERMISSIONS = 401
+        private const val STATE_BOOK_LEFT = "book-left"
+        private const val STATE_BOOK_TOP = "book-top"
+        private const val STATE_BOOK_RIGHT = "book-right"
+        private const val STATE_BOOK_BOTTOM = "book-bottom"
         private const val TICK_INTERVAL_MS = 250L
         private const val UNDO_WINDOW_MS = 5_000L
-        private const val CAPTURE_INTERVAL_MS = 10_000L
+        private const val DEFAULT_CAPTURE_INTERVAL_MS = 10_000L
         private const val CAMERA_BIND_RETRY_DELAY_MS = 2_000L
         private const val MAX_CAMERA_BIND_RETRIES = 3
         private const val MAX_LOCAL_ASSETS = 300

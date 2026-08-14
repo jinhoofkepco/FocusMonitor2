@@ -2,18 +2,20 @@
 
 학생폰 카메라로 책과 자리 판정 구역을 보여 주고, 선생님폰과 1:1로 근거리 소통하는 **비배포 Android debug 프로토타입**입니다. 스토어 배포·운영용 release 앱이 아니며, 1차 범위는 두 Android 기기의 근거리 연결입니다.
 
-## 현재 실행되는 세로 단면
+## 현재 실행 화면
 
-1. 학생 앱에서 카메라 미리보기 위의 `책 영역`과 `자리 판정 영역`을 맞춥니다.
+1. 학생 앱에서 카메라 미리보기 위의 노란 `책 영역`을 직접 이동하거나 네 모서리를 끌어 크기를 맞춥니다. 자리 판정 영역은 별도 설정하지 않습니다.
 2. 학생폰은 선생님폰을 발견하고 양쪽에 동일한 Nearby 인증 숫자를 표시합니다. 양쪽에서 승인해야 연결됩니다.
-3. 학생이 직접 시작하거나 선생님이 시작을 요청합니다. 학생 시작은 즉시, 선생님 요청은 학생폰의 5초 카운트다운 뒤 시작합니다.
-4. 학생폰의 monotonic clock으로 `명상 5분 → 공부 40분 → 휴식 15분`을 진행하고 상태를 선생님폰에 동기화합니다.
-5. 공부 단계에서 카메라 분석 결과를 `activity-detection`에 넣어 자리 차이 10초와 책 움직임 없음 30초를 판정합니다. 알 수 없는 프레임은 `UNKNOWN`으로 두며, 연결 장애를 자리 비움으로 해석하지 않습니다.
-6. 공부 중 10초마다 학생폰에서 전체 원본 JPEG를 임시 생성한 뒤 `주변을 픽셀화한 썸네일`과 `고화질 책 ROI`로 분리하고 원본을 삭제합니다. 썸네일만 자동 전송하며, 고화질 책 ROI는 선생님이 해당 썸네일을 눌렀을 때 요청·전송합니다.
+3. 양쪽 앱의 조작 메뉴는 화면 맨 아래 한 줄의 작은 버튼으로 접거나 펼칩니다. 선생님은 설정에서 명상/공부/휴식, 시작 대기, 촬영 간격, 두 알림 시간과 두 감도를 변경할 수 있습니다.
+4. 학생이 직접 시작하거나 선생님이 시작을 요청합니다. 선생님 시작은 저장된 설정을 학생폰에 먼저 전달하고 항상 첫 명상 사이클부터 시작합니다.
+5. 학생폰의 monotonic clock으로 기본 `명상 5분 → 공부 40분 → 휴식 15분`을 진행하고 상태를 선생님폰에 동기화합니다.
+6. 공부 단계에서 카메라 분석 결과를 `activity-detection`에 넣어 자리 차이 10초와 책 움직임 없음 30초를 판정합니다. 알 수 없는 프레임은 `UNKNOWN`으로 두며, 연결 장애를 자리 비움으로 해석하지 않습니다.
+7. 공부 중 10초마다 학생폰에서 전체 원본 JPEG를 임시 생성한 뒤 `주변을 픽셀화한 썸네일`과 `고화질 책 ROI`로 분리하고 원본을 삭제합니다. 썸네일만 자동 전송하며, 고화질 책 ROI는 선생님이 해당 썸네일을 눌렀을 때 요청·전송합니다.
    파일은 Nearby의 실제 전송 완료 뒤에만 전송됨으로 표시합니다. 실패하면 연결 중 2초 간격으로 최초 시도 뒤 최대 3회 재시도하고, 재연결하면 남은 ROI·음성 및 최신 썸네일을 다시 보냅니다.
-7. 선생님 화면은 가장 최근 사진과 최근 썸네일 최대 12개를 표시합니다. 각 썸네일을 누르면 그 촬영 시점의 책 ROI를 요청합니다.
-8. 학생이 `문제 풀었어` 버튼 또는 음성 명령을 사용하면 선생님폰에 알림이 옵니다. 5초 안에는 취소할 수 있습니다.
-9. 학생은 최대 60초 음성 메시지를 보내고 선생님은 이를 재생할 수 있습니다. 선생님은 텍스트 또는 최대 60초 음성으로 답하며, 학생폰은 텍스트 답변을 한국어 TTS로 읽고 음성 답변을 재생합니다. 실시간 통화는 아닙니다.
+8. 선생님 화면은 화면 대부분을 최신 사진에 사용하고 아래에 최근 썸네일 최대 12개를 표시합니다. 썸네일을 누르면 해당 시점의 고화질 책 ROI가 상단 `×` 하나만 있는 전체화면으로 열립니다.
+9. 두 앱 모두 세로·가로 화면을 지원하며 회전 중 학생 세션과 책 영역을 유지합니다.
+10. 학생이 `문제 풀었어` 버튼 또는 음성 명령을 사용하면 선생님폰에 알림이 옵니다. 5초 안에는 취소할 수 있습니다.
+11. 학생은 최대 60초 음성 메시지를 보내고 선생님은 이를 재생할 수 있습니다. 선생님은 텍스트 또는 최대 60초 음성으로 답하며, 학생폰은 텍스트 답변을 한국어 TTS로 읽고 음성 답변을 재생합니다. 실시간 통화는 아닙니다.
 
 ## 모듈과 I/O
 
@@ -29,7 +31,7 @@
 | `voice-command` | start/stop, SpeechRecognizer result | 제한된 한국어 command | 음성 원본 저장·전송 없음, debounce와 touch 대체 입력 |
 | `voice-message` | main-thread record/stop/cancel/play, output file | AAC `.m4a` `RecordedVoiceMessage`, playback callback | 최대 60초, `.part` 성공 후 commit, 취소·실패 파일 cleanup, recorder·player 각각 활성 작업 1개 |
 | `app-student` | touch/voice/teacher request, camera observation, teacher reply | authoritative session state, thumbnail/ROI, alert, student voice message, TTS/playback | 타이머·촬영·판정 기준은 학생폰 |
-| `app-teacher` | pairing approval, start/media request, text/voice reply | concise state, 최근 썸네일 12개, ROI dialog, notifications | 썸네일 자동 수신과 ROI 요청 전송을 분리 |
+| `app-teacher` | pairing approval, settings/start/media request, text/voice reply | concise state, 최근 썸네일 12개, 전체화면 ROI, notifications | 설정 후 첫 사이클 시작, 썸네일 자동 수신과 ROI 요청 전송 분리 |
 
 상세 계약은 [`docs/remote-study-mvp-system-design-v0.1.md`](docs/remote-study-mvp-system-design-v0.1.md), 장기 wire schema는 [`docs/remote-study-protocol-v1.proto`](docs/remote-study-protocol-v1.proto)에 있습니다. 현재 빌드는 코드 생성 도구를 강제하지 않도록 같은 개념의 수동 검증 codec을 사용합니다.
 
@@ -67,7 +69,7 @@ Android 기기 또는 emulator가 연결된 경우 Camera asset processor의 ins
 - JVM/Android unit test 62개: 실패 0, 오류 0, skip 0
 - API 35 emulator camera instrumented test 1개: 통과
 - 학생/선생님/Nearby/camera/두 음성 모듈 Android lint: 오류 0
-- API 35 emulator에 두 debug APK 설치 및 cold launch 성공; 학생 배치 완료 → 명상 단계 전환 확인
+- API 35 emulator에 두 debug APK 설치 및 cold launch 성공; 접이식 메뉴·설정 화면·세로/가로 회전·학생 카메라 화면 확인
 - 실제 두 Android 기기 사이의 Nearby 승인·재연결·사진/음성 왕복과 거리·발열 시험은 아직 실행하지 않음
 
 APK:

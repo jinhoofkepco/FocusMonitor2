@@ -49,7 +49,11 @@ class StudyWireCodecTest {
                 sentAtEpochMs = 1_723_624_520_000,
                 durationMs = 12_500,
             ),
-            StudyMessage.Ack("m15", "m14"),
+            StudyMessage.StudySettings(
+                "m15", 300_000, 2_400_000, 900_000, 5_000, 10_000,
+                10_000, 30_000, 0.18f, 0.012f,
+            ),
+            StudyMessage.Ack("m16", "m14"),
         )
 
         messages.forEach { message ->

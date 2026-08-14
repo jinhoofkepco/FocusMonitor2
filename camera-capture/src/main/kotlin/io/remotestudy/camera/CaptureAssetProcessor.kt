@@ -33,11 +33,12 @@ internal object CaptureAssetProcessor {
         outputDir: File,
         assetId: String,
         capturedAtEpochMs: Long,
+        bookRegion: BookRegion = BookRegion.DEFAULT,
     ): CaptureAssets {
         var committedAssets: CaptureAssets? = null
         var processingFailure: Throwable? = null
         try {
-            committedAssets = createAssets(originalJpeg, outputDir, assetId, capturedAtEpochMs)
+            committedAssets = createAssets(originalJpeg, outputDir, assetId, capturedAtEpochMs, bookRegion)
             return committedAssets
         } catch (failure: Throwable) {
             processingFailure = failure
@@ -60,6 +61,7 @@ internal object CaptureAssetProcessor {
         outputDir: File,
         assetId: String,
         capturedAtEpochMs: Long,
+        bookRegion: BookRegion,
     ): CaptureAssets {
         require(originalJpeg.isFile) { "temporary camera original is missing" }
         require(assetId.matches(Regex("[A-Za-z0-9._-]{1,96}"))) {
@@ -83,8 +85,8 @@ internal object CaptureAssetProcessor {
         var bookCommitted = false
         try {
             val orientation = readExifOrientation(originalJpeg)
-            writeBookRoi(originalJpeg, orientation, bookStaging)
-            writeThumbnail(originalJpeg, orientation, thumbnailStaging)
+            writeBookRoi(originalJpeg, orientation, bookRegion.normalized(), bookStaging)
+            writeThumbnail(originalJpeg, orientation, bookRegion.normalized(), thumbnailStaging)
 
             if (!bookStaging.renameTo(bookRoiFile)) {
                 throw IOException("Unable to commit book ROI")
@@ -111,13 +113,18 @@ internal object CaptureAssetProcessor {
         }
     }
 
-    private fun writeBookRoi(originalJpeg: File, orientation: Int, destination: File) {
+    private fun writeBookRoi(
+        originalJpeg: File,
+        orientation: Int,
+        bookRegion: NormalizedRegion,
+        destination: File,
+    ) {
         val bounds = decodeBounds(originalJpeg)
         val rawRegion = rawRegionForUprightNormalized(
             width = bounds.first,
             height = bounds.second,
             orientation = orientation,
-            uprightRegion = CameraRegions.BOOK,
+            uprightRegion = bookRegion,
         )
         val sampleSize = sampleSizeFor(rawRegion.width(), rawRegion.height(), BOOK_MAX_LONG_EDGE)
         val decoder = BitmapRegionDecoder.newInstance(originalJpeg.absolutePath, false)
@@ -139,7 +146,12 @@ internal object CaptureAssetProcessor {
         }
     }
 
-    private fun writeThumbnail(originalJpeg: File, orientation: Int, destination: File) {
+    private fun writeThumbnail(
+        originalJpeg: File,
+        orientation: Int,
+        bookRegion: NormalizedRegion,
+        destination: File,
+    ) {
         val bounds = decodeBounds(originalJpeg)
         val sampleSize = sampleSizeFor(bounds.first, bounds.second, THUMBNAIL_MAX_LONG_EDGE)
         val sampledRaw = BitmapFactory.decodeFile(
@@ -147,7 +159,7 @@ internal object CaptureAssetProcessor {
             BitmapFactory.Options().apply { inSampleSize = sampleSize },
         ) ?: throw IOException("Unable to decode thumbnail source")
         val upright = orientAndLimit(sampledRaw, orientation, THUMBNAIL_MAX_LONG_EDGE)
-        val composited = pixelateOutsideBook(upright)
+        val composited = pixelateOutsideBook(upright, bookRegion)
         try {
             writeJpeg(composited, destination, THUMBNAIL_JPEG_QUALITY)
         } finally {
@@ -156,7 +168,7 @@ internal object CaptureAssetProcessor {
         }
     }
 
-    private fun pixelateOutsideBook(source: Bitmap): Bitmap {
+    private fun pixelateOutsideBook(source: Bitmap, bookRegion: NormalizedRegion): Bitmap {
         val tinyWidth = max(1, source.width / PIXEL_BLOCK_SIZE)
         val tinyHeight = max(1, source.height / PIXEL_BLOCK_SIZE)
         val tiny = Bitmap.createScaledBitmap(source, tinyWidth, tinyHeight, true)
@@ -166,10 +178,10 @@ internal object CaptureAssetProcessor {
         canvas.drawBitmap(tiny, null, fullRect, Paint().apply { isFilterBitmap = false })
 
         val bookSourceRect = Rect(
-            floor(CameraRegions.BOOK.left * source.width).toInt(),
-            floor(CameraRegions.BOOK.top * source.height).toInt(),
-            ceil(CameraRegions.BOOK.right * source.width).toInt(),
-            ceil(CameraRegions.BOOK.bottom * source.height).toInt(),
+            floor(bookRegion.left * source.width).toInt(),
+            floor(bookRegion.top * source.height).toInt(),
+            ceil(bookRegion.right * source.width).toInt(),
+            ceil(bookRegion.bottom * source.height).toInt(),
         )
         canvas.drawBitmap(
             source,

@@ -19,9 +19,28 @@ data class FrameObservation(
     val bookMovement: Float?,
 )
 
+/** Upright preview coordinates. Values are normalized so the region survives rotation. */
+data class BookRegion(
+    val left: Float,
+    val top: Float,
+    val right: Float,
+    val bottom: Float,
+) {
+    init {
+        require(left in 0f..1f && right in 0f..1f && right - left >= 0.12f)
+        require(top in 0f..1f && bottom in 0f..1f && bottom - top >= 0.12f)
+    }
+
+    internal fun normalized() = NormalizedRegion(left, top, right, bottom)
+
+    companion object {
+        val DEFAULT = BookRegion(0.07f, 0.30f, 0.93f, 0.70f)
+    }
+}
+
 internal object CameraRegions {
     // The lower control card covers the bottom of the preview. Both regions stay
     // fully visible above it so calibration cannot silently hide presence input.
-    val BOOK = NormalizedRegion(left = 0.07f, top = 0.30f, right = 0.93f, bottom = 0.70f)
+    val BOOK = BookRegion.DEFAULT.normalized()
     val PRESENCE = NormalizedRegion(left = 0.55f, top = 0.14f, right = 0.94f, bottom = 0.27f)
 }

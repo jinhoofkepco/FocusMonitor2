@@ -2,9 +2,11 @@ package io.remotestudy.teacher
 
 import android.Manifest
 import android.app.AlertDialog
+import android.app.Dialog
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.res.ColorStateList
+import android.content.res.Configuration
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -25,6 +27,7 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.HorizontalScrollView
 import android.widget.ImageView
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -103,10 +106,13 @@ class TeacherActivity : ComponentActivity() {
     private val recentThumbnails = ArrayDeque<RecentThumbnail>()
     private val pendingRoiAssetIds = mutableSetOf<String>()
     private var roiDialog: AlertDialog? = null
+    private var fullScreenPhotoDialog: Dialog? = null
+    private var studySettings = TeacherStudySettings()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         createNotificationChannel()
+        studySettings = loadStudySettings()
         setContentView(buildContentView())
 
         voicePlayer = VoiceMessagePlayer(this)
@@ -145,11 +151,17 @@ class TeacherActivity : ComponentActivity() {
         super.onStop()
     }
 
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+    }
+
     override fun onDestroy() {
         activityDestroyed = true
         handler.removeCallbacksAndMessages(null)
         roiDialog?.dismiss()
         roiDialog = null
+        fullScreenPhotoDialog?.dismiss()
+        fullScreenPhotoDialog = null
         voiceRecorder.close()
         voicePlayer.close()
         transport.setListener(null)
@@ -280,6 +292,7 @@ class TeacherActivity : ComponentActivity() {
             is StudyMessage.AssetTransfer -> registerAssetTransfer(message)
             is StudyMessage.TextMessage -> showTextMessage(message)
             is StudyMessage.VoiceTransfer -> registerVoiceTransfer(message)
+            is StudyMessage.StudySettings -> Unit
             is StudyMessage.AssetRequest -> Unit
             is StudyMessage.Ack -> Unit
             is StudyMessage.StartRequest -> Unit
@@ -354,27 +367,38 @@ class TeacherActivity : ComponentActivity() {
             AssetKind.BOOK_ROI -> {
                 pendingRoiAssetIds.remove(metadata.assetId)
                 thumbnailLabel.text = "고화질 책 영역 수신 완료"
-                roiDialog?.dismiss()
-                val image = ImageView(this).apply {
-                    setImageBitmap(bitmap)
-                    adjustViewBounds = true
-                    scaleType = ImageView.ScaleType.FIT_CENTER
-                    contentDescription = "${file.name} 책 영역"
-                }
-                val dialog = AlertDialog.Builder(this)
-                    .setTitle("책 영역 고화질")
-                    .setView(image)
-                    .setPositiveButton("닫기", null)
-                    .create()
-                dialog.setOnDismissListener {
-                    image.setImageDrawable(null)
-                    if (!bitmap.isRecycled) bitmap.recycle()
-                    if (roiDialog === dialog) roiDialog = null
-                }
-                roiDialog = dialog
-                dialog.show()
+                showFullScreenPhoto(bitmap, "${file.name} 책 영역")
             }
         }
+    }
+
+    private fun showFullScreenPhoto(bitmap: Bitmap, description: String) {
+        fullScreenPhotoDialog?.dismiss()
+        val dialog = Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
+        val frame = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        val image = ImageView(this).apply {
+            setImageBitmap(bitmap)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            contentDescription = description
+        }
+        frame.addView(image, FrameLayout.LayoutParams(-1, -1))
+        val close = Button(this).apply {
+            text = "×"
+            textSize = 28f
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.TRANSPARENT)
+            contentDescription = "사진 닫기"
+            setOnClickListener { dialog.dismiss() }
+        }
+        frame.addView(close, FrameLayout.LayoutParams(dp(56), dp(56), Gravity.TOP or Gravity.END))
+        dialog.setContentView(frame)
+        dialog.setOnDismissListener {
+            image.setImageDrawable(null)
+            if (!bitmap.isRecycled) bitmap.recycle()
+            if (fullScreenPhotoDialog === dialog) fullScreenPhotoDialog = null
+        }
+        fullScreenPhotoDialog = dialog
+        dialog.show()
     }
 
     private fun addRecentThumbnail(metadata: StudyMessage.AssetTransfer, bitmap: Bitmap) {
@@ -758,6 +782,15 @@ class TeacherActivity : ComponentActivity() {
     }
 
     private fun sendStartRequest() {
+        val settingsQueued = reliableChannel.send(
+            studySettings.toMessage(UUID.randomUUID().toString()),
+            SystemClock.elapsedRealtime(),
+            "study-settings",
+        )
+        if (!settingsQueued) {
+            eventLabel.text = "설정 전송 대기열이 가득 찼습니다"
+            return
+        }
         val message = StudyMessage.StartRequest(
                 messageId = UUID.randomUUID().toString(),
                 origin = WireStartOrigin.TEACHER,
@@ -770,74 +803,160 @@ class TeacherActivity : ComponentActivity() {
         }
     }
 
-    private fun buildContentView(): View {
-        val scroll = ScrollView(this).apply {
-            isFillViewport = true
-            setBackgroundColor(COLOR_BACKGROUND)
+    private fun showSettingsDialog() {
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), dp(8))
         }
+        fun numberField(label: String, value: String, decimal: Boolean = false): EditText {
+            container.addView(TextView(this).apply {
+                text = label
+                textSize = 13f
+                setTextColor(COLOR_MUTED)
+            }, matchWrap(top = 10))
+            return EditText(this).apply {
+                setText(value)
+                inputType = if (decimal) {
+                    InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+                } else {
+                    InputType.TYPE_CLASS_NUMBER
+                }
+                selectAll()
+                container.addView(this, LinearLayout.LayoutParams(-1, dp(48)))
+            }
+        }
+        val meditation = numberField("명상 시간(분)", studySettings.meditationMinutes.toString())
+        val study = numberField("공부 시간(분)", studySettings.studyMinutes.toString())
+        val rest = numberField("쉬는 시간(분)", studySettings.breakMinutes.toString())
+        val countdown = numberField("교사 시작 대기(초)", studySettings.countdownSeconds.toString())
+        val capture = numberField("사진 촬영 간격(초)", studySettings.captureSeconds.toString())
+        val away = numberField("자리 비움 알림(초)", studySettings.awaySeconds.toString())
+        val movement = numberField("책 움직임 없음 알림(초)", studySettings.noMovementSeconds.toString())
+        val presence = numberField("자리 변화 감도(0~1)", studySettings.presenceThreshold.toString(), true)
+        val book = numberField("책 움직임 감도(0~1)", studySettings.bookMovementThreshold.toString(), true)
+        val scroll = ScrollView(this).apply { addView(container) }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("학습 설정")
+            .setView(scroll)
+            .setNegativeButton("취소", null)
+            .setPositiveButton("저장", null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val candidate = runCatching {
+                    TeacherStudySettings(
+                        meditationMinutes = meditation.text.toString().toInt(),
+                        studyMinutes = study.text.toString().toInt(),
+                        breakMinutes = rest.text.toString().toInt(),
+                        countdownSeconds = countdown.text.toString().toInt(),
+                        captureSeconds = capture.text.toString().toInt(),
+                        awaySeconds = away.text.toString().toInt(),
+                        noMovementSeconds = movement.text.toString().toInt(),
+                        presenceThreshold = presence.text.toString().toFloat(),
+                        bookMovementThreshold = book.text.toString().toFloat(),
+                    ).validated()
+                }
+                candidate.onSuccess {
+                    studySettings = it
+                    saveStudySettings(it)
+                    eventLabel.text = "설정을 저장했습니다 · 다음 시작부터 적용"
+                    dialog.dismiss()
+                }.onFailure {
+                    eventLabel.text = "설정값을 확인해 주세요: ${it.message.orEmpty()}"
+                }
+            }
+        }
+        dialog.show()
+    }
+
+    private fun loadStudySettings(): TeacherStudySettings {
+        val preferences = getSharedPreferences("study-settings", MODE_PRIVATE)
+        return runCatching {
+            TeacherStudySettings(
+                meditationMinutes = preferences.getInt("meditation", 5),
+                studyMinutes = preferences.getInt("study", 40),
+                breakMinutes = preferences.getInt("break", 15),
+                countdownSeconds = preferences.getInt("countdown", 5),
+                captureSeconds = preferences.getInt("capture", 10),
+                awaySeconds = preferences.getInt("away", 10),
+                noMovementSeconds = preferences.getInt("movement", 30),
+                presenceThreshold = preferences.getFloat("presenceThreshold", 0.18f),
+                bookMovementThreshold = preferences.getFloat("bookThreshold", 0.012f),
+            ).validated()
+        }.getOrDefault(TeacherStudySettings())
+    }
+
+    private fun saveStudySettings(settings: TeacherStudySettings) {
+        getSharedPreferences("study-settings", MODE_PRIVATE).edit()
+            .putInt("meditation", settings.meditationMinutes)
+            .putInt("study", settings.studyMinutes)
+            .putInt("break", settings.breakMinutes)
+            .putInt("countdown", settings.countdownSeconds)
+            .putInt("capture", settings.captureSeconds)
+            .putInt("away", settings.awaySeconds)
+            .putInt("movement", settings.noMovementSeconds)
+            .putFloat("presenceThreshold", settings.presenceThreshold)
+            .putFloat("bookThreshold", settings.bookMovementThreshold)
+            .apply()
+    }
+
+    private fun buildContentView(): View {
+        val frame = FrameLayout(this).apply { setBackgroundColor(COLOR_BACKGROUND) }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(22), dp(18), dp(22), dp(24))
+            setPadding(dp(12), dp(12), dp(12), dp(52))
             setBackgroundColor(COLOR_BACKGROUND)
         }
-        root.addView(TextView(this).apply {
-            text = "학생 학습 상태"
-            textSize = 28f
-            setTextColor(COLOR_TEXT)
-            setTypeface(typeface, Typeface.BOLD)
-        })
-        root.addView(TextView(this).apply {
-            text = "필요한 정보만 한 화면에서 확인합니다"
-            textSize = 14f
-            setTextColor(COLOR_MUTED)
-        }, matchWrap(top = 4, bottom = 18))
-
         connectionPill = TextView(this).apply {
             textSize = 13f
             gravity = Gravity.CENTER
             setPadding(dp(14), dp(8), dp(14), dp(8))
         }
         setConnectionState("연결 준비 중", COLOR_MUTED)
-        root.addView(connectionPill, wrapWrap(bottom = 14))
+        root.addView(connectionPill, wrapWrap(bottom = 8))
 
         val statusCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(20), dp(20), dp(20))
-            background = rounded(Color.WHITE, 20f)
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+            background = rounded(Color.WHITE, 16f)
             elevation = dp(2).toFloat()
         }
+        val statusText = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         phaseLabel = TextView(this).apply {
             text = "준비 전"
-            textSize = 18f
+            textSize = 16f
             setTextColor(COLOR_MUTED)
             setTypeface(typeface, Typeface.BOLD)
         }
         timerLabel = TextView(this).apply {
             text = "40:00"
-            textSize = 52f
+            textSize = 38f
             setTextColor(COLOR_TEXT)
             setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
         }
         problemLabel = TextView(this).apply {
             text = "완료한 문제 0개"
-            textSize = 16f
+            textSize = 14f
             setTextColor(COLOR_TEXT)
         }
         eventLabel = TextView(this).apply {
             text = "학생폰 연결을 기다리는 중"
-            textSize = 14f
+            textSize = 12f
             setTextColor(COLOR_MUTED)
+            maxLines = 2
         }
-        statusCard.addView(phaseLabel)
-        statusCard.addView(timerLabel, matchWrap(top = 8, bottom = 10))
-        statusCard.addView(problemLabel)
-        statusCard.addView(eventLabel, matchWrap(top = 14))
-        root.addView(statusCard, matchWrap(bottom = 14))
+        statusText.addView(phaseLabel)
+        statusText.addView(problemLabel, matchWrap(top = 3))
+        statusText.addView(eventLabel, matchWrap(top = 4))
+        statusCard.addView(statusText, LinearLayout.LayoutParams(0, -2, 1f))
+        statusCard.addView(timerLabel)
+        root.addView(statusCard, matchWrap(bottom = 8))
 
         val mediaCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(12), dp(12), dp(12))
-            background = rounded(Color.WHITE, 18f)
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+            background = rounded(Color.WHITE, 14f)
         }
         latestThumbnail = ImageView(this).apply {
             setBackgroundColor(0xFFE7EAF1.toInt())
@@ -860,52 +979,39 @@ class TeacherActivity : ComponentActivity() {
             setTextColor(COLOR_MUTED)
             gravity = Gravity.CENTER
         }
-        mediaCard.addView(latestThumbnail, LinearLayout.LayoutParams(-1, dp(148)))
-        mediaCard.addView(thumbnailScroller, LinearLayout.LayoutParams(-1, dp(88)).apply {
-            topMargin = dp(10)
+        mediaCard.addView(latestThumbnail, LinearLayout.LayoutParams(-1, 0, 1f))
+        mediaCard.addView(thumbnailScroller, LinearLayout.LayoutParams(-1, dp(82)).apply {
+            topMargin = dp(6)
         })
-        mediaCard.addView(thumbnailLabel, matchWrap(top = 9))
-        root.addView(mediaCard, matchWrap(bottom = 14))
+        mediaCard.addView(thumbnailLabel, matchWrap(top = 4))
+        root.addView(mediaCard, LinearLayout.LayoutParams(-1, 0, 1f))
 
         studentVoiceButton = actionButton("학생 음성 듣기", COLOR_SUCCESS).apply {
             visibility = View.GONE
             setOnClickListener { playLatestStudentVoice() }
         }
-        root.addView(studentVoiceButton, LinearLayout.LayoutParams(-1, dp(52)).apply {
-            bottomMargin = dp(10)
-        })
-
-        val replyActions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         textReplyButton = actionButton("텍스트 답장", COLOR_PRIMARY).apply {
             setOnClickListener { showTextReplyDialog() }
         }
         voiceReplyButton = actionButton("음성 답장", COLOR_MUTED).apply {
             setOnClickListener { toggleVoiceRecording() }
         }
-        replyActions.addView(textReplyButton, weightWrap(1f, end = 6))
-        replyActions.addView(voiceReplyButton, weightWrap(1f, start = 6))
-        root.addView(replyActions, matchWrap(bottom = 14))
 
         pairingPanel = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(18), dp(16), dp(18), dp(16))
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(8), dp(6), dp(8), dp(6))
             background = rounded(0xFFFFF6D8.toInt(), 16f)
             visibility = View.GONE
         }
-        pairingPanel.addView(TextView(this).apply {
-            text = "두 폰에 같은 숫자가 보이는지 확인"
-            textSize = 14f
-            setTextColor(COLOR_TEXT)
-        })
         pairingDigits = TextView(this).apply {
             text = "0000"
-            textSize = 30f
+            textSize = 24f
             letterSpacing = 0.18f
             setTextColor(COLOR_TEXT)
             setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
         }
-        pairingPanel.addView(pairingDigits, matchWrap(top = 6, bottom = 10))
-        val pairingActions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        pairingPanel.addView(pairingDigits, LinearLayout.LayoutParams(0, -2, 1f))
         approveButton = actionButton("연결 승인", COLOR_PRIMARY).apply {
             setOnClickListener { pendingEndpointId?.let(transport::approve) }
         }
@@ -915,34 +1021,66 @@ class TeacherActivity : ComponentActivity() {
                 pairingPanel.visibility = View.GONE
             }
         }
-        pairingActions.addView(approveButton, weightWrap(1f, end = 6))
-        pairingActions.addView(rejectButton, weightWrap(1f, start = 6))
-        pairingPanel.addView(pairingActions)
-        root.addView(pairingPanel, matchWrap(bottom = 14))
+        pairingPanel.addView(approveButton, LinearLayout.LayoutParams(dp(104), dp(44)))
+        pairingPanel.addView(rejectButton, LinearLayout.LayoutParams(dp(72), dp(44)).apply { marginStart = dp(6) })
 
         startButton = actionButton("공부 시작 요청", COLOR_PRIMARY).apply {
             isEnabled = false
             setOnClickListener { sendStartRequest() }
         }
-        root.addView(startButton, LinearLayout.LayoutParams(-1, dp(56)))
-        root.addView(TextView(this).apply {
-            text = "설정 · 메시지 · 기록 ︿"
-            gravity = Gravity.CENTER
-            textSize = 14f
-            setTextColor(COLOR_MUTED)
-        }, matchWrap(top = 14))
-        ViewCompat.setOnApplyWindowInsetsListener(scroll) { _, insets ->
+        val settingsButton = actionButton("설정", COLOR_MUTED).apply {
+            setOnClickListener { showSettingsDialog() }
+        }
+        val actionRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+        }
+        listOf(startButton, settingsButton, studentVoiceButton, textReplyButton, voiceReplyButton)
+            .forEach { button ->
+                actionRow.addView(button, LinearLayout.LayoutParams(dp(128), dp(46)).apply { marginEnd = dp(6) })
+            }
+        val actionScroller = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            addView(actionRow, FrameLayout.LayoutParams(-2, dp(46)))
+        }
+        val bottomPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(8), dp(6), dp(8), dp(6))
+            background = rounded(0xF7FFFFFF.toInt(), 14f)
+            elevation = dp(8).toFloat()
+            addView(pairingPanel, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(4) })
+            addView(actionScroller, LinearLayout.LayoutParams(-1, 0))
+        }
+        val menuToggle = actionButton("메뉴 열기 ︿", COLOR_MUTED).apply {
+            textSize = 12f
+            setOnClickListener {
+                val opening = actionRow.visibility != View.VISIBLE
+                actionRow.visibility = if (opening) View.VISIBLE else View.GONE
+                actionScroller.layoutParams = LinearLayout.LayoutParams(-1, if (opening) dp(46) else 0)
+                text = if (opening) "메뉴 닫기 ﹀" else "메뉴 열기 ︿"
+            }
+        }
+        bottomPanel.addView(menuToggle, LinearLayout.LayoutParams(-1, dp(34)).apply { topMargin = dp(3) })
+        frame.addView(root, FrameLayout.LayoutParams(-1, -1))
+        frame.addView(
+            bottomPanel,
+            FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM).apply {
+                marginStart = dp(8); marginEnd = dp(8); bottomMargin = dp(8)
+            },
+        )
+        ViewCompat.setOnApplyWindowInsetsListener(frame) { _, insets ->
             val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
             root.setPadding(
-                dp(22),
-                systemBars.top + dp(18),
-                dp(22),
-                systemBars.bottom + dp(24),
+                dp(12), systemBars.top + dp(10), dp(12), systemBars.bottom + dp(52),
             )
+            (bottomPanel.layoutParams as FrameLayout.LayoutParams).let { params ->
+                params.bottomMargin = systemBars.bottom + dp(8)
+                bottomPanel.layoutParams = params
+            }
             insets
         }
-        scroll.addView(root, android.widget.FrameLayout.LayoutParams(-1, -2))
-        return scroll
+        return frame
     }
 
     private fun setConnectionState(text: String, color: Int) {
@@ -1035,7 +1173,7 @@ class TeacherActivity : ComponentActivity() {
 
     private fun phaseText(phase: WireSessionPhase, status: WireSessionStatus): String {
         if (status == WireSessionStatus.READY) return "배치 후 시작"
-        if (status == WireSessionStatus.START_COUNTDOWN) return "5초 뒤 공부 시작"
+        if (status == WireSessionStatus.START_COUNTDOWN) return "곧 공부 시작"
         if (status == WireSessionStatus.PAUSED) return "잠시 멈춤"
         return when (phase) {
             WireSessionPhase.MEDITATION -> "명상 시간"
@@ -1123,6 +1261,43 @@ class TeacherActivity : ComponentActivity() {
         val imageView: ImageView,
         val bitmap: Bitmap,
     )
+
+    private data class TeacherStudySettings(
+        val meditationMinutes: Int = 5,
+        val studyMinutes: Int = 40,
+        val breakMinutes: Int = 15,
+        val countdownSeconds: Int = 5,
+        val captureSeconds: Int = 10,
+        val awaySeconds: Int = 10,
+        val noMovementSeconds: Int = 30,
+        val presenceThreshold: Float = 0.18f,
+        val bookMovementThreshold: Float = 0.012f,
+    ) {
+        fun validated() = apply {
+            require(meditationMinutes in 1..1_440) { "명상 시간은 1~1440분" }
+            require(studyMinutes in 1..1_440) { "공부 시간은 1~1440분" }
+            require(breakMinutes in 1..1_440) { "쉬는 시간은 1~1440분" }
+            require(countdownSeconds in 1..60) { "시작 대기는 1~60초" }
+            require(captureSeconds in 1..3_600) { "촬영 간격은 1~3600초" }
+            require(awaySeconds in 1..3_600) { "자리 알림은 1~3600초" }
+            require(noMovementSeconds in 1..3_600) { "움직임 알림은 1~3600초" }
+            require(presenceThreshold.isFinite() && presenceThreshold in 0f..1f) { "자리 감도는 0~1" }
+            require(bookMovementThreshold.isFinite() && bookMovementThreshold in 0f..1f) { "책 감도는 0~1" }
+        }
+
+        fun toMessage(messageId: String) = StudyMessage.StudySettings(
+            messageId = messageId,
+            meditationDurationMs = meditationMinutes * 60_000L,
+            studyDurationMs = studyMinutes * 60_000L,
+            breakDurationMs = breakMinutes * 60_000L,
+            teacherCountdownMs = countdownSeconds * 1_000L,
+            captureIntervalMs = captureSeconds * 1_000L,
+            awayAfterMs = awaySeconds * 1_000L,
+            noMovementAfterMs = noMovementSeconds * 1_000L,
+            presenceThreshold = presenceThreshold,
+            bookMovementThreshold = bookMovementThreshold,
+        )
+    }
 
     companion object {
         private const val REQUEST_PERMISSIONS = 400

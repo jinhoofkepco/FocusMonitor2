@@ -99,6 +99,20 @@ sealed interface StudyMessage {
         val durationMs: Long,
     ) : StudyMessage
 
+    /** Numeric settings selected on the teacher phone and applied before a session starts. */
+    data class StudySettings(
+        override val messageId: String,
+        val meditationDurationMs: Long,
+        val studyDurationMs: Long,
+        val breakDurationMs: Long,
+        val teacherCountdownMs: Long,
+        val captureIntervalMs: Long,
+        val awayAfterMs: Long,
+        val noMovementAfterMs: Long,
+        val presenceThreshold: Float,
+        val bookMovementThreshold: Float,
+    ) : StudyMessage
+
     data class Ack(
         override val messageId: String,
         val acknowledgedMessageId: String,

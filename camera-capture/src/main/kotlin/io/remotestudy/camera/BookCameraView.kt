@@ -3,13 +3,13 @@ package io.remotestudy.camera
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.DashPathEffect
 import android.graphics.Paint
 import android.graphics.RectF
 import android.os.Looper
 import android.util.AttributeSet
 import android.util.Size
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.widget.FrameLayout
 import android.widget.TextView
@@ -53,10 +53,16 @@ class BookCameraView @JvmOverloads constructor(
     private val pendingCaptures = ConcurrentHashMap.newKeySet<PendingCapture>()
 
     @Volatile
+    private var bookRegion: BookRegion = BookRegion.DEFAULT
+
+    @Volatile
     private var frameObservationListener: ((FrameObservation) -> Unit)? = null
 
     @Volatile
     private var imageCapture: ImageCapture? = null
+
+    @Volatile
+    private var preview: Preview? = null
 
     @Volatile
     private var imageAnalysis: ImageAnalysis? = null
@@ -74,9 +80,12 @@ class BookCameraView @JvmOverloads constructor(
         implementationMode = PreviewView.ImplementationMode.COMPATIBLE
         scaleType = PreviewView.ScaleType.FILL_CENTER
     }
-    private val guideView = CalibrationGuideView(context)
+    private val guideView = CalibrationGuideView(context) { region ->
+        bookRegion = region
+        frameAnalyzer.setBookRegion(region)
+    }
     private val hint = TextView(context).apply {
-        text = "노랑: 책 · 파랑: 손/상체"
+        text = "노란 책 영역을 직접 맞춰 주세요"
         setTextColor(Color.WHITE)
         setBackgroundColor(0x99000000.toInt())
         textSize = 14f
@@ -172,7 +181,7 @@ class BookCameraView @JvmOverloads constructor(
                     val provider = providerFuture.get()
                     candidateProvider = provider
                     val targetRotation = viewPort.rotation
-                    val preview = Preview.Builder()
+                    val candidatePreview = Preview.Builder()
                         .setTargetRotation(targetRotation)
                         .build()
                         .also { it.surfaceProvider = previewView.surfaceProvider }
@@ -196,7 +205,7 @@ class BookCameraView @JvmOverloads constructor(
                         CameraSelector.DEFAULT_BACK_CAMERA,
                         UseCaseGroup.Builder()
                             .setViewPort(viewPort)
-                            .addUseCase(preview)
+                            .addUseCase(candidatePreview)
                             .addUseCase(capture)
                             .addUseCase(analysis)
                             .build(),
@@ -204,6 +213,7 @@ class BookCameraView @JvmOverloads constructor(
                     check(!closed.get()) { "BookCameraView was closed while binding" }
                     cameraProvider = provider
                     imageCapture = capture
+                    preview = candidatePreview
                     imageAnalysis = analysis
                     candidateProvider = null
                     candidateAnalysis = null
@@ -215,6 +225,7 @@ class BookCameraView @JvmOverloads constructor(
                     imageAnalysis?.clearAnalyzer()
                     imageAnalysis = null
                     imageCapture = null
+                    preview = null
                     completeBind(request, Result.failure(failure))
                 }
             },
@@ -280,6 +291,7 @@ class BookCameraView @JvmOverloads constructor(
                                     outputDir = outputDir,
                                     assetId = assetId,
                                     capturedAtEpochMs = capturedAtEpochMs,
+                                    bookRegion = bookRegion,
                                 )
                             }
                             completeCapture(request, result)
@@ -304,8 +316,32 @@ class BookCameraView @JvmOverloads constructor(
             hint.text = if (calibrated) {
                 "배치 완료 · 판정 구역 촬영 중"
             } else {
-                "노랑: 책 · 파랑: 손/상체"
+                "노란 책 영역을 직접 맞춰 주세요"
             }
+        }
+    }
+
+    /** Enables direct drag/resize of the yellow book rectangle. */
+    fun setBookRegionEditingEnabled(enabled: Boolean) {
+        runOnMain { guideView.editingEnabled = enabled }
+    }
+
+    fun setBookRegion(region: BookRegion) {
+        runOnMain {
+            bookRegion = region
+            frameAnalyzer.setBookRegion(region)
+            guideView.setBookRegion(region)
+        }
+    }
+
+    fun currentBookRegion(): BookRegion = bookRegion
+
+    /** Keeps CameraX output upright when the host handles configuration changes itself. */
+    fun updateTargetRotation(rotation: Int) {
+        runOnMain {
+            preview?.targetRotation = rotation
+            imageCapture?.targetRotation = rotation
+            imageAnalysis?.targetRotation = rotation
         }
     }
 
@@ -329,6 +365,7 @@ class BookCameraView @JvmOverloads constructor(
             cameraProvider?.unbindAll()
             imageAnalysis = null
             imageCapture = null
+            preview = null
             cameraProvider = null
         }
         cameraExecutor.shutdownNow()
@@ -399,22 +436,35 @@ class BookCameraView @JvmOverloads constructor(
     }
 }
 
-private class CalibrationGuideView(context: Context) : android.view.View(context) {
+private class CalibrationGuideView(
+    context: Context,
+    private val onBookRegionChanged: (BookRegion) -> Unit,
+) : android.view.View(context) {
     var calibrated: Boolean = false
         set(value) {
             field = value
             invalidate()
         }
 
+    var editingEnabled: Boolean = true
+        set(value) {
+            field = value
+            invalidate()
+        }
+
+    private var bookRegion = BookRegion.DEFAULT
+    private var dragMode = DragMode.NONE
+    private var lastTouchX = 0f
+    private var lastTouchY = 0f
+
+    fun setBookRegion(region: BookRegion) {
+        bookRegion = region
+        invalidate()
+    }
+
     private val bookPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = dp(3f)
-    }
-    private val presencePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeWidth = dp(2f)
-        color = Color.rgb(66, 203, 245)
-        pathEffect = DashPathEffect(floatArrayOf(dp(10f), dp(7f)), 0f)
     }
     private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         textSize = dp(14f)
@@ -423,17 +473,87 @@ private class CalibrationGuideView(context: Context) : android.view.View(context
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        val book = CameraRegions.BOOK.toRectF(width, height)
-        val presence = CameraRegions.PRESENCE.toRectF(width, height)
-
+        val book = bookRegion.normalized().toRectF(width, height)
         bookPaint.color = if (calibrated) Color.rgb(87, 214, 141) else Color.rgb(255, 196, 61)
         labelPaint.color = bookPaint.color
         canvas.drawRoundRect(book, dp(12f), dp(12f), bookPaint)
-        canvas.drawText(if (calibrated) "책 영역 ✓" else "책 영역", book.left, book.top - dp(10f), labelPaint)
+        val bookLabel = when {
+            editingEnabled -> "책 영역 · 안쪽 이동 / 모서리 크기 조절"
+            calibrated -> "책 영역 ✓"
+            else -> "책 영역"
+        }
+        canvas.drawText(bookLabel, book.left, (book.top - dp(10f)).coerceAtLeast(dp(20f)), labelPaint)
+    }
 
-        canvas.drawRoundRect(presence, dp(10f), dp(10f), presencePaint)
-        labelPaint.color = presencePaint.color
-        canvas.drawText("자리 판정 영역", presence.left, presence.top - dp(9f), labelPaint)
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (!editingEnabled || width == 0 || height == 0) return false
+        val x = event.x.coerceIn(0f, width.toFloat())
+        val y = event.y.coerceIn(0f, height.toFloat())
+        val rect = bookRegion.normalized().toRectF(width, height)
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                dragMode = hitTest(x, y, rect)
+                if (dragMode == DragMode.NONE) return false
+                lastTouchX = x
+                lastTouchY = y
+                parent?.requestDisallowInterceptTouchEvent(true)
+                return true
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (dragMode == DragMode.NONE) return false
+                val dx = (x - lastTouchX) / width
+                val dy = (y - lastTouchY) / height
+                updateRegion(dx, dy)
+                lastTouchX = x
+                lastTouchY = y
+                return true
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                val handled = dragMode != DragMode.NONE
+                dragMode = DragMode.NONE
+                parent?.requestDisallowInterceptTouchEvent(false)
+                return handled
+            }
+        }
+        return false
+    }
+
+    private fun hitTest(x: Float, y: Float, rect: RectF): DragMode {
+        val radius = dp(34f)
+        if (distanceSquared(x, y, rect.left, rect.top) <= radius * radius) return DragMode.TOP_LEFT
+        if (distanceSquared(x, y, rect.right, rect.top) <= radius * radius) return DragMode.TOP_RIGHT
+        if (distanceSquared(x, y, rect.left, rect.bottom) <= radius * radius) return DragMode.BOTTOM_LEFT
+        if (distanceSquared(x, y, rect.right, rect.bottom) <= radius * radius) return DragMode.BOTTOM_RIGHT
+        return if (rect.contains(x, y)) DragMode.MOVE else DragMode.NONE
+    }
+
+    private fun updateRegion(dx: Float, dy: Float) {
+        val minimum = 0.12f
+        var left = bookRegion.left
+        var top = bookRegion.top
+        var right = bookRegion.right
+        var bottom = bookRegion.bottom
+        when (dragMode) {
+            DragMode.MOVE -> {
+                val safeDx = dx.coerceIn(-left, 1f - right)
+                val safeDy = dy.coerceIn(-top, 1f - bottom)
+                left += safeDx; right += safeDx; top += safeDy; bottom += safeDy
+            }
+            DragMode.TOP_LEFT -> { left = (left + dx).coerceIn(0f, right - minimum); top = (top + dy).coerceIn(0f, bottom - minimum) }
+            DragMode.TOP_RIGHT -> { right = (right + dx).coerceIn(left + minimum, 1f); top = (top + dy).coerceIn(0f, bottom - minimum) }
+            DragMode.BOTTOM_LEFT -> { left = (left + dx).coerceIn(0f, right - minimum); bottom = (bottom + dy).coerceIn(top + minimum, 1f) }
+            DragMode.BOTTOM_RIGHT -> { right = (right + dx).coerceIn(left + minimum, 1f); bottom = (bottom + dy).coerceIn(top + minimum, 1f) }
+            DragMode.NONE -> return
+        }
+        bookRegion = BookRegion(left, top, right, bottom)
+        onBookRegionChanged(bookRegion)
+        invalidate()
+    }
+
+    private fun distanceSquared(x1: Float, y1: Float, x2: Float, y2: Float): Float {
+        val dx = x1 - x2
+        val dy = y1 - y2
+        return dx * dx + dy * dy
     }
 
     private fun NormalizedRegion.toRectF(width: Int, height: Int) = RectF(
@@ -444,4 +564,6 @@ private class CalibrationGuideView(context: Context) : android.view.View(context
     )
 
     private fun dp(value: Float): Float = value * resources.displayMetrics.density
+
+    private enum class DragMode { NONE, MOVE, TOP_LEFT, TOP_RIGHT, BOTTOM_LEFT, BOTTOM_RIGHT }
 }
