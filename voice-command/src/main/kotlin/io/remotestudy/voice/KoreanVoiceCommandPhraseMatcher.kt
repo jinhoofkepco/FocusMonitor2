@@ -35,7 +35,7 @@ class KoreanVoiceCommandPhraseMatcher {
                 "^공부(를)?시작(해|해줘|해주세요|하자|할게|합니다|할까요)?$",
             ),
             VoiceCommand.PROBLEM_DONE to Regex(
-                "^(문제(를)?|이문제(를)?)?(다)?풀었(어|어요|습니다)?$",
+                "^(아빠)?((문제(를)?|이문제(를)?)?(다)?풀었(어|어요|습니다)?|벌써(요)?)$",
             ),
             VoiceCommand.UNDO to Regex(
                 "^(방금(거|꺼))?취소(해|해줘|해주세요|할게)?$",

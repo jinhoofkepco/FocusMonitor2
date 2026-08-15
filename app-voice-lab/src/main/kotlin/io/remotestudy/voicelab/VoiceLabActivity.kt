@@ -258,7 +258,7 @@ class VoiceLabActivity : ComponentActivity() {
         if (!final) return
         val normalized = primary.replace(Regex("[\\s\\p{P}\\p{S}]+"), "")
         val detected = when {
-            "풀었" in normalized -> "풀었어"
+            "풀었" in normalized || normalized == "벌써" || normalized == "벌써요" -> "풀었어"
             normalized.startsWith("아빠") -> "아빠"
             else -> null
         }

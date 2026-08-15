@@ -26,6 +26,10 @@ class KoreanVoiceCommandPhraseMatcherTest {
             "다 풀었어",
             "문제를 다 풀었어요.",
             "이 문제 풀었습니다",
+            "벌써",
+            "벌써요",
+            "아빠 풀었어",
+            "아빠 벌써",
         )
     }
 
@@ -82,6 +86,7 @@ class KoreanVoiceCommandPhraseMatcherTest {
             "공부 끝나면 놀자",
             "멈추지 마",
             "문제 푸는 중",
+            "벌써 끝났어",
             "",
             "   ",
         ).forEach { phrase -> assertNull(phrase, matcher.match(phrase)) }
