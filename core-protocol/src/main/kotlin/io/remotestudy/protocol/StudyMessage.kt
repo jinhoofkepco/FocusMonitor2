@@ -1,6 +1,6 @@
 package io.remotestudy.protocol
 
-const val STUDY_PROTOCOL_VERSION: Int = 3
+const val STUDY_PROTOCOL_VERSION: Int = 4
 
 enum class PeerRole { STUDENT, TEACHER }
 
@@ -43,6 +43,12 @@ enum class DetailCaptureMode {
     ULTRA_50_MP,
 }
 
+enum class SessionControlAction {
+    PAUSE,
+    RESUME,
+    RESET,
+}
+
 sealed interface StudyMessage {
     val messageId: String
 
@@ -55,6 +61,11 @@ sealed interface StudyMessage {
     data class StartRequest(
         override val messageId: String,
         val origin: WireStartOrigin,
+    ) : StudyMessage
+
+    data class SessionControl(
+        override val messageId: String,
+        val action: SessionControlAction,
     ) : StudyMessage
 
     data class SessionSnapshot(

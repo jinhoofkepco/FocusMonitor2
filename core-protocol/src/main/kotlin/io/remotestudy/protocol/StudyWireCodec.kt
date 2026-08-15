@@ -24,6 +24,7 @@ object StudyWireCodec {
     private const val TYPE_STUDY_SETTINGS = 11
     private const val TYPE_BOOK_REGION_SETTINGS = 12
     private const val TYPE_CAMERA_PROFILE_STATUS = 13
+    private const val TYPE_SESSION_CONTROL = 14
 
     fun encode(message: StudyMessage): ByteArray {
         require(message.messageId.isNotBlank()) { "messageId must not be blank" }
@@ -40,6 +41,8 @@ object StudyWireCodec {
                 }
 
                 is StudyMessage.StartRequest -> data.writeByte(message.origin.ordinal)
+
+                is StudyMessage.SessionControl -> data.writeByte(message.action.ordinal)
 
                 is StudyMessage.SessionSnapshot -> {
                     require(message.sessionId.isNotBlank()) { "sessionId must not be blank" }
@@ -268,6 +271,13 @@ object StudyWireCodec {
                     ultra50MpAvailable = data.readBoolean(),
                 ).also(::validateCameraProfileStatus)
 
+                TYPE_SESSION_CONTROL -> StudyMessage.SessionControl(
+                    messageId = messageId,
+                    action = enumValue(
+                        data.readUnsignedByte(), SessionControlAction.entries, "session control action",
+                    ),
+                )
+
                 TYPE_ACK -> StudyMessage.Ack(
                     messageId = messageId,
                     acknowledgedMessageId = data.readSizedString().also { require(it.isNotBlank()) },
@@ -283,6 +293,7 @@ object StudyWireCodec {
     private fun typeOf(message: StudyMessage): Int = when (message) {
         is StudyMessage.Hello -> TYPE_HELLO
         is StudyMessage.StartRequest -> TYPE_START_REQUEST
+        is StudyMessage.SessionControl -> TYPE_SESSION_CONTROL
         is StudyMessage.SessionSnapshot -> TYPE_SESSION_SNAPSHOT
         is StudyMessage.ProblemCompleted -> TYPE_PROBLEM_COMPLETED
         is StudyMessage.Alert -> TYPE_ALERT

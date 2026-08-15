@@ -8,6 +8,7 @@ import android.app.NotificationManager
 import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.content.pm.PackageManager
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -40,12 +41,14 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.activity.ComponentActivity
+import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import io.remotestudy.protocol.AlertKind
 import io.remotestudy.protocol.AssetKind
 import io.remotestudy.protocol.DetailCaptureMode
 import io.remotestudy.protocol.PeerRole
+import io.remotestudy.protocol.SessionControlAction
 import io.remotestudy.protocol.StudyMessage
 import io.remotestudy.protocol.WireSessionPhase
 import io.remotestudy.protocol.WireSessionStatus
@@ -90,6 +93,7 @@ class TeacherActivity : ComponentActivity() {
     private lateinit var approveButton: Button
     private lateinit var rejectButton: Button
     private lateinit var startButton: Button
+    private lateinit var reconnectButton: Button
     private lateinit var latestThumbnail: ImageView
     private lateinit var thumbnailLabel: TextView
     private lateinit var thumbnailScroller: HorizontalScrollView
@@ -107,6 +111,9 @@ class TeacherActivity : ComponentActivity() {
     private var activityDestroyed = false
     private var latestSessionId: String? = null
     private var latestSessionRevision = -1L
+    private var latestSessionStatus: WireSessionStatus? = null
+    private var resetSessionOnNextConnect = false
+    private var awaitingResetReady = false
     private var latestStudentVoiceFile: File? = null
     private val transferByPayloadId = linkedMapOf<Long, StudyMessage.AssetTransfer>()
     private val voiceTransferByPayloadId = linkedMapOf<Long, StudyMessage.VoiceTransfer>()
@@ -208,6 +215,7 @@ class TeacherActivity : ComponentActivity() {
         voicePlayer.close()
         transport.setListener(null)
         transport.stop()
+        if (isFinishing) stopService(Intent(this, TeacherKeepAliveService::class.java))
         fileExecutor.shutdownNow()
         super.onDestroy()
     }
@@ -253,6 +261,7 @@ class TeacherActivity : ComponentActivity() {
 
     private fun startTransport() {
         if (transportStarted) return
+        ContextCompat.startForegroundService(this, Intent(this, TeacherKeepAliveService::class.java))
         transportStarted = true
         transport.start(TransportRole.TEACHER, "선생님폰")
     }
@@ -277,7 +286,6 @@ class TeacherActivity : ComponentActivity() {
                 flushPendingVoiceMessages()
                 pairingPanel.visibility = View.GONE
                 setConnectionState("${event.displayName} 연결됨", COLOR_SUCCESS)
-                startButton.isEnabled = true
                 eventLabel.text = "연결 완료 · 학생의 배치 완료를 기다리는 중"
                 reliableChannel.send(
                     studySettings.toMessage(UUID.randomUUID().toString()),
@@ -285,6 +293,18 @@ class TeacherActivity : ComponentActivity() {
                     "study-settings",
                 )
                 sendCurrentBookProfile()
+                if (resetSessionOnNextConnect) {
+                    val queued = reliableChannel.send(
+                        StudyMessage.SessionControl(
+                            messageId = UUID.randomUUID().toString(),
+                            action = SessionControlAction.RESET,
+                        ),
+                        SystemClock.elapsedRealtime(),
+                        "session-reset",
+                    )
+                    if (queued) resetSessionOnNextConnect = false
+                }
+                updateSessionControlButton()
             }
 
             is TransportEvent.Disconnected -> {
@@ -322,11 +342,20 @@ class TeacherActivity : ComponentActivity() {
                 if (currentSessionId == message.sessionId && message.revision <= latestSessionRevision) return
                 if (currentSessionId != message.sessionId) latestSessionId = message.sessionId
                 latestSessionRevision = message.revision
+                latestSessionStatus = message.status
+                val resetConfirmed = awaitingResetReady && message.status == WireSessionStatus.READY
+                if (resetConfirmed) {
+                    awaitingResetReady = false
+                }
                 phaseLabel.text = phaseText(message.phase, message.status)
                 timerLabel.text = formatDuration(message.remainingMs)
                 problemLabel.text = "완료한 문제 ${message.completedProblems}개"
-                eventLabel.text = "학생 상태 갱신 · revision ${message.revision}"
-                startButton.isEnabled = message.status == WireSessionStatus.READY
+                eventLabel.text = if (resetConfirmed) {
+                    "학생폰 초기화 확인 · 새 공부를 시작할 수 있습니다"
+                } else {
+                    "학생 상태 갱신 · revision ${message.revision}"
+                }
+                updateSessionControlButton()
             }
 
             is StudyMessage.ProblemCompleted -> {
@@ -351,6 +380,7 @@ class TeacherActivity : ComponentActivity() {
             is StudyMessage.AssetRequest -> Unit
             is StudyMessage.Ack -> Unit
             is StudyMessage.StartRequest -> Unit
+            is StudyMessage.SessionControl -> Unit
         }
     }
 
@@ -415,6 +445,11 @@ class TeacherActivity : ComponentActivity() {
         file: File,
         bitmap: Bitmap,
     ) {
+        if (awaitingResetReady) {
+            if (!bitmap.isRecycled) bitmap.recycle()
+            file.delete()
+            return
+        }
         when (metadata.kind) {
             AssetKind.THUMBNAIL -> {
                 val previousMainBitmap = latestThumbnailBitmap
@@ -930,7 +965,6 @@ class TeacherActivity : ComponentActivity() {
 
     private fun clearOutgoingVoiceInflightForDisconnect() {
         outgoingVoiceAttemptByPayloadId
-            .filterValues { !it.fileSent }
             .keys
             .toList()
             .forEach(::removeOutgoingVoiceAttempt)
@@ -942,11 +976,7 @@ class TeacherActivity : ComponentActivity() {
         outgoingVoiceRetryCountByUserMessageId.clear()
         outgoingVoiceRetryRunnableByUserMessageId.values.forEach(handler::removeCallbacks)
         outgoingVoiceRetryRunnableByUserMessageId.clear()
-        outgoingVoiceAttemptByPayloadId
-            .filterValues { it.fileSent }
-            .keys
-            .toList()
-            .forEach(::tryQueueOutgoingVoiceMetadata)
+        flushPendingVoiceMessages()
     }
 
     private fun playLatestStudentVoice() {
@@ -1029,6 +1059,119 @@ class TeacherActivity : ComponentActivity() {
         } else {
             eventLabel.text = "연결을 확인해 주세요"
         }
+    }
+
+    private fun sendPrimarySessionControl() {
+        if (!transportConnected) {
+            eventLabel.text = "학생폰 연결 후 학습을 제어할 수 있습니다"
+            return
+        }
+        when (latestSessionStatus) {
+            WireSessionStatus.READY -> sendStartRequest()
+            WireSessionStatus.RUNNING -> sendSessionControl(SessionControlAction.PAUSE)
+            WireSessionStatus.PAUSED -> sendSessionControl(SessionControlAction.RESUME)
+            WireSessionStatus.COMPLETED -> confirmResetAndReconnect()
+            WireSessionStatus.START_COUNTDOWN -> eventLabel.text = "학생폰 시작 대기시간이 진행 중입니다"
+            null -> eventLabel.text = "학생폰의 현재 상태를 기다리는 중입니다"
+        }
+    }
+
+    private fun sendSessionControl(action: SessionControlAction): Boolean {
+        val queued = reliableChannel.send(
+            StudyMessage.SessionControl(
+                messageId = UUID.randomUUID().toString(),
+                action = action,
+            ),
+            SystemClock.elapsedRealtime(),
+            "session-control",
+        )
+        eventLabel.text = when {
+            !queued -> "학습 제어 요청 대기열이 가득 찼습니다"
+            action == SessionControlAction.PAUSE -> "학생폰에 일시정지를 요청했습니다"
+            else -> "학생폰에 다시 시작을 요청했습니다"
+        }
+        if (queued) startButton.isEnabled = false
+        return queued
+    }
+
+    private fun updateSessionControlButton() {
+        startButton.text = when (latestSessionStatus) {
+            WireSessionStatus.READY -> "공부 시작"
+            WireSessionStatus.RUNNING -> "일시정지"
+            WireSessionStatus.PAUSED -> "다시 시작"
+            WireSessionStatus.START_COUNTDOWN -> "시작 대기 중"
+            WireSessionStatus.COMPLETED -> "처음부터"
+            null -> "학생 상태 대기"
+        }
+        startButton.isEnabled = transportConnected &&
+            latestSessionStatus !in setOf(null, WireSessionStatus.START_COUNTDOWN)
+    }
+
+    private fun confirmResetAndReconnect() {
+        AlertDialog.Builder(this)
+            .setTitle("처음부터 다시 연결")
+            .setMessage(
+                "현재 타이머·문제 수·사진 전송 상태를 초기화하고 새 연결로 시작합니다. " +
+                    "시간·책 영역·카메라 설정은 유지합니다.",
+            )
+            .setNegativeButton("취소", null)
+            .setPositiveButton("초기화·재연결") { _, _ -> resetAndReconnect() }
+            .show()
+    }
+
+    private fun resetAndReconnect() {
+        resetSessionOnNextConnect = true
+        awaitingResetReady = true
+        latestSessionId = null
+        latestSessionRevision = -1L
+        latestSessionStatus = null
+        phaseLabel.text = "새 연결 준비"
+        timerLabel.text = formatDuration(studySettings.meditationMinutes * 60_000L)
+        problemLabel.text = "완료한 문제 0개"
+        clearReceivedPhotosForReset()
+        forceReconnect()
+    }
+
+    private fun clearReceivedPhotosForReset() {
+        roiDialog?.dismiss()
+        roiDialog = null
+        fullScreenPhotoDialog?.dismiss()
+        fullScreenPhotoDialog = null
+        bookCalibrationDialog?.dismiss()
+        bookCalibrationDialog = null
+        cameraComparisonDialog?.dismiss()
+        cameraComparisonDialog = null
+        clearCameraComparisonBitmaps()
+        latestThumbnail.setImageDrawable(null)
+        latestThumbnailBitmap?.takeUnless(Bitmap::isRecycled)?.recycle()
+        latestThumbnailBitmap = null
+        recentThumbnails.forEach { entry ->
+            entry.imageView.setImageDrawable(null)
+            if (!entry.bitmap.isRecycled) entry.bitmap.recycle()
+        }
+        recentThumbnails.clear()
+        thumbnailStrip.removeAllViews()
+        thumbnailScroller.visibility = View.GONE
+        thumbnailLabel.text = "새 연결의 첫 사진을 기다립니다"
+        thumbnailLabel.visibility = View.VISIBLE
+    }
+
+    private fun forceReconnect() {
+        transportConnected = false
+        reliableChannel.reset()
+        clearOutgoingVoiceInflightForDisconnect()
+        transferByPayloadId.clear()
+        voiceTransferByPayloadId.clear()
+        earlyFileUriByPayloadId.clear()
+        pendingRoiAssetIds.clear()
+        pendingCalibrationAssetId = null
+        pendingComparisonAssetIds.clear()
+        transport.stop()
+        transportStarted = false
+        startButton.isEnabled = false
+        setConnectionState("연결을 완전히 다시 시작하는 중", COLOR_WARNING)
+        eventLabel.text = "이전 연결 번호를 폐기하고 학생폰을 다시 찾습니다"
+        handler.postDelayed(::startTransport, FORCE_RECONNECT_DELAY_MS)
     }
 
     private fun toggleBookRegionEditing() {
@@ -1698,7 +1841,10 @@ class TeacherActivity : ComponentActivity() {
 
         startButton = actionButton("공부 시작 요청", COLOR_PRIMARY).apply {
             isEnabled = false
-            setOnClickListener { sendStartRequest() }
+            setOnClickListener { sendPrimarySessionControl() }
+        }
+        reconnectButton = actionButton("처음부터·재연결", COLOR_DANGER).apply {
+            setOnClickListener { confirmResetAndReconnect() }
         }
         val settingsButton = actionButton("설정", COLOR_MUTED).apply {
             setOnClickListener { showSettingsDialog() }
@@ -1715,7 +1861,7 @@ class TeacherActivity : ComponentActivity() {
             visibility = View.GONE
         }
         listOf(
-            startButton, settingsButton, cameraCompareButton, bookRegionButton,
+            startButton, reconnectButton, settingsButton, cameraCompareButton, bookRegionButton,
             studentVoiceButton, textReplyButton, voiceReplyButton,
         )
             .forEach { button ->
@@ -2066,6 +2212,7 @@ class TeacherActivity : ComponentActivity() {
         private const val CAMERA_COMPARISON_TIMEOUT_MS = 75_000L
         private const val DEFAULT_DETAIL_ZOOM_RATIO = 2f
         private const val DEFAULT_FOCUS_TIMEOUT_MS = 2_000L
+        private const val FORCE_RECONNECT_DELAY_MS = 600L
         private const val MAX_MESSAGE_TEXT_BYTES = 4 * 1024
         private const val MAX_STATUS_TEXT_CHARS = 120
         private const val MAX_VOICE_DURATION_MS = 60_000L

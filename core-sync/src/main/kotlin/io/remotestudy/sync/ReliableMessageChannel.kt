@@ -37,6 +37,13 @@ class ReliableMessageChannel(
 
     val pendingCount: Int get() = pendingById.size
 
+    /** Drops all state tied to a dead transport generation. */
+    fun reset() {
+        connected = false
+        pendingById.clear()
+        inboundIds.clear()
+    }
+
     fun setConnected(value: Boolean, atElapsedMs: Long) {
         require(atElapsedMs >= 0)
         connected = value

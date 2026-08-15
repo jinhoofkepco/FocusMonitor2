@@ -74,4 +74,20 @@ class ReliableMessageChannelTest {
         channel.retryDue(2_010)
         assertEquals(2, sent.filter { it == message }.size)
     }
+
+    @Test
+    fun `hard reset drops old pending and inbound generation state`() {
+        channel.setConnected(true, 0)
+        val old = StudyMessage.StartRequest("old", WireStartOrigin.TEACHER)
+        val repeatedAcrossGeneration = StudyMessage.StartRequest("same-id", WireStartOrigin.TEACHER)
+        channel.send(old, 1)
+        assertEquals(repeatedAcrossGeneration, channel.receive(StudyWireCodec.encode(repeatedAcrossGeneration), 2))
+
+        channel.reset()
+
+        assertEquals(0, channel.pendingCount)
+        assertEquals(repeatedAcrossGeneration, channel.receive(StudyWireCodec.encode(repeatedAcrossGeneration), 3))
+        channel.setConnected(true, 4)
+        assertEquals(0, channel.pendingCount)
+    }
 }

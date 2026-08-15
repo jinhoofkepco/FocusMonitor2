@@ -10,6 +10,9 @@ class StudyWireCodecTest {
         val messages = listOf(
             StudyMessage.Hello("m1", "학생폰", PeerRole.STUDENT),
             StudyMessage.StartRequest("m2", WireStartOrigin.TEACHER),
+            StudyMessage.SessionControl("m2a", SessionControlAction.PAUSE),
+            StudyMessage.SessionControl("m2b", SessionControlAction.RESUME),
+            StudyMessage.SessionControl("m2c", SessionControlAction.RESET),
             StudyMessage.SessionSnapshot(
                 "m3",
                 "session-1",
