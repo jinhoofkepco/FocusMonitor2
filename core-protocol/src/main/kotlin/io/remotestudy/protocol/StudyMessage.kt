@@ -1,6 +1,6 @@
 package io.remotestudy.protocol
 
-const val STUDY_PROTOCOL_VERSION: Int = 2
+const val STUDY_PROTOCOL_VERSION: Int = 3
 
 enum class PeerRole { STUDENT, TEACHER }
 
@@ -31,8 +31,11 @@ enum class AlertKind {
 enum class AssetKind {
     THUMBNAIL,
     BOOK_ROI,
-    /** Fresh, unpixelated image captured at the same real 2x zoom used by BOOK_ROI. */
+    /** Fresh, unpixelated image captured at the selected zoom used by BOOK_ROI. */
     BOOK_CALIBRATION,
+    CAMERA_COMPARE_1X,
+    CAMERA_COMPARE_2X,
+    CAMERA_COMPARE_3X,
 }
 
 enum class DetailCaptureMode {
@@ -134,6 +137,8 @@ sealed interface StudyMessage {
         val right: Float,
         val bottom: Float,
         val detailCaptureMode: DetailCaptureMode = DetailCaptureMode.STANDARD_12_MP,
+        val detailZoomRatio: Float = 2f,
+        val focusTimeoutMs: Long = 2_000L,
     ) : StudyMessage
 
     data class CameraProfileStatus(

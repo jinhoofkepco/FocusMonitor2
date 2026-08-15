@@ -75,6 +75,7 @@ import io.remotestudy.voicemessage.VoiceMessageRecorderState
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.util.ArrayDeque
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.Executors
@@ -134,6 +135,7 @@ class StudentActivity : ComponentActivity() {
     private var latestProblemEventId: String? = null
     private var captureInFlight = false
     private var pendingCalibrationAssetId: String? = null
+    private val pendingComparisonRequests = ArrayDeque<StudyMessage.AssetRequest>()
     private var lastCaptureAtElapsedMs: Long? = null
     private val captureById = linkedMapOf<String, CaptureAssets>()
     private val thumbnailOfferedIds = mutableSetOf<String>()
@@ -157,6 +159,8 @@ class StudentActivity : ComponentActivity() {
     private var awayAlertEnabled = true
     private var noMovementAlertEnabled = true
     private var requestedDetailMode = CameraDetailCaptureMode.STANDARD_12_MP
+    private var requestedDetailZoomRatio = DEFAULT_DETAIL_ZOOM_RATIO
+    private var requestedFocusTimeoutMs = DEFAULT_FOCUS_TIMEOUT_MS
     private var pendingCameraProfileApply = false
     private var cameraProfileApplying = false
 
@@ -203,6 +207,9 @@ class StudentActivity : ComponentActivity() {
                         ?: CameraDetailCaptureMode.STANDARD_12_MP.name,
                 )
             }.getOrDefault(CameraDetailCaptureMode.STANDARD_12_MP)
+            requestedDetailZoomRatio = preferences.getFloat("detailZoomRatio", DEFAULT_DETAIL_ZOOM_RATIO)
+            requestedFocusTimeoutMs = preferences.getLong("focusTimeoutMs", DEFAULT_FOCUS_TIMEOUT_MS)
+            cameraView.setDetailCaptureSettings(requestedDetailZoomRatio, requestedFocusTimeoutMs)
         }
 
         transport = NearbyStudyTransport(this).also { nearby ->
@@ -587,14 +594,19 @@ class StudentActivity : ComponentActivity() {
             cameraView.setBookRegion(region)
             cameraView.armPresenceBaseline()
             requestedDetailMode = settings.detailCaptureMode.toCameraMode()
+            requestedDetailZoomRatio = settings.detailZoomRatio
+            requestedFocusTimeoutMs = settings.focusTimeoutMs
+            cameraView.setDetailCaptureSettings(requestedDetailZoomRatio, requestedFocusTimeoutMs)
             getSharedPreferences("camera-profile", MODE_PRIVATE).edit()
                 .putFloat("left", region.left)
                 .putFloat("top", region.top)
                 .putFloat("right", region.right)
                 .putFloat("bottom", region.bottom)
                 .putString("detailMode", requestedDetailMode.name)
+                .putFloat("detailZoomRatio", requestedDetailZoomRatio)
+                .putLong("focusTimeoutMs", requestedFocusTimeoutMs)
                 .apply()
-            eventLabel.text = "책 영역과 상세 화질 적용 중"
+            eventLabel.text = "책 영역 · ${requestedDetailZoomRatio}배 · 초점 설정 적용 중"
             pendingCameraProfileApply = true
             if (cameraReady) applyRequestedCameraProfile(reportToTeacher = true)
         }.onFailure {
@@ -644,7 +656,7 @@ class StudentActivity : ComponentActivity() {
             if (result.isSuccess && pendingCameraProfileApply) {
                 applyRequestedCameraProfile(reportToTeacher = true)
             } else if (result.isSuccess) {
-                startPendingCalibrationCaptureIfNeeded()
+                startNextSpecialCaptureIfNeeded()
             }
         }
     }
@@ -1139,7 +1151,7 @@ class StudentActivity : ComponentActivity() {
             if (pendingCameraProfileApply) {
                 applyRequestedCameraProfile(reportToTeacher = true)
             } else {
-                startPendingCalibrationCaptureIfNeeded()
+                startNextSpecialCaptureIfNeeded()
             }
         }
     }
@@ -1154,47 +1166,102 @@ class StudentActivity : ComponentActivity() {
                     return
                 }
                 if (offerAsset(assets, AssetKind.BOOK_ROI)) {
-                    eventLabel.text = "2배 고화질 책 영역을 선생님께 전송 중입니다"
+                    eventLabel.text = "${requestedDetailZoomRatio}배 고화질 책 영역을 선생님께 전송 중입니다"
                 }
             }
             AssetKind.BOOK_CALIBRATION -> {
                 pendingCalibrationAssetId = request.assetId
-                startPendingCalibrationCaptureIfNeeded()
+                startNextSpecialCaptureIfNeeded()
+            }
+            AssetKind.CAMERA_COMPARE_1X,
+            AssetKind.CAMERA_COMPARE_2X,
+            AssetKind.CAMERA_COMPARE_3X,
+            -> {
+                if (pendingComparisonRequests.none { it.assetId == request.assetId }) {
+                    pendingComparisonRequests.addLast(request)
+                }
+                startNextSpecialCaptureIfNeeded()
             }
         }
+    }
+
+    private fun startNextSpecialCaptureIfNeeded() {
+        if (pendingCalibrationAssetId != null) startPendingCalibrationCaptureIfNeeded()
+        else startPendingComparisonCaptureIfNeeded()
     }
 
     private fun startPendingCalibrationCaptureIfNeeded() {
         val assetId = pendingCalibrationAssetId ?: return
         if (captureInFlight || cameraProfileApplying) return
         if (!cameraReady || !appInForeground) {
-            eventLabel.text = "2배 책 영역 설정 사진을 촬영할 수 없습니다 · 카메라 화면을 확인해 주세요"
+            eventLabel.text = "책 영역 설정 사진을 촬영할 수 없습니다 · 카메라 화면을 확인해 주세요"
             return
         }
         pendingCalibrationAssetId = null
         captureInFlight = true
-        eventLabel.text = "선생님 설정용 실제 2배 사진을 촬영 중입니다"
+        eventLabel.text = "선생님 설정용 실제 ${requestedDetailZoomRatio}배 사진을 촬영 중입니다"
         cameraView.captureAssets(
             outputDir = File(filesDir, "study-assets"),
             assetId = assetId,
             capturedAtEpochMs = System.currentTimeMillis(),
             includeCalibration = true,
+            focusAtFrameCenter = true,
         ) { result ->
             captureInFlight = false
             result.onSuccess { assets ->
                 captureById[assets.assetId] = assets
                 pruneLocalAssets()
                 if (offerAsset(assets, AssetKind.BOOK_CALIBRATION)) {
-                    eventLabel.text = "실제 2배 책 영역 설정 사진을 선생님께 전송 중입니다"
+                    eventLabel.text = "실제 ${requestedDetailZoomRatio}배 책 영역 설정 사진을 선생님께 전송 중입니다"
                 }
             }.onFailure {
-                eventLabel.text = "2배 책 영역 설정 사진 실패: ${it.message.orEmpty()}"
+                eventLabel.text = "책 영역 설정 사진 실패: ${it.message.orEmpty()}"
             }
             if (pendingCameraProfileApply) {
                 applyRequestedCameraProfile(reportToTeacher = true)
             } else {
-                startPendingCalibrationCaptureIfNeeded()
+                startNextSpecialCaptureIfNeeded()
             }
+        }
+    }
+
+    private fun startPendingComparisonCaptureIfNeeded() {
+        val request = pendingComparisonRequests.firstOrNull() ?: return
+        if (captureInFlight || cameraProfileApplying) return
+        if (!cameraReady || !appInForeground) {
+            eventLabel.text = "카메라 비교 촬영 대기 · 학생 화면을 켜 주세요"
+            return
+        }
+        pendingComparisonRequests.removeFirst()
+        val zoomRatio = when (request.kind) {
+            AssetKind.CAMERA_COMPARE_1X -> 1f
+            AssetKind.CAMERA_COMPARE_2X -> 2f
+            AssetKind.CAMERA_COMPARE_3X -> 3f
+            else -> return
+        }
+        captureInFlight = true
+        eventLabel.text = "카메라 비교 ${zoomRatio.toInt()}배 · 초점 맞추는 중"
+        cameraView.captureAssets(
+            outputDir = File(filesDir, "study-assets"),
+            assetId = request.assetId,
+            capturedAtEpochMs = System.currentTimeMillis(),
+            includeCalibration = true,
+            detailZoomRatioOverride = zoomRatio,
+            focusTimeoutOverrideMs = requestedFocusTimeoutMs,
+            focusAtFrameCenter = true,
+        ) { result ->
+            captureInFlight = false
+            result.onSuccess { assets ->
+                captureById[assets.assetId] = assets
+                pruneLocalAssets()
+                if (offerAsset(assets, request.kind)) {
+                    eventLabel.text = "비교 ${zoomRatio.toInt()}배 사진 전송 중"
+                }
+            }.onFailure {
+                eventLabel.text = "비교 ${zoomRatio.toInt()}배 촬영 실패: ${it.message.orEmpty()}"
+            }
+            if (pendingCameraProfileApply) applyRequestedCameraProfile(reportToTeacher = true)
+            else startNextSpecialCaptureIfNeeded()
         }
     }
 
@@ -1225,6 +1292,13 @@ class StudentActivity : ComponentActivity() {
             AssetKind.THUMBNAIL -> assets.thumbnailFile
             AssetKind.BOOK_ROI -> assets.bookRoiFile
             AssetKind.BOOK_CALIBRATION -> assets.bookCalibrationFile ?: run {
+                pendingAssetTransfers.remove(transferKey)
+                return false
+            }
+            AssetKind.CAMERA_COMPARE_1X,
+            AssetKind.CAMERA_COMPARE_2X,
+            AssetKind.CAMERA_COMPARE_3X,
+            -> assets.bookCalibrationFile ?: run {
                 pendingAssetTransfers.remove(transferKey)
                 return false
             }
@@ -1323,10 +1397,10 @@ class StudentActivity : ComponentActivity() {
                     }
                 }
                 if (key.transfer.kind != AssetKind.THUMBNAIL) {
-                    eventLabel.text = if (key.transfer.kind == AssetKind.BOOK_CALIBRATION) {
-                        "실제 2배 책 영역 설정 사진을 선생님께 전송했습니다"
-                    } else {
-                        "2배 고화질 책 영역을 선생님께 전송했습니다"
+                    eventLabel.text = when (key.transfer.kind) {
+                        AssetKind.BOOK_CALIBRATION -> "책 영역 설정 사진을 선생님께 전송했습니다"
+                        AssetKind.BOOK_ROI -> "${requestedDetailZoomRatio}배 고화질 책 영역을 선생님께 전송했습니다"
+                        else -> "카메라 비교 사진을 선생님께 전송했습니다"
                     }
                 }
             }
@@ -1836,6 +1910,8 @@ class StudentActivity : ComponentActivity() {
         private const val STATE_BOOK_TOP = "book-top"
         private const val STATE_BOOK_RIGHT = "book-right"
         private const val STATE_BOOK_BOTTOM = "book-bottom"
+        private const val DEFAULT_DETAIL_ZOOM_RATIO = 2f
+        private const val DEFAULT_FOCUS_TIMEOUT_MS = 2_000L
         private const val TICK_INTERVAL_MS = 250L
         private const val UNDO_WINDOW_MS = 5_000L
         private const val DEFAULT_CAPTURE_INTERVAL_MS = 10_000L

@@ -45,6 +45,9 @@ class StudyWireCodecTest {
                 1_723_624_500_000,
             ),
             StudyMessage.AssetRequest("m12b", "fresh-2x-calibration", AssetKind.BOOK_CALIBRATION),
+            StudyMessage.AssetRequest("m12c", "compare-1x", AssetKind.CAMERA_COMPARE_1X),
+            StudyMessage.AssetRequest("m12d", "compare-2x", AssetKind.CAMERA_COMPARE_2X),
+            StudyMessage.AssetRequest("m12e", "compare-3x", AssetKind.CAMERA_COMPARE_3X),
             StudyMessage.TextMessage("m13", PeerRole.STUDENT, "이 문제를 모르겠어요.", 1_723_624_510_000),
             StudyMessage.VoiceTransfer(
                 messageId = "m14",
@@ -58,7 +61,10 @@ class StudyWireCodecTest {
                 "m15", 300_000, 2_400_000, 900_000, 5_000, 10_000,
                 10_000, 30_000, 0.18f, 0.012f,
             ),
-            StudyMessage.BookRegionSettings("m16", 0.1f, 0.2f, 0.9f, 0.8f),
+            StudyMessage.BookRegionSettings(
+                "m16", 0.1f, 0.2f, 0.9f, 0.8f,
+                DetailCaptureMode.STANDARD_12_MP, 3f, 3_000L,
+            ),
             StudyMessage.CameraProfileStatus(
                 "m17", DetailCaptureMode.ULTRA_50_MP, DetailCaptureMode.STANDARD_12_MP,
                 4_000, 3_000, false,

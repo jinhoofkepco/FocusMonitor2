@@ -143,4 +143,16 @@ class LuminanceSignaturesTest {
         assertEquals(0.70f, full.right, 0.0001f)
         assertEquals(0.65f, full.bottom, 0.0001f)
     }
+
+    @Test
+    fun `one and three x book coordinates map to their selected zoom crop`() {
+        val region = BookRegion(0.15f, 0.20f, 0.75f, 0.80f)
+        assertEquals(region, region.inFullFrame(1f))
+
+        val threeX = region.inFullFrame(3f)
+        assertEquals(0.3833333f, threeX.left, 0.0001f)
+        assertEquals(0.4000000f, threeX.top, 0.0001f)
+        assertEquals(0.5833333f, threeX.right, 0.0001f)
+        assertEquals(0.6000000f, threeX.bottom, 0.0001f)
+    }
 }

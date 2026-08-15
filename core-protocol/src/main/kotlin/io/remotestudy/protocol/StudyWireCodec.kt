@@ -122,6 +122,8 @@ object StudyWireCodec {
                     data.writeFloat(message.right)
                     data.writeFloat(message.bottom)
                     data.writeByte(message.detailCaptureMode.ordinal)
+                    data.writeFloat(message.detailZoomRatio)
+                    data.writeLong(message.focusTimeoutMs)
                 }
 
                 is StudyMessage.CameraProfileStatus -> {
@@ -249,6 +251,8 @@ object StudyWireCodec {
                     detailCaptureMode = enumValue(
                         data.readUnsignedByte(), DetailCaptureMode.entries, "detail capture mode",
                     ),
+                    detailZoomRatio = data.readFloat(),
+                    focusTimeoutMs = data.readLong(),
                 ).also(::validateBookRegion)
 
                 TYPE_CAMERA_PROFILE_STATUS -> StudyMessage.CameraProfileStatus(
@@ -317,6 +321,8 @@ object StudyWireCodec {
         require(region.top.isFinite() && region.bottom.isFinite())
         require(region.left in 0f..1f && region.right in 0f..1f && region.right - region.left >= 0.12f)
         require(region.top in 0f..1f && region.bottom in 0f..1f && region.bottom - region.top >= 0.12f)
+        require(region.detailZoomRatio.isFinite() && region.detailZoomRatio in 1f..10f)
+        require(region.focusTimeoutMs in 500L..5_000L)
     }
 
     private fun DataOutputStream.writeSizedString(value: String) {

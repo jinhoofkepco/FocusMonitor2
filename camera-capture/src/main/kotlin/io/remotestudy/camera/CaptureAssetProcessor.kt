@@ -23,8 +23,8 @@ internal object CaptureAssetProcessor {
     private const val BOOK_JPEG_QUALITY = 95
     private const val THUMBNAIL_MAX_LONG_EDGE = 2_400
     private const val THUMBNAIL_JPEG_QUALITY = 92
-    private const val CALIBRATION_MAX_LONG_EDGE = 2_400
-    private const val CALIBRATION_JPEG_QUALITY = 92
+    private const val CALIBRATION_MAX_LONG_EDGE = 4_000
+    private const val CALIBRATION_JPEG_QUALITY = 95
 
     fun process(
         originalJpeg: File,

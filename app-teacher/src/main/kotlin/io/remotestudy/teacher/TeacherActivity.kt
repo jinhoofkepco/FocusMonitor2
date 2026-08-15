@@ -96,6 +96,7 @@ class TeacherActivity : ComponentActivity() {
     private lateinit var thumbnailStrip: GridLayout
     private lateinit var bookRegionOverlay: TeacherBookRegionOverlay
     private lateinit var bookRegionButton: Button
+    private lateinit var cameraCompareButton: Button
     private lateinit var studentVoiceButton: Button
     private lateinit var textReplyButton: Button
     private lateinit var voiceReplyButton: Button
@@ -126,14 +127,21 @@ class TeacherActivity : ComponentActivity() {
     private var fullScreenPhotoDialog: Dialog? = null
     private var bookCalibrationDialog: Dialog? = null
     private var pendingCalibrationAssetId: String? = null
+    private var cameraComparisonDialog: Dialog? = null
+    private val pendingComparisonAssetIds = mutableMapOf<AssetKind, String>()
+    private val cameraComparisonBitmaps = linkedMapOf<AssetKind, Bitmap>()
     private var studySettings = TeacherStudySettings()
     private var detailCaptureMode = DetailCaptureMode.STANDARD_12_MP
+    private var detailZoomRatio = DEFAULT_DETAIL_ZOOM_RATIO
+    private var focusTimeoutMs = DEFAULT_FOCUS_TIMEOUT_MS
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         createNotificationChannel()
         studySettings = loadStudySettings()
         detailCaptureMode = loadDetailCaptureMode()
+        detailZoomRatio = loadDetailZoomRatio()
+        focusTimeoutMs = loadFocusTimeoutMs()
         setContentView(buildContentView())
 
         voicePlayer = VoiceMessagePlayer(this)
@@ -183,6 +191,9 @@ class TeacherActivity : ComponentActivity() {
         roiDialog = null
         bookCalibrationDialog?.dismiss()
         bookCalibrationDialog = null
+        cameraComparisonDialog?.dismiss()
+        cameraComparisonDialog = null
+        clearCameraComparisonBitmaps()
         fullScreenPhotoDialog?.dismiss()
         fullScreenPhotoDialog = null
         latestThumbnail.setImageDrawable(null)
@@ -431,9 +442,14 @@ class TeacherActivity : ComponentActivity() {
                     return
                 }
                 pendingCalibrationAssetId = null
-                thumbnailLabel.text = "실제 2배 사진에서 책 영역을 지정해 주세요"
+                thumbnailLabel.text = "실제 ${detailZoomRatio}배 사진에서 책 영역을 지정해 주세요"
                 showBookCalibrationEditor(bitmap)
             }
+
+            AssetKind.CAMERA_COMPARE_1X,
+            AssetKind.CAMERA_COMPARE_2X,
+            AssetKind.CAMERA_COMPARE_3X,
+            -> receiveCameraComparison(metadata, bitmap)
         }
     }
 
@@ -1030,6 +1046,8 @@ class TeacherActivity : ComponentActivity() {
                 right = 1f - displayRegion.left,
                 bottom = 1f - displayRegion.top,
                 detailCaptureMode = detailCaptureMode,
+                detailZoomRatio = detailZoomRatio,
+                focusTimeoutMs = focusTimeoutMs,
             ),
             SystemClock.elapsedRealtime(),
             "book-region",
@@ -1041,19 +1059,204 @@ class TeacherActivity : ComponentActivity() {
             eventLabel.text = "학생폰 연결 후 책 영역을 설정해 주세요"
             return
         }
-        var selected = detailCaptureMode.ordinal
-        AlertDialog.Builder(this)
-            .setTitle("책 영역 상세 화질")
-            .setSingleChoiceItems(
-                arrayOf("12MP 일반 · 빠르고 발열 적음", "50MP 초고화질 · 지원 기기만"),
-                selected,
-            ) { _, which -> selected = which }
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(22), dp(6), dp(22), 0)
+        }
+        container.addView(TextView(this).apply {
+            text = "현재 상세 배율 ${detailZoomRatio}배 · 비교 촬영 버튼에서 변경"
+            textSize = 14f
+            setTextColor(COLOR_TEXT)
+        }, matchWrap(bottom = 10))
+        val quality = android.widget.RadioGroup(this).apply { orientation = LinearLayout.VERTICAL }
+        val standard = android.widget.RadioButton(this).apply {
+            text = "12MP 일반 · 권장"
+            isChecked = detailCaptureMode == DetailCaptureMode.STANDARD_12_MP
+        }
+        val ultra = android.widget.RadioButton(this).apply {
+            text = "50MP 요청 · 지원 기기만"
+            isChecked = detailCaptureMode == DetailCaptureMode.ULTRA_50_MP
+        }
+        quality.addView(standard)
+        quality.addView(ultra)
+        container.addView(quality)
+        container.addView(TextView(this).apply {
+            text = "자동 초점 시도당 대기(초, 0.5~5.0 · 실패 시 1회 재시도)"
+            textSize = 13f
+            setTextColor(COLOR_MUTED)
+        }, matchWrap(top = 10))
+        val focusSeconds = EditText(this).apply {
+            setText("%.1f".format(focusTimeoutMs / 1_000f))
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+        }
+        container.addView(focusSeconds, LinearLayout.LayoutParams(-1, dp(48)))
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("책 영역 촬영 설정")
+            .setView(container)
             .setNegativeButton("취소", null)
-            .setPositiveButton("영역 지정") { _, _ ->
-                detailCaptureMode = DetailCaptureMode.entries[selected]
+            .setPositiveButton("영역 지정", null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val focus = focusSeconds.text.toString().toFloatOrNull()
+                if (focus == null || focus !in 0.5f..5f) {
+                    focusSeconds.error = "0.5~5.0초로 입력해 주세요"
+                    return@setOnClickListener
+                }
+                detailCaptureMode = if (ultra.isChecked) {
+                    DetailCaptureMode.ULTRA_50_MP
+                } else {
+                    DetailCaptureMode.STANDARD_12_MP
+                }
+                focusTimeoutMs = (focus * 1_000).toLong()
+                saveBookProfile(bookRegionOverlay.region)
+                dialog.dismiss()
                 requestFreshBookCalibration()
             }
-            .show()
+        }
+        dialog.show()
+    }
+
+    private fun requestCameraComparison() {
+        if (!transportConnected) {
+            eventLabel.text = "학생폰 연결 후 비교 촬영을 시작해 주세요"
+            return
+        }
+        cameraComparisonDialog?.dismiss()
+        cameraComparisonDialog = null
+        clearCameraComparisonBitmaps()
+        pendingComparisonAssetIds.clear()
+        val kinds = listOf(
+            AssetKind.CAMERA_COMPARE_1X,
+            AssetKind.CAMERA_COMPARE_2X,
+            AssetKind.CAMERA_COMPARE_3X,
+        )
+        val queuedAll = kinds.all { kind ->
+            val assetId = "compare-${kind.name.lowercase()}-${UUID.randomUUID()}"
+            val queued = reliableChannel.send(
+                StudyMessage.AssetRequest(
+                    messageId = UUID.randomUUID().toString(),
+                    assetId = assetId,
+                    kind = kind,
+                ),
+                SystemClock.elapsedRealtime(),
+            )
+            if (queued) pendingComparisonAssetIds[kind] = assetId
+            queued
+        }
+        if (!queuedAll) {
+            pendingComparisonAssetIds.clear()
+            eventLabel.text = "비교 촬영 요청 대기열이 가득 찼습니다"
+            return
+        }
+        thumbnailLabel.visibility = View.VISIBLE
+        thumbnailLabel.text = "1배·2배·3배 초점 비교 촬영 중… 약 20초"
+        cameraCompareButton.isEnabled = false
+        handler.postDelayed({
+            if (pendingComparisonAssetIds.isNotEmpty()) {
+                pendingComparisonAssetIds.clear()
+                clearCameraComparisonBitmaps()
+                cameraCompareButton.isEnabled = true
+                thumbnailLabel.text = "비교 촬영 응답이 끝나지 않았습니다 · 학생폰 오류 문구를 확인해 주세요"
+            }
+        }, CAMERA_COMPARISON_TIMEOUT_MS)
+    }
+
+    private fun receiveCameraComparison(metadata: StudyMessage.AssetTransfer, bitmap: Bitmap) {
+        if (pendingComparisonAssetIds[metadata.kind] != metadata.assetId) {
+            bitmap.recycle()
+            return
+        }
+        pendingComparisonAssetIds.remove(metadata.kind)
+        cameraComparisonBitmaps.remove(metadata.kind)?.takeUnless(Bitmap::isRecycled)?.recycle()
+        cameraComparisonBitmaps[metadata.kind] = bitmap
+        thumbnailLabel.text = "비교 사진 ${cameraComparisonBitmaps.size}/3 수신"
+        if (pendingComparisonAssetIds.isEmpty() && cameraComparisonBitmaps.size == 3) {
+            cameraCompareButton.isEnabled = true
+            showCameraComparisonDialog()
+        }
+    }
+
+    private fun showCameraComparisonDialog() {
+        cameraComparisonDialog?.dismiss()
+        val dialog = Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
+        val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        val strip = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(8), dp(58), dp(8), dp(12))
+        }
+        val images = mutableListOf<ImageView>()
+        listOf(
+            AssetKind.CAMERA_COMPARE_1X to 1f,
+            AssetKind.CAMERA_COMPARE_2X to 2f,
+            AssetKind.CAMERA_COMPARE_3X to 3f,
+        ).forEach { (kind, zoom) ->
+            val bitmap = cameraComparisonBitmaps.getValue(kind)
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_HORIZONTAL
+                setPadding(dp(6), 0, dp(6), 0)
+            }
+            card.addView(TextView(this).apply {
+                text = "${zoom.toInt()}배 · 손가락으로 확대 가능"
+                textSize = 18f
+                gravity = Gravity.CENTER
+                setTextColor(Color.WHITE)
+                setTypeface(typeface, Typeface.BOLD)
+            }, LinearLayout.LayoutParams(-1, dp(38)))
+            val image = ZoomableImageView(this).apply {
+                setImageBitmap(bitmap)
+                contentDescription = "카메라 비교 ${zoom.toInt()}배 사진"
+            }
+            images += image
+            card.addView(image, LinearLayout.LayoutParams(-1, 0, 1f))
+            card.addView(
+                actionButton("${zoom.toInt()}배 사용 · 영역 지정", COLOR_SUCCESS).apply {
+                    setOnClickListener {
+                        detailZoomRatio = zoom
+                        saveBookProfile(bookRegionOverlay.region)
+                        dialog.dismiss()
+                        eventLabel.text = "${zoom.toInt()}배 선택 · 같은 배율 사진에서 책 영역을 다시 지정합니다"
+                        requestFreshBookCalibration()
+                    }
+                },
+                LinearLayout.LayoutParams(-1, dp(52)).apply { topMargin = dp(8) },
+            )
+            strip.addView(
+                card,
+                LinearLayout.LayoutParams(resources.displayMetrics.widthPixels - dp(24), -1),
+            )
+        }
+        val scroller = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = true
+            addView(strip, FrameLayout.LayoutParams(-2, -1))
+        }
+        root.addView(scroller, FrameLayout.LayoutParams(-1, -1))
+        val close = Button(this).apply {
+            text = "×"
+            textSize = 28f
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.TRANSPARENT)
+            contentDescription = "비교 촬영 닫기"
+            setOnClickListener { dialog.dismiss() }
+        }
+        root.addView(close, FrameLayout.LayoutParams(dp(56), dp(56), Gravity.TOP or Gravity.END))
+        dialog.setContentView(root)
+        dialog.setOnDismissListener {
+            images.forEach { it.setImageDrawable(null) }
+            clearCameraComparisonBitmaps()
+            if (cameraComparisonDialog === dialog) cameraComparisonDialog = null
+        }
+        cameraComparisonDialog = dialog
+        thumbnailLabel.text = "비교 완료 · 선명한 배율을 선택해 주세요"
+        dialog.show()
+    }
+
+    private fun clearCameraComparisonBitmaps() {
+        cameraComparisonBitmaps.values.forEach { bitmap ->
+            if (!bitmap.isRecycled) bitmap.recycle()
+        }
+        cameraComparisonBitmaps.clear()
     }
 
     private fun requestFreshBookCalibration() {
@@ -1074,11 +1277,11 @@ class TeacherActivity : ComponentActivity() {
         if (queued) {
             pendingCalibrationAssetId = assetId
             thumbnailLabel.visibility = View.VISIBLE
-            thumbnailLabel.text = "학생폰에서 실제 2배 설정 사진 촬영 중…"
+            thumbnailLabel.text = "학생폰에서 실제 ${detailZoomRatio}배 설정 사진 촬영 중…"
             handler.postDelayed({
                 if (pendingCalibrationAssetId == assetId) {
                     pendingCalibrationAssetId = null
-                    thumbnailLabel.text = "2배 설정 사진 응답이 없습니다 · 다시 시도해 주세요"
+                    thumbnailLabel.text = "설정 사진 응답이 없습니다 · 다시 시도해 주세요"
                 }
             }, CALIBRATION_REQUEST_TIMEOUT_MS)
         } else {
@@ -1094,7 +1297,7 @@ class TeacherActivity : ComponentActivity() {
         val image = ImageView(this).apply {
             setImageBitmap(bitmap)
             scaleType = ImageView.ScaleType.FIT_CENTER
-            contentDescription = "실제 2배 책 영역 설정 사진"
+            contentDescription = "실제 ${detailZoomRatio}배 책 영역 설정 사진"
         }
         val overlay = TeacherBookRegionOverlay(this).apply {
             setImageSize(bitmap.width, bitmap.height)
@@ -1112,14 +1315,14 @@ class TeacherActivity : ComponentActivity() {
             setOnClickListener { dialog.dismiss() }
         }
         frame.addView(close, FrameLayout.LayoutParams(dp(56), dp(56), Gravity.TOP or Gravity.END))
-        val save = actionButton("이 영역 저장 · ${detailModeLabel(detailCaptureMode)}", COLOR_SUCCESS).apply {
+        val save = actionButton("이 영역 저장 · ${detailZoomRatio}배", COLOR_SUCCESS).apply {
             setOnClickListener {
                 val selectedRegion = overlay.region
                 bookRegionOverlay.setRegion(selectedRegion)
                 val queued = sendCurrentBookProfile()
                 saveBookProfile(selectedRegion)
                 thumbnailLabel.text = if (queued) {
-                    "실제 2배 기준 책 영역과 ${detailModeLabel(detailCaptureMode)} 적용 요청 중"
+                    "실제 ${detailZoomRatio}배 기준 책 영역과 ${detailModeLabel(detailCaptureMode)} 적용 요청 중"
                 } else {
                     "연결 후 책 영역을 다시 저장해 주세요"
                 }
@@ -1166,6 +1369,8 @@ class TeacherActivity : ComponentActivity() {
             .putFloat("right", region.right)
             .putFloat("bottom", region.bottom)
             .putString("detailMode", detailCaptureMode.name)
+            .putFloat("detailZoomRatio", detailZoomRatio)
+            .putLong("focusTimeoutMs", focusTimeoutMs)
             .apply()
     }
 
@@ -1176,6 +1381,12 @@ class TeacherActivity : ComponentActivity() {
                 ?: DetailCaptureMode.STANDARD_12_MP.name,
         )
     }.getOrDefault(DetailCaptureMode.STANDARD_12_MP)
+
+    private fun loadDetailZoomRatio(): Float = getSharedPreferences("book-profile", MODE_PRIVATE)
+        .getFloat("detailZoomRatio", DEFAULT_DETAIL_ZOOM_RATIO)
+
+    private fun loadFocusTimeoutMs(): Long = getSharedPreferences("book-profile", MODE_PRIVATE)
+        .getLong("focusTimeoutMs", DEFAULT_FOCUS_TIMEOUT_MS)
 
     private fun showSettingsDialog() {
         val container = LinearLayout(this).apply {
@@ -1495,12 +1706,18 @@ class TeacherActivity : ComponentActivity() {
         bookRegionButton = actionButton("책 영역 설정", COLOR_SUCCESS).apply {
             setOnClickListener { toggleBookRegionEditing() }
         }
+        cameraCompareButton = actionButton("1·2·3배 비교", COLOR_WARNING).apply {
+            setOnClickListener { requestCameraComparison() }
+        }
         val actionRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             visibility = View.GONE
         }
-        listOf(startButton, settingsButton, bookRegionButton, studentVoiceButton, textReplyButton, voiceReplyButton)
+        listOf(
+            startButton, settingsButton, cameraCompareButton, bookRegionButton,
+            studentVoiceButton, textReplyButton, voiceReplyButton,
+        )
             .forEach { button ->
                 actionRow.addView(button, LinearLayout.LayoutParams(dp(128), dp(46)).apply { marginEnd = dp(6) })
             }
@@ -1846,6 +2063,9 @@ class TeacherActivity : ComponentActivity() {
         private const val OUTGOING_FILE_RETRY_DELAY_MS = 2_000L
         private const val ROI_REQUEST_TIMEOUT_MS = 15_000L
         private const val CALIBRATION_REQUEST_TIMEOUT_MS = 25_000L
+        private const val CAMERA_COMPARISON_TIMEOUT_MS = 75_000L
+        private const val DEFAULT_DETAIL_ZOOM_RATIO = 2f
+        private const val DEFAULT_FOCUS_TIMEOUT_MS = 2_000L
         private const val MAX_MESSAGE_TEXT_BYTES = 4 * 1024
         private const val MAX_STATUS_TEXT_CHARS = 120
         private const val MAX_VOICE_DURATION_MS = 60_000L
