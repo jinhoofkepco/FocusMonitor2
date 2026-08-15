@@ -14,7 +14,7 @@
    파일은 Nearby의 실제 전송 완료 뒤에만 전송됨으로 표시합니다. 실패하면 연결 중 2초 간격으로 최초 시도 뒤 최대 3회 재시도하고, 재연결하면 남은 ROI·음성 및 최신 썸네일을 다시 보냅니다.
 8. 선생님 사진은 디스플레이 픽셀을 180도 변환해 보여 주므로 확대 상태의 드래그 방향이 손가락과 일치합니다. 최근 썸네일은 최대 12개이며, 상세 ROI는 전체화면에서 최대 5배 확대·이동할 수 있습니다.
 9. 두 앱 모두 세로·가로 화면을 지원하며 회전 중 학생 세션과 책 영역을 유지합니다.
-10. 학생이 `풀었어`라고 말하면 확인음을 먼저 내고 선생님폰에 문제 완료를 보냅니다. `아빠`라고 말하면 확인음 뒤 다음 발화를 인식 텍스트로 보내고 완료음을 냅니다. `아빠 녹음`이라고 말하면 이어지는 12초 음성을 녹음해 자동 전송합니다.
+10. Android 13 이상 학생폰은 하나의 `AudioRecord` 입력을 segmented `SpeechRecognizer`에 계속 공급해 시스템 마이크 재시작음을 반복하지 않습니다. 학생이 `풀었어`라고 말하면 확인음을 먼저 내고 선생님폰에 문제 완료를 보냅니다. `아빠`라고 말하면 확인음 뒤 다음 발화를 인식 텍스트로 보내고 완료음을 냅니다. `아빠 녹음`이라고 말하면 이어지는 12초 음성을 녹음해 자동 전송합니다. 연속 입력을 기기 음성서비스가 지원하지 않으면 시끄러운 재시작 fallback 없이 오류만 표시합니다.
 11. 학생은 최대 60초 음성 메시지를 보내고 선생님은 이를 재생할 수 있습니다. 선생님은 텍스트 또는 최대 60초 음성으로 답하며, 학생폰은 수신 즉시 확인음을 내고 텍스트 답변을 한국어 TTS로 읽거나 음성 답변을 자동 재생합니다. 실시간 통화는 아닙니다.
 
 ## 모듈과 I/O
@@ -28,7 +28,7 @@
 | `transport-api` | bytes/file, approve/reject | connection/message/file event | 개인용 앱에서 발견된 상대 요청 자동 승인 |
 | `transport-nearby` | transport port 호출 | Nearby P2P point-to-point, payload별 file success/failure | UI와 Google Play services 타입 격리, 파일 완료 이벤트 exactly-once 방출 |
 | `camera-capture` | lifecycle, capture 요청, baseline arm | `FrameObservation`, thumbnail file, book ROI file | Preview/ImageCapture/ImageAnalysis 동시 사용, 분석 1fps 이하, 임시 원본과 종료 중 자산 cleanup |
-| `voice-command` | start/stop, SpeechRecognizer result | 제한된 한국어 command | 음성 원본 저장·전송 없음, debounce와 touch 대체 입력 |
+| `voice-command` | start/stop, AudioRecord PCM | segmented SpeechRecognizer의 제한된 한국어 command | Android 13+, 고정 버퍼, 자동 재시작 없음, 미지원 시 명시적 오류 |
 | `voice-message` | main-thread record/stop/cancel/play, output file | AAC `.m4a` `RecordedVoiceMessage`, playback callback | 최대 60초, `.part` 성공 후 commit, 취소·실패 파일 cleanup, recorder·player 각각 활성 작업 1개 |
 | `app-student` | touch/voice/teacher request, camera observation, teacher reply | authoritative session state, thumbnail/ROI, alert, student voice message, TTS/playback | 타이머·촬영·판정 기준은 학생폰 |
 | `app-teacher` | pairing approval, settings/start/media request, text/voice reply | concise state, 최근 썸네일 12개, 전체화면 ROI, notifications | 설정 후 첫 사이클 시작, 썸네일 자동 수신과 ROI 요청 전송 분리 |

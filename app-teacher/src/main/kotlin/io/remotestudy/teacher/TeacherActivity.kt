@@ -1004,7 +1004,8 @@ class TeacherActivity : ComponentActivity() {
             "${detailModeLabel(status.appliedMode)} 적용 · ${status.width}×${status.height} " +
                 "(%.1fMP)".format(actualMegapixels)
         } else {
-            "50MP를 앱 카메라에서 사용할 수 없어 ${status.width}×${status.height}로 적용"
+            "제조사가 외부 앱에 50MP를 제공하지 않아 ${status.width}×${status.height} " +
+                "(%.1fMP)로 적용".format(actualMegapixels)
         }
     }
 

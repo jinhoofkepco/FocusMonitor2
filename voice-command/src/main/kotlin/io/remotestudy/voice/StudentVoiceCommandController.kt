@@ -1,32 +1,35 @@
 package io.remotestudy.voice
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import java.util.EnumMap
-import kotlin.math.max
-import kotlin.math.min
 
 /**
- * Continuously recognizes a small, Korean command vocabulary while explicitly started.
+ * Continuously recognizes a small Korean command vocabulary while explicitly started.
  *
  * This class never writes audio to storage or forwards audio itself. When [allowSystemFallback]
  * is true (the default), Android's selected system recognizer may process audio remotely even
  * though [RecognizerIntent.EXTRA_PREFER_OFFLINE] is requested. Set it to false when on-device-only
  * processing is a hard privacy requirement.
  *
- * All SpeechRecognizer operations and every [StudentVoiceCommandListener] callback run on the
- * Android main thread. [stop] cancels pending automatic restarts but a later explicit [start] is
- * allowed. [destroy] is terminal.
+ * Android 13+ supplies one app-owned AudioRecord stream to a segmented SpeechRecognizer session.
+ * This avoids the platform start/stop chime caused by repeatedly reopening the system microphone.
+ * Unsupported devices fail visibly instead of falling back to a noisy restart loop.
  */
 class StudentVoiceCommandController @JvmOverloads constructor(
     context: Context,
@@ -41,13 +44,16 @@ class StudentVoiceCommandController @JvmOverloads constructor(
 
     private var recognizer: SpeechRecognizer? = null
     private var recognitionMode: RecognitionMode? = null
-    private var restartRunnable: Runnable? = null
     private var requestedActive = false
     private var destroyed = false
     private var listening = false
     private var recognitionCycle = 0L
-    private var consecutiveErrors = 0
     private var awaitingMessage = false
+    private var audioRecord: AudioRecord? = null
+    private var audioReadDescriptor: ParcelFileDescriptor? = null
+    private var audioWriteDescriptor: ParcelFileDescriptor? = null
+    private var audioThread: Thread? = null
+    private var audioGeneration = 0L
 
     fun start() = onMainThread {
         if (destroyed) {
@@ -63,16 +69,23 @@ class StudentVoiceCommandController @JvmOverloads constructor(
         if (requestedActive) return@onMainThread
 
         requestedActive = true
-        consecutiveErrors = 0
         lastCommandAtMillis.clear()
         awaitingMessage = false
-        cancelScheduledRestart()
 
         if (!hasRecordAudioPermission()) {
             requestedActive = false
             dispatchTerminalError(
                 kind = VoiceCommandErrorKind.PERMISSION_DENIED,
                 message = "RECORD_AUDIO permission has not been granted.",
+            )
+            return@onMainThread
+        }
+
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            requestedActive = false
+            dispatchTerminalError(
+                kind = VoiceCommandErrorKind.RECOGNIZER_UNAVAILABLE,
+                message = "연속 음성인식은 Android 13 이상에서만 사용할 수 있습니다.",
             )
             return@onMainThread
         }
@@ -86,9 +99,8 @@ class StudentVoiceCommandController @JvmOverloads constructor(
 
         requestedActive = false
         awaitingMessage = false
-        consecutiveErrors = 0
-        cancelScheduledRestart()
         invalidateCurrentCycle()
+        closeContinuousAudio()
         runCatching { recognizer?.cancel() }
         listener.onStatus(
             VoiceCommandStatus(
@@ -104,8 +116,8 @@ class StudentVoiceCommandController @JvmOverloads constructor(
         requestedActive = false
         awaitingMessage = false
         destroyed = true
-        cancelScheduledRestart()
         invalidateCurrentCycle()
+        closeContinuousAudio()
         runCatching { recognizer?.cancel() }
         runCatching { recognizer?.destroy() }
         recognizer = null
@@ -175,12 +187,12 @@ class StudentVoiceCommandController @JvmOverloads constructor(
         val activeRecognizer = recognizer ?: if (ensureRecognizer()) recognizer else null
         if (activeRecognizer == null) return
 
-        cancelScheduledRestart()
         val cycle = ++recognitionCycle
         activeRecognizer.setRecognitionListener(createRecognitionListener(cycle))
 
         try {
-            activeRecognizer.startListening(recognitionIntent())
+            val audioSource = openContinuousAudio(cycle)
+            activeRecognizer.startListening(recognitionIntent(audioSource))
             listening = true
             listener.onStatus(
                 VoiceCommandStatus(
@@ -189,6 +201,7 @@ class StudentVoiceCommandController @JvmOverloads constructor(
                 ),
             )
         } catch (securityException: SecurityException) {
+            closeContinuousAudio()
             listening = false
             requestedActive = false
             dispatchTerminalError(
@@ -196,6 +209,7 @@ class StudentVoiceCommandController @JvmOverloads constructor(
                 message = securityException.message,
             )
         } catch (runtimeException: RuntimeException) {
+            closeContinuousAudio()
             listening = false
             handleControllerError(
                 kind = VoiceCommandErrorKind.CLIENT,
@@ -232,35 +246,38 @@ class StudentVoiceCommandController @JvmOverloads constructor(
 
         override fun onError(error: Int) = handleCycle(cycle) {
             listening = false
-            handlePlatformError(error)
+            requestedActive = false
+            closeContinuousAudio()
+            dispatchTerminalError(
+                kind = platformErrorKind(error),
+                platformCode = error,
+                message = "연속 음성인식이 중단되었습니다. 앱을 다시 열어 주세요.",
+            )
         }
 
         override fun onResults(results: Bundle?) = handleCycle(cycle) {
             listening = false
-            consecutiveErrors = 0
-            val hypotheses = results
-                ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                .orEmpty()
-            val primary = hypotheses.firstOrNull { it.isNotBlank() }
-            if (awaitingMessage) {
-                if (primary != null) {
-                    awaitingMessage = false
-                    listener.onMessageRecognized(primary.trim())
-                }
-            } else {
-                val dadPhrase = primary?.trim()?.takeIf { it.startsWith("아빠") }?.indexOf("아빠") ?: -1
-                if (dadPhrase == 0) {
-                    emitIfNotDebounced(VoiceCommand.DAD_MESSAGE)
-                    val remainder = primary.orEmpty().substring(dadPhrase + 2).trim()
-                    if (remainder.isNotEmpty()) {
-                        awaitingMessage = false
-                        listener.onMessageRecognized(remainder)
-                    }
-                } else {
-                    phraseMatcher.matchFirst(hypotheses)?.let(::emitIfNotDebounced)
-                }
-            }
-            scheduleRestart(BASE_RESTART_DELAY_MILLIS)
+            processFinalResults(results)
+            requestedActive = false
+            closeContinuousAudio()
+            dispatchTerminalError(
+                kind = VoiceCommandErrorKind.SERVICE,
+                message = "기기 음성서비스가 연속 인식을 지원하지 않습니다.",
+            )
+        }
+
+        override fun onSegmentResults(segmentResults: Bundle) = handleCycle(cycle) {
+            processFinalResults(segmentResults)
+        }
+
+        override fun onEndOfSegmentedSession() = handleCycle(cycle) {
+            listening = false
+            requestedActive = false
+            closeContinuousAudio()
+            dispatchTerminalError(
+                kind = VoiceCommandErrorKind.SERVICE,
+                message = "연속 음성인식 세션이 종료되었습니다. 앱을 다시 열어 주세요.",
+            )
         }
 
         override fun onPartialResults(partialResults: Bundle?) = handleCycle(cycle) {
@@ -275,60 +292,10 @@ class StudentVoiceCommandController @JvmOverloads constructor(
         override fun onEvent(eventType: Int, params: Bundle?) = Unit
     }
 
-    private fun handlePlatformError(platformCode: Int) {
-        val kind = platformErrorKind(platformCode)
-        val terminal = kind == VoiceCommandErrorKind.PERMISSION_DENIED ||
-            kind == VoiceCommandErrorKind.LANGUAGE_NOT_SUPPORTED ||
-            kind == VoiceCommandErrorKind.LANGUAGE_UNAVAILABLE
-
-        if (terminal) {
-            requestedActive = false
-            dispatchTerminalError(kind, platformCode = platformCode)
-            return
-        }
-
-        val retryDelay = when (kind) {
-            VoiceCommandErrorKind.NO_MATCH,
-            VoiceCommandErrorKind.SPEECH_TIMEOUT,
-            -> {
-                consecutiveErrors = 0
-                BASE_RESTART_DELAY_MILLIS
-            }
-
-            VoiceCommandErrorKind.RECOGNIZER_BUSY -> {
-                consecutiveErrors++
-                max(BUSY_MINIMUM_DELAY_MILLIS, exponentialErrorDelay())
-            }
-
-            else -> {
-                consecutiveErrors++
-                exponentialErrorDelay()
-            }
-        }
-
-        listener.onError(
-            VoiceCommandError(
-                kind = kind,
-                platformCode = platformCode,
-                recoverable = true,
-                retryInMillis = retryDelay,
-            ),
-        )
-        scheduleRestart(retryDelay)
-    }
-
     private fun handleControllerError(kind: VoiceCommandErrorKind, message: String?) {
-        consecutiveErrors++
-        val retryDelay = exponentialErrorDelay()
-        listener.onError(
-            VoiceCommandError(
-                kind = kind,
-                recoverable = true,
-                retryInMillis = retryDelay,
-                message = message,
-            ),
-        )
-        scheduleRestart(retryDelay)
+        requestedActive = false
+        closeContinuousAudio()
+        dispatchTerminalError(kind = kind, message = message)
     }
 
     private fun dispatchTerminalError(
@@ -336,7 +303,6 @@ class StudentVoiceCommandController @JvmOverloads constructor(
         platformCode: Int? = null,
         message: String? = null,
     ) {
-        cancelScheduledRestart()
         listening = false
         listener.onError(
             VoiceCommandError(
@@ -364,31 +330,136 @@ class StudentVoiceCommandController @JvmOverloads constructor(
         }
     }
 
-    private fun scheduleRestart(delayMillis: Long) {
-        if (!requestedActive || destroyed) return
-
-        cancelScheduledRestart()
-        val scheduledCycle = recognitionCycle
-        val runnable = Runnable {
-            restartRunnable = null
-            if (requestedActive && !destroyed && scheduledCycle == recognitionCycle) {
-                beginListening()
+    private fun processFinalResults(results: Bundle?) {
+        val hypotheses = results
+            ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+            .orEmpty()
+        val primary = hypotheses.firstOrNull { it.isNotBlank() }
+        if (awaitingMessage) {
+            if (primary != null) {
+                awaitingMessage = false
+                listener.onMessageRecognized(primary.trim())
             }
+            return
         }
-        restartRunnable = runnable
-        listener.onStatus(
-            VoiceCommandStatus(
-                state = VoiceCommandState.RETRY_WAIT,
-                recognitionMode = recognitionMode,
-                retryInMillis = delayMillis,
-            ),
-        )
-        mainHandler.postDelayed(runnable, delayMillis)
+
+        val normalized = primary?.trim().orEmpty()
+        if (normalized.startsWith("아빠")) {
+            emitIfNotDebounced(VoiceCommand.DAD_MESSAGE)
+            val remainder = normalized.removePrefix("아빠").trim()
+            if (remainder.isNotEmpty()) {
+                awaitingMessage = false
+                listener.onMessageRecognized(remainder)
+            }
+        } else {
+            phraseMatcher.matchFirst(hypotheses)?.let(::emitIfNotDebounced)
+        }
     }
 
-    private fun cancelScheduledRestart() {
-        restartRunnable?.let(mainHandler::removeCallbacks)
-        restartRunnable = null
+    @SuppressLint("MissingPermission") // start() checks RECORD_AUDIO immediately before this path.
+    private fun openContinuousAudio(cycle: Long): ParcelFileDescriptor {
+        check(Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+        closeContinuousAudio()
+        val minimumBuffer = AudioRecord.getMinBufferSize(
+            AUDIO_SAMPLE_RATE_HZ,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+        )
+        check(minimumBuffer > 0) { "마이크 버퍼를 만들 수 없습니다." }
+        val bufferSize = maxOf(minimumBuffer, AUDIO_BUFFER_BYTES)
+        val record = AudioRecord.Builder()
+            .setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(AUDIO_SAMPLE_RATE_HZ)
+                    .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                    .build(),
+            )
+            .setBufferSizeInBytes(bufferSize)
+            .build()
+        check(record.state == AudioRecord.STATE_INITIALIZED) {
+            record.release()
+            "마이크를 초기화할 수 없습니다."
+        }
+
+        val pipe = ParcelFileDescriptor.createPipe()
+        val readDescriptor = pipe[0]
+        val writeDescriptor = pipe[1]
+        val generation = ++audioGeneration
+        audioRecord = record
+        audioReadDescriptor = readDescriptor
+        audioWriteDescriptor = writeDescriptor
+
+        try {
+            record.startRecording()
+            check(record.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                "마이크 녹음을 시작할 수 없습니다."
+            }
+            audioThread = Thread(
+                {
+                    val buffer = ByteArray(bufferSize)
+                    try {
+                        ParcelFileDescriptor.AutoCloseOutputStream(writeDescriptor).use { output ->
+                            while (
+                                requestedActive && !destroyed &&
+                                cycle == recognitionCycle && generation == audioGeneration
+                            ) {
+                                val count = record.read(
+                                    buffer,
+                                    0,
+                                    buffer.size,
+                                    AudioRecord.READ_BLOCKING,
+                                )
+                                if (count > 0) {
+                                    output.write(buffer, 0, count)
+                                } else if (count != AudioRecord.ERROR_INVALID_OPERATION) {
+                                    throw IllegalStateException("마이크 읽기 오류: $count")
+                                }
+                            }
+                        }
+                    } catch (error: Throwable) {
+                        mainHandler.post {
+                            if (
+                                requestedActive && !destroyed &&
+                                cycle == recognitionCycle && generation == audioGeneration
+                            ) {
+                                requestedActive = false
+                                listening = false
+                                closeContinuousAudio()
+                                runCatching { recognizer?.cancel() }
+                                dispatchTerminalError(
+                                    kind = VoiceCommandErrorKind.AUDIO,
+                                    message = error.message ?: "연속 마이크 입력이 중단되었습니다.",
+                                )
+                            }
+                        }
+                    }
+                },
+                "continuous-speech-audio",
+            ).apply {
+                priority = Thread.NORM_PRIORITY + 1
+                start()
+            }
+            return readDescriptor
+        } catch (error: Throwable) {
+            closeContinuousAudio()
+            throw error
+        }
+    }
+
+    private fun closeContinuousAudio() {
+        audioGeneration++
+        val record = audioRecord
+        audioRecord = null
+        runCatching { record?.stop() }
+        runCatching { record?.release() }
+        runCatching { audioWriteDescriptor?.close() }
+        runCatching { audioReadDescriptor?.close() }
+        audioWriteDescriptor = null
+        audioReadDescriptor = null
+        audioThread?.interrupt()
+        audioThread = null
     }
 
     private fun invalidateCurrentCycle() {
@@ -396,25 +467,27 @@ class StudentVoiceCommandController @JvmOverloads constructor(
         listening = false
     }
 
-    private fun exponentialErrorDelay(): Long {
-        val exponent = min(consecutiveErrors, MAX_BACKOFF_EXPONENT)
-        return min(
-            MAX_ERROR_BACKOFF_MILLIS,
-            BASE_RESTART_DELAY_MILLIS * (1L shl exponent),
-        )
-    }
-
     private fun hasRecordAudioPermission(): Boolean =
         appContext.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
             PackageManager.PERMISSION_GRANTED
 
-    private fun recognitionIntent() = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+    private fun recognitionIntent(audioSource: ParcelFileDescriptor) =
+        Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
         putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
         putExtra(RecognizerIntent.EXTRA_LANGUAGE, KOREAN_LOCALE)
         putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, KOREAN_LOCALE)
         putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, MAX_RECOGNITION_RESULTS)
         putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
         putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+        putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, audioSource)
+        putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
+        putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
+        putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, AUDIO_SAMPLE_RATE_HZ)
+        putExtra(RecognizerIntent.EXTRA_SEGMENTED_SESSION, RecognizerIntent.EXTRA_AUDIO_SOURCE)
+        putStringArrayListExtra(
+            RecognizerIntent.EXTRA_BIASING_STRINGS,
+            arrayListOf("풀었어", "아빠", "공부 시작", "일시 정지", "그만"),
+        )
     }
 
     private fun handleCycle(cycle: Long, action: () -> Unit) = onMainThread {
@@ -454,10 +527,8 @@ class StudentVoiceCommandController @JvmOverloads constructor(
     private companion object {
         const val KOREAN_LOCALE = "ko-KR"
         const val MAX_RECOGNITION_RESULTS = 5
-        const val BASE_RESTART_DELAY_MILLIS = 600L
-        const val BUSY_MINIMUM_DELAY_MILLIS = 2_400L
-        const val MAX_ERROR_BACKOFF_MILLIS = 9_600L
-        const val MAX_BACKOFF_EXPONENT = 4
         const val COMMAND_DEBOUNCE_MILLIS = 2_000L
+        const val AUDIO_SAMPLE_RATE_HZ = 16_000
+        const val AUDIO_BUFFER_BYTES = 16_384
     }
 }

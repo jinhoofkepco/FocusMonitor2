@@ -219,7 +219,9 @@ class StudentActivity : ComponentActivity() {
 
                 override fun onError(error: VoiceCommandError) {
                     if (!error.recoverable) {
-                        eventLabel.text = "음성 명령을 사용할 수 없습니다 · 버튼은 계속 사용할 수 있어요"
+                        voiceStarted = false
+                        eventLabel.text = error.message
+                            ?: "음성 명령을 사용할 수 없습니다 · 버튼은 계속 사용할 수 있어요"
                     }
                 }
             },
