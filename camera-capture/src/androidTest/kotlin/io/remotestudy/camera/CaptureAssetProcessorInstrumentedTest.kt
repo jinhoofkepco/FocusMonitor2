@@ -47,7 +47,7 @@ class CaptureAssetProcessorInstrumentedTest {
         val calibration = checkNotNull(BitmapFactory.decodeFile(checkNotNull(assets.bookCalibrationFile).absolutePath))
         val book = checkNotNull(BitmapFactory.decodeFile(assets.bookRoiFile.absolutePath))
         try {
-            assertTrue(maxOf(thumbnail.width, thumbnail.height) <= 2_400)
+            assertTrue(maxOf(thumbnail.width, thumbnail.height) <= 1_600)
             assertTrue(maxOf(calibration.width, calibration.height) <= 2_400)
             assertTrue(maxOf(book.width, book.height) <= 4_000)
             assertTrue(

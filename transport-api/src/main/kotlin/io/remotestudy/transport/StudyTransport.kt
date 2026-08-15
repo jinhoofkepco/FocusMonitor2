@@ -45,6 +45,12 @@ sealed interface TransportEvent {
 
     data class FileSent(val payloadId: Long) : TransportEvent
 
+    data class FileProgress(
+        val payloadId: Long,
+        val bytesTransferred: Long,
+        val totalBytes: Long,
+    ) : TransportEvent
+
     data class FileSendFailed(
         val payloadId: Long,
         val detail: String,
@@ -74,6 +80,8 @@ interface StudyTransport {
     fun send(bytes: ByteArray): Boolean
 
     fun sendFile(file: File): Long?
+
+    fun cancelFile(payloadId: Long): Boolean
 
     fun stop()
 }

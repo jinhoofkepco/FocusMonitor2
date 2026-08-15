@@ -55,6 +55,7 @@ import io.remotestudy.protocol.WireSessionStatus
 import io.remotestudy.protocol.WireStartOrigin
 import io.remotestudy.transport.TransportEvent
 import io.remotestudy.transport.TransportRole
+import io.remotestudy.transport.ReconnectBackoff
 import io.remotestudy.transport.nearby.NearbyPermissionSet
 import io.remotestudy.transport.nearby.NearbyStudyTransport
 import io.remotestudy.sync.ReliableMessageChannel
@@ -123,6 +124,10 @@ class TeacherActivity : ComponentActivity() {
     private val outgoingVoicePayloadIdByUserMessageId = mutableMapOf<String, Long>()
     private val outgoingVoiceRetryCountByUserMessageId = mutableMapOf<String, Int>()
     private val outgoingVoiceRetryRunnableByUserMessageId = mutableMapOf<String, Runnable>()
+    private val outgoingVoiceStallRunnableByPayloadId = mutableMapOf<Long, Runnable>()
+    private val outgoingVoiceProgressBytesByPayloadId = mutableMapOf<Long, Long>()
+    private val reconnectBackoff = ReconnectBackoff()
+    private var reconnectRunnable: Runnable? = null
     private val recentThumbnails = ArrayDeque<RecentThumbnail>()
     private var latestThumbnailBitmap: Bitmap? = null
     private val conversationHistory = ArrayDeque<ConversationEntry>()
@@ -280,6 +285,9 @@ class TeacherActivity : ComponentActivity() {
             }
 
             is TransportEvent.Connected -> {
+                reconnectRunnable?.let(handler::removeCallbacks)
+                reconnectRunnable = null
+                reconnectBackoff.reset()
                 transportConnected = true
                 reliableChannel.setConnected(true, SystemClock.elapsedRealtime())
                 resetOutgoingVoiceRetriesForReconnect()
@@ -314,13 +322,13 @@ class TeacherActivity : ComponentActivity() {
                 startButton.isEnabled = false
                 setConnectionState("연결 끊김", COLOR_DANGER)
                 eventLabel.text = "상태를 확인할 수 없음 · 자리 비움으로 판정하지 않음"
-                transportStarted = false
-                startTransport()
+                scheduleTransportRestart()
             }
 
             is TransportEvent.MessageReceived -> receiveMessage(event.bytes)
             is TransportEvent.FileReceived -> receiveFile(event)
             is TransportEvent.FileSent -> handleOutgoingVoiceFileSent(event.payloadId)
+            is TransportEvent.FileProgress -> handleOutgoingVoiceFileProgress(event)
             is TransportEvent.FileSendFailed -> handleOutgoingVoiceFileFailure(event.payloadId, event.detail)
             is TransportEvent.Failure -> {
                 setConnectionState("연결 오류", COLOR_DANGER)
@@ -891,7 +899,36 @@ class TeacherActivity : ComponentActivity() {
             metadata = metadata,
             fileSent = false,
         )
+        armOutgoingVoiceStallTimeout(payloadId)
         return true
+    }
+
+    private fun handleOutgoingVoiceFileProgress(event: TransportEvent.FileProgress) {
+        if (event.payloadId !in outgoingVoiceAttemptByPayloadId) return
+        val previous = outgoingVoiceProgressBytesByPayloadId[event.payloadId] ?: -1L
+        if (event.bytesTransferred <= previous) return
+        outgoingVoiceProgressBytesByPayloadId[event.payloadId] = event.bytesTransferred
+        armOutgoingVoiceStallTimeout(event.payloadId)
+    }
+
+    private fun armOutgoingVoiceStallTimeout(payloadId: Long) {
+        outgoingVoiceStallRunnableByPayloadId.remove(payloadId)?.let(handler::removeCallbacks)
+        val timeout = Runnable {
+            outgoingVoiceStallRunnableByPayloadId.remove(payloadId)
+            if (outgoingVoiceAttemptByPayloadId[payloadId]?.fileSent != false) return@Runnable
+            eventLabel.text = "음성 전송이 멈춰 취소하고 다시 시도합니다"
+            if (!transport.cancelFile(payloadId)) {
+                handleOutgoingVoiceFileFailure(payloadId, "전송 진행 시간 초과")
+            } else {
+                handler.postDelayed({
+                    if (payloadId in outgoingVoiceAttemptByPayloadId) {
+                        handleOutgoingVoiceFileFailure(payloadId, "전송 취소 응답 시간 초과")
+                    }
+                }, PAYLOAD_CANCEL_GRACE_MS)
+            }
+        }
+        outgoingVoiceStallRunnableByPayloadId[payloadId] = timeout
+        handler.postDelayed(timeout, OUTGOING_FILE_STALL_TIMEOUT_MS)
     }
 
     private fun handleOutgoingVoiceFileSent(payloadId: Long) {
@@ -927,6 +964,8 @@ class TeacherActivity : ComponentActivity() {
 
     private fun removeOutgoingVoiceAttempt(payloadId: Long): OutgoingVoiceAttempt? {
         val attempt = outgoingVoiceAttemptByPayloadId.remove(payloadId) ?: return null
+        outgoingVoiceStallRunnableByPayloadId.remove(payloadId)?.let(handler::removeCallbacks)
+        outgoingVoiceProgressBytesByPayloadId.remove(payloadId)
         if (outgoingVoicePayloadIdByUserMessageId[attempt.userMessageId] == payloadId) {
             outgoingVoicePayloadIdByUserMessageId.remove(attempt.userMessageId)
         }
@@ -1166,12 +1205,28 @@ class TeacherActivity : ComponentActivity() {
         pendingRoiAssetIds.clear()
         pendingCalibrationAssetId = null
         pendingComparisonAssetIds.clear()
-        transport.stop()
-        transportStarted = false
         startButton.isEnabled = false
         setConnectionState("연결을 완전히 다시 시작하는 중", COLOR_WARNING)
         eventLabel.text = "이전 연결 번호를 폐기하고 학생폰을 다시 찾습니다"
-        handler.postDelayed(::startTransport, FORCE_RECONNECT_DELAY_MS)
+        reconnectRunnable?.let(handler::removeCallbacks)
+        reconnectRunnable = null
+        reconnectBackoff.reset()
+        scheduleTransportRestart()
+    }
+
+    private fun scheduleTransportRestart() {
+        if (activityDestroyed || reconnectRunnable != null) return
+        transportConnected = false
+        transport.stop()
+        transportStarted = false
+        val delayMs = reconnectBackoff.nextDelay()
+        val restart = Runnable {
+            reconnectRunnable = null
+            if (!activityDestroyed) startTransport()
+        }
+        reconnectRunnable = restart
+        eventLabel.text = "무선 연결 정리 중 · ${delayMs / 1_000}초 뒤 다시 기다립니다"
+        handler.postDelayed(restart, delayMs)
     }
 
     private fun toggleBookRegionEditing() {
@@ -2207,12 +2262,13 @@ class TeacherActivity : ComponentActivity() {
         private const val MAX_PENDING_INCOMING_FILES = 64
         private const val MAX_OUTGOING_FILE_RETRIES = 3
         private const val OUTGOING_FILE_RETRY_DELAY_MS = 2_000L
+        private const val OUTGOING_FILE_STALL_TIMEOUT_MS = 15_000L
+        private const val PAYLOAD_CANCEL_GRACE_MS = 2_000L
         private const val ROI_REQUEST_TIMEOUT_MS = 15_000L
         private const val CALIBRATION_REQUEST_TIMEOUT_MS = 25_000L
         private const val CAMERA_COMPARISON_TIMEOUT_MS = 75_000L
         private const val DEFAULT_DETAIL_ZOOM_RATIO = 2f
         private const val DEFAULT_FOCUS_TIMEOUT_MS = 2_000L
-        private const val FORCE_RECONNECT_DELAY_MS = 600L
         private const val MAX_MESSAGE_TEXT_BYTES = 4 * 1024
         private const val MAX_STATUS_TEXT_CHARS = 120
         private const val MAX_VOICE_DURATION_MS = 60_000L

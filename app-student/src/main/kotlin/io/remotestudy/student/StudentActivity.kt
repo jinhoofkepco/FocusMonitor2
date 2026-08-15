@@ -61,6 +61,7 @@ import io.remotestudy.protocol.WireSessionPhase
 import io.remotestudy.protocol.WireSessionStatus
 import io.remotestudy.transport.TransportEvent
 import io.remotestudy.transport.TransportRole
+import io.remotestudy.transport.ReconnectBackoff
 import io.remotestudy.transport.nearby.NearbyPermissionSet
 import io.remotestudy.transport.nearby.NearbyStudyTransport
 import io.remotestudy.sync.ReliableMessageChannel
@@ -151,6 +152,10 @@ class StudentActivity : ComponentActivity() {
     private val outgoingPayloadIdByKey = mutableMapOf<OutgoingFileKey, Long>()
     private val outgoingRetryCountByKey = mutableMapOf<OutgoingFileKey, Int>()
     private val outgoingRetryRunnableByKey = mutableMapOf<OutgoingFileKey, Runnable>()
+    private val outgoingStallRunnableByPayloadId = mutableMapOf<Long, Runnable>()
+    private val outgoingProgressBytesByPayloadId = mutableMapOf<Long, Long>()
+    private val reconnectBackoff = ReconnectBackoff()
+    private var reconnectRunnable: Runnable? = null
     private val voiceTransferByPayloadId = linkedMapOf<Long, StudyMessage.VoiceTransfer>()
     private val earlyVoiceFileUriByPayloadId = linkedMapOf<Long, String>()
     private val ignoredAssetPayloadIds = linkedSetOf<Long>()
@@ -498,6 +503,9 @@ class StudentActivity : ComponentActivity() {
             }
 
             is TransportEvent.Connected -> {
+                reconnectRunnable?.let(handler::removeCallbacks)
+                reconnectRunnable = null
+                reconnectBackoff.reset()
                 connected = true
                 reliableChannel.setConnected(true, SystemClock.elapsedRealtime())
                 resetOutgoingRetriesForReconnect()
@@ -525,13 +533,13 @@ class StudentActivity : ComponentActivity() {
                 requestedEndpointId = null
                 setConnectionState("연결 끊김", COLOR_DANGER)
                 eventLabel.text = "선생님폰 연결이 끊겼지만 타이머는 계속됩니다"
-                transportStarted = false
-                startTransport()
+                scheduleTransportRestart()
             }
 
             is TransportEvent.MessageReceived -> receiveMessage(event.bytes)
             is TransportEvent.FileReceived -> receiveVoiceFile(event)
             is TransportEvent.FileSent -> handleOutgoingFileSent(event.payloadId)
+            is TransportEvent.FileProgress -> handleOutgoingFileProgress(event)
             is TransportEvent.FileSendFailed -> handleOutgoingFileFailure(event.payloadId, event.detail)
             is TransportEvent.Failure -> {
                 if (event.operation in setOf("requestConnection", "connection", "startDiscovery")) {
@@ -1323,8 +1331,19 @@ class StudentActivity : ComponentActivity() {
             discardSupersededPendingThumbnails(keep = transferKey)
         }
         pendingAssetTransfers += transferKey
+        if (kind == AssetKind.THUMBNAIL && hasThumbnailInFlight(excluding = transferKey)) {
+            eventLabel.text = "이전 사진 전송 중 · 최신 사진 1장만 대기"
+            return true
+        }
         return trySendPendingAsset(transferKey)
     }
+
+    private fun hasThumbnailInFlight(excluding: AssetTransferKey? = null): Boolean =
+        outgoingPayloadIdByKey.keys.any { key ->
+            key is OutgoingFileKey.Asset &&
+                key.transfer.kind == AssetKind.THUMBNAIL &&
+                key.transfer != excluding
+        }
 
     private fun trySendPendingAsset(transferKey: AssetTransferKey): Boolean {
         val key = OutgoingFileKey.Asset(transferKey)
@@ -1413,6 +1432,44 @@ class StudentActivity : ComponentActivity() {
             metadata = metadata,
             fileSent = false,
         )
+        armOutgoingStallTimeout(payloadId)
+    }
+
+    private fun handleOutgoingFileProgress(event: TransportEvent.FileProgress) {
+        val attempt = outgoingFileAttemptByPayloadId[event.payloadId] ?: return
+        val previous = outgoingProgressBytesByPayloadId[event.payloadId] ?: -1L
+        if (event.bytesTransferred <= previous) return
+        outgoingProgressBytesByPayloadId[event.payloadId] = event.bytesTransferred
+        armOutgoingStallTimeout(event.payloadId)
+        val asset = attempt.key as? OutgoingFileKey.Asset
+        if (asset?.transfer?.kind == AssetKind.THUMBNAIL) {
+            val percent = if (event.totalBytes > 0) {
+                (event.bytesTransferred * 100L / event.totalBytes).coerceIn(0L, 99L)
+            } else {
+                0L
+            }
+            eventLabel.text = "최신 사진 전송 중 · ${percent}%"
+        }
+    }
+
+    private fun armOutgoingStallTimeout(payloadId: Long) {
+        outgoingStallRunnableByPayloadId.remove(payloadId)?.let(handler::removeCallbacks)
+        val timeout = Runnable {
+            outgoingStallRunnableByPayloadId.remove(payloadId)
+            if (outgoingFileAttemptByPayloadId[payloadId]?.fileSent != false) return@Runnable
+            eventLabel.text = "파일 전송이 멈춰 취소하고 최신 항목으로 교체합니다"
+            if (!transport.cancelFile(payloadId)) {
+                handleOutgoingFileFailure(payloadId, "전송 진행 시간 초과")
+            } else {
+                handler.postDelayed({
+                    if (payloadId in outgoingFileAttemptByPayloadId) {
+                        handleOutgoingFileFailure(payloadId, "전송 취소 응답 시간 초과")
+                    }
+                }, PAYLOAD_CANCEL_GRACE_MS)
+            }
+        }
+        outgoingStallRunnableByPayloadId[payloadId] = timeout
+        handler.postDelayed(timeout, OUTGOING_FILE_STALL_TIMEOUT_MS)
     }
 
     private fun handleOutgoingFileSent(payloadId: Long) {
@@ -1442,6 +1499,7 @@ class StudentActivity : ComponentActivity() {
                     captureById[key.transfer.assetId]?.thumbnailFile?.let { sentFile ->
                         fileExecutor.execute { sentFile.delete() }
                     }
+                    sendLatestPendingThumbnail()
                 }
                 if (key.transfer.kind != AssetKind.THUMBNAIL) {
                     eventLabel.text = when (key.transfer.kind) {
@@ -1463,11 +1521,43 @@ class StudentActivity : ComponentActivity() {
     private fun handleOutgoingFileFailure(payloadId: Long, detail: String) {
         val attempt = removeOutgoingAttempt(payloadId) ?: return
         eventLabel.text = "파일 전송 실패 · $detail"
+        val assetKey = attempt.key as? OutgoingFileKey.Asset
+        if (assetKey?.transfer?.kind == AssetKind.THUMBNAIL) {
+            val newerThumbnailExists = pendingAssetTransfers.any {
+                it.kind == AssetKind.THUMBNAIL && it != assetKey.transfer
+            }
+            if (newerThumbnailExists) {
+                dropPendingThumbnail(assetKey.transfer)
+                sendLatestPendingThumbnail()
+                return
+            }
+        }
         scheduleOutgoingRetry(attempt.key)
+    }
+
+    private fun sendLatestPendingThumbnail() {
+        if (hasThumbnailInFlight()) return
+        pendingAssetTransfers
+            .filter { it.kind == AssetKind.THUMBNAIL }
+            .maxByOrNull { captureById[it.assetId]?.capturedAtEpochMs ?: Long.MIN_VALUE }
+            ?.let(::trySendPendingAsset)
+    }
+
+    private fun dropPendingThumbnail(transfer: AssetTransferKey) {
+        val key = OutgoingFileKey.Asset(transfer)
+        pendingAssetTransfers.remove(transfer)
+        cancelOutgoingRetry(key)
+        outgoingRetryCountByKey.remove(key)
+        thumbnailOfferedIds += transfer.assetId
+        captureById[transfer.assetId]?.thumbnailFile?.let { staleFile ->
+            fileExecutor.execute { staleFile.delete() }
+        }
     }
 
     private fun removeOutgoingAttempt(payloadId: Long): OutgoingFileAttempt? {
         val attempt = outgoingFileAttemptByPayloadId.remove(payloadId) ?: return null
+        outgoingStallRunnableByPayloadId.remove(payloadId)?.let(handler::removeCallbacks)
+        outgoingProgressBytesByPayloadId.remove(payloadId)
         if (outgoingPayloadIdByKey[attempt.key] == payloadId) {
             outgoingPayloadIdByKey.remove(attempt.key)
         }
@@ -1551,11 +1641,27 @@ class StudentActivity : ComponentActivity() {
         clearOutgoingInflightForDisconnect()
         requestedEndpointId = null
         pendingEndpointId = null
-        transport.stop()
-        transportStarted = false
         setConnectionState("연결을 완전히 다시 시작하는 중", COLOR_WARNING)
         eventLabel.text = "이전 연결 번호를 폐기하고 선생님폰을 다시 찾습니다"
-        handler.postDelayed(::startTransport, FORCE_RECONNECT_DELAY_MS)
+        reconnectRunnable?.let(handler::removeCallbacks)
+        reconnectRunnable = null
+        reconnectBackoff.reset()
+        scheduleTransportRestart()
+    }
+
+    private fun scheduleTransportRestart() {
+        if (activityDestroyed || reconnectRunnable != null) return
+        connected = false
+        transport.stop()
+        transportStarted = false
+        val delayMs = reconnectBackoff.nextDelay()
+        val restart = Runnable {
+            reconnectRunnable = null
+            if (!activityDestroyed) startTransport()
+        }
+        reconnectRunnable = restart
+        eventLabel.text = "무선 연결 정리 중 · ${delayMs / 1_000}초 뒤 다시 찾습니다"
+        handler.postDelayed(restart, delayMs)
     }
 
     private fun pruneLocalAssets() {
@@ -1989,7 +2095,6 @@ class StudentActivity : ComponentActivity() {
         private const val STATE_BOOK_BOTTOM = "book-bottom"
         private const val DEFAULT_DETAIL_ZOOM_RATIO = 2f
         private const val DEFAULT_FOCUS_TIMEOUT_MS = 2_000L
-        private const val FORCE_RECONNECT_DELAY_MS = 600L
         private const val TICK_INTERVAL_MS = 250L
         private const val UNDO_WINDOW_MS = 5_000L
         private const val DEFAULT_CAPTURE_INTERVAL_MS = 10_000L
@@ -2003,6 +2108,8 @@ class StudentActivity : ComponentActivity() {
         private const val VOICE_DICTATION_DURATION_MS = 12_000L
         private const val MAX_OUTGOING_FILE_RETRIES = 3
         private const val OUTGOING_FILE_RETRY_DELAY_MS = 2_000L
+        private const val OUTGOING_FILE_STALL_TIMEOUT_MS = 15_000L
+        private const val PAYLOAD_CANCEL_GRACE_MS = 2_000L
         private const val SESSION_SNAPSHOT_KEY = "session-snapshot"
         private const val COLOR_TEXT = 0xFF172033.toInt()
         private const val COLOR_MUTED = 0xFF65708A.toInt()

@@ -46,7 +46,7 @@ class NearbyStudyTransport(context: Context) : StudyTransport {
     }
 
     override fun start(role: TransportRole, displayName: String) {
-        stop()
+        if (active) stop()
         val startedGeneration = ++generation
         active = true
         this.role = role
@@ -121,6 +121,32 @@ class NearbyStudyTransport(context: Context) : StudyTransport {
             return null
         }
         return payload.id
+    }
+
+    override fun cancelFile(payloadId: Long): Boolean {
+        val callbackGeneration = currentCallbacks()?.generation ?: return false
+        if (payloadId !in outgoingFilePayloadIds) return false
+        client.cancelPayload(payloadId)
+            .addOnSuccessListener {
+                retryHandler.postDelayed(
+                    {
+                        completeOutgoingFailure(
+                            callbackGeneration,
+                            payloadId,
+                            "파일 전송을 취소했습니다.",
+                        )
+                    },
+                    CANCEL_CALLBACK_GRACE_MS,
+                )
+            }
+            .addOnFailureListener { error ->
+                completeOutgoingFailure(
+                    callbackGeneration,
+                    payloadId,
+                    error.message ?: "파일 전송 취소에 실패했습니다.",
+                )
+            }
+        return true
     }
 
     override fun stop() {
@@ -299,6 +325,15 @@ class NearbyStudyTransport(context: Context) : StudyTransport {
                 if (!isCurrent(generation)) return
                 if (update.payloadId in outgoingFilePayloadIds) {
                     when (update.status) {
+                        PayloadTransferUpdate.Status.IN_PROGRESS -> emitIfCurrent(
+                            generation,
+                            TransportEvent.FileProgress(
+                                payloadId = update.payloadId,
+                                bytesTransferred = update.bytesTransferred,
+                                totalBytes = update.totalBytes,
+                            ),
+                        )
+
                         PayloadTransferUpdate.Status.SUCCESS -> {
                             if (outgoingFilePayloadIds.remove(update.payloadId)) {
                                 emitIfCurrent(generation, TransportEvent.FileSent(update.payloadId))
@@ -320,6 +355,8 @@ class NearbyStudyTransport(context: Context) : StudyTransport {
                     return
                 }
                 when (update.status) {
+                    PayloadTransferUpdate.Status.IN_PROGRESS -> Unit
+
                     PayloadTransferUpdate.Status.SUCCESS -> {
                         val incoming = incomingFilePayloads.remove(update.payloadId) ?: return
                         val uri = checkNotNull(incoming.payload.asFile()).asUri().toString()
@@ -387,6 +424,7 @@ class NearbyStudyTransport(context: Context) : StudyTransport {
     companion object {
         private const val SERVICE_ID = "io.remotestudy.connections.v1"
         private const val MAX_BYTES_PAYLOAD = 32 * 1024
+        private const val CANCEL_CALLBACK_GRACE_MS = 3_000L
         private const val RESTART_BASE_DELAY_MS = 2_000L
         private const val MAX_RESTART_EXPONENT = 3
         private val STRATEGY = Strategy.P2P_POINT_TO_POINT
