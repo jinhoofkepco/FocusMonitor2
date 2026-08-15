@@ -13,6 +13,9 @@ internal class FrameObservationAnalyzer(
     @Volatile
     private var closed = false
 
+    @Volatile
+    private var suspended = false
+
     private var lastAnalyzedAtElapsedMs: Long? = null
     private var presenceBaseline: FloatArray? = null
     private var previousPresenceSignature: FloatArray? = null
@@ -30,6 +33,15 @@ internal class FrameObservationAnalyzer(
         if (!closed) baselineRequested.set(true)
     }
 
+    fun setSuspended(value: Boolean) {
+        suspended = value
+        if (!value) {
+            lastAnalyzedAtElapsedMs = null
+            previousPresenceSignature = null
+            previousBookSignature = null
+        }
+    }
+
     fun reset() {
         lastAnalyzedAtElapsedMs = null
         presenceBaseline = null
@@ -40,7 +52,7 @@ internal class FrameObservationAnalyzer(
 
     override fun analyze(image: ImageProxy) {
         try {
-            if (closed) return
+            if (closed || suspended) return
 
             val observedAt = SystemClock.elapsedRealtime()
             val previousObservedAt = lastAnalyzedAtElapsedMs

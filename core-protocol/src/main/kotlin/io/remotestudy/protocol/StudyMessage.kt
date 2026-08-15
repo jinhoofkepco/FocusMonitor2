@@ -31,6 +31,8 @@ enum class AlertKind {
 enum class AssetKind {
     THUMBNAIL,
     BOOK_ROI,
+    /** Fresh, unpixelated image captured at the same real 2x zoom used by BOOK_ROI. */
+    BOOK_CALIBRATION,
 }
 
 enum class DetailCaptureMode {

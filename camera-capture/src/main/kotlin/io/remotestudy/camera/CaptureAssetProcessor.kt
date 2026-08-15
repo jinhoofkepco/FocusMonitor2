@@ -3,11 +3,8 @@ package io.remotestudy.camera
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.BitmapRegionDecoder
-import android.graphics.Canvas
 import android.graphics.Matrix
-import android.graphics.Paint
 import android.graphics.Rect
-import android.graphics.RectF
 import androidx.exifinterface.media.ExifInterface
 import java.io.File
 import java.io.FileOutputStream
@@ -24,9 +21,10 @@ internal object CaptureAssetProcessor {
     private const val STANDARD_BOOK_MAX_LONG_EDGE = 4_000
     private const val ULTRA_BOOK_MAX_LONG_EDGE = 4_600
     private const val BOOK_JPEG_QUALITY = 95
-    private const val THUMBNAIL_MAX_LONG_EDGE = 1_440
-    private const val THUMBNAIL_JPEG_QUALITY = 82
-    private const val PIXEL_BLOCK_SIZE = 20
+    private const val THUMBNAIL_MAX_LONG_EDGE = 2_400
+    private const val THUMBNAIL_JPEG_QUALITY = 92
+    private const val CALIBRATION_MAX_LONG_EDGE = 2_400
+    private const val CALIBRATION_JPEG_QUALITY = 92
 
     fun process(
         originalJpeg: File,
@@ -35,39 +33,69 @@ internal object CaptureAssetProcessor {
         capturedAtEpochMs: Long,
         bookRegion: BookRegion = BookRegion.DEFAULT,
         detailCaptureMode: DetailCaptureMode = DetailCaptureMode.STANDARD_12_MP,
+        includeCalibration: Boolean = true,
+    ): CaptureAssets {
+        return processDual(
+            fullFrameJpeg = originalJpeg,
+            detailFrameJpeg = originalJpeg,
+            outputDir = outputDir,
+            assetId = assetId,
+            capturedAtEpochMs = capturedAtEpochMs,
+            bookRegion = bookRegion,
+            detailCaptureMode = detailCaptureMode,
+            includeCalibration = includeCalibration,
+        )
+    }
+
+    fun processDual(
+        fullFrameJpeg: File,
+        detailFrameJpeg: File,
+        outputDir: File,
+        assetId: String,
+        capturedAtEpochMs: Long,
+        bookRegion: BookRegion = BookRegion.DEFAULT,
+        detailCaptureMode: DetailCaptureMode = DetailCaptureMode.STANDARD_12_MP,
+        includeCalibration: Boolean = true,
     ): CaptureAssets {
         var committedAssets: CaptureAssets? = null
         var processingFailure: Throwable? = null
         try {
             committedAssets = createAssets(
-                originalJpeg, outputDir, assetId, capturedAtEpochMs, bookRegion, detailCaptureMode,
+                fullFrameJpeg, detailFrameJpeg, outputDir, assetId, capturedAtEpochMs,
+                bookRegion, detailCaptureMode,
+                includeCalibration,
             )
             return committedAssets
         } catch (failure: Throwable) {
             processingFailure = failure
             throw failure
         } finally {
-            if (originalJpeg.exists() && !originalJpeg.delete()) {
-                committedAssets?.deleteFiles()
-                val cleanupFailure = IOException("Unable to delete temporary camera original")
-                if (processingFailure != null) {
-                    processingFailure.addSuppressed(cleanupFailure)
-                } else {
-                    throw cleanupFailure
+            setOf(fullFrameJpeg, detailFrameJpeg).forEach { original ->
+                if (original.exists() && !original.delete()) {
+                    committedAssets?.deleteFiles()
+                    val cleanupFailure = IOException("Unable to delete temporary camera original")
+                    if (processingFailure != null) {
+                        processingFailure.addSuppressed(cleanupFailure)
+                    } else {
+                        throw cleanupFailure
+                    }
                 }
             }
         }
     }
 
     private fun createAssets(
-        originalJpeg: File,
+        fullFrameJpeg: File,
+        detailFrameJpeg: File,
         outputDir: File,
         assetId: String,
         capturedAtEpochMs: Long,
         bookRegion: BookRegion,
         detailCaptureMode: DetailCaptureMode,
+        includeCalibration: Boolean,
     ): CaptureAssets {
-        require(originalJpeg.isFile) { "temporary camera original is missing" }
+        require(fullFrameJpeg.isFile) { "temporary 1x camera original is missing" }
+        require(detailFrameJpeg.isFile) { "temporary 2x camera original is missing" }
         require(assetId.matches(Regex("[A-Za-z0-9._-]{1,96}"))) {
             "assetId may contain only letters, numbers, dot, underscore, and dash"
         }
@@ -78,31 +106,50 @@ internal object CaptureAssetProcessor {
         require(outputDir.isDirectory) { "outputDir must be a directory" }
 
         val thumbnailFile = File(outputDir, "${assetId}_thumbnail.jpg")
+        val calibrationFile = if (includeCalibration) File(outputDir, "${assetId}_calibration.jpg") else null
         val bookRoiFile = File(outputDir, "${assetId}_book.jpg")
-        if (thumbnailFile.exists() || bookRoiFile.exists()) {
+        if (thumbnailFile.exists() || calibrationFile?.exists() == true || bookRoiFile.exists()) {
             throw IOException("Capture assets already exist for assetId=$assetId")
         }
 
         val thumbnailStaging = File.createTempFile("${assetId}_thumbnail_", ".part", outputDir)
+        val calibrationStaging = if (includeCalibration) {
+            File.createTempFile("${assetId}_calibration_", ".part", outputDir)
+        } else {
+            null
+        }
         val bookStaging = File.createTempFile("${assetId}_book_", ".part", outputDir)
         var thumbnailCommitted = false
+        var calibrationCommitted = false
         var bookCommitted = false
         try {
-            val orientation = readExifOrientation(originalJpeg)
+            val fullOrientation = readExifOrientation(fullFrameJpeg)
+            val detailOrientation = readExifOrientation(detailFrameJpeg)
             val bookMaxLongEdge = if (detailCaptureMode == DetailCaptureMode.ULTRA_50_MP) {
                 ULTRA_BOOK_MAX_LONG_EDGE
             } else {
                 STANDARD_BOOK_MAX_LONG_EDGE
             }
             writeBookRoi(
-                originalJpeg, orientation, bookRegion.normalized(), bookStaging, bookMaxLongEdge,
+                detailFrameJpeg, detailOrientation, bookRegion.normalized(), bookStaging, bookMaxLongEdge,
             )
-            writeThumbnail(originalJpeg, orientation, bookRegion.normalized(), thumbnailStaging)
+            writeThumbnail(
+                fullFrameJpeg,
+                fullOrientation,
+                thumbnailStaging,
+            )
+            if (calibrationStaging != null) {
+                writeCalibration(detailFrameJpeg, detailOrientation, calibrationStaging)
+            }
 
             if (!bookStaging.renameTo(bookRoiFile)) {
                 throw IOException("Unable to commit book ROI")
             }
             bookCommitted = true
+            if (calibrationStaging != null && calibrationFile != null && !calibrationStaging.renameTo(calibrationFile)) {
+                throw IOException("Unable to commit book calibration")
+            }
+            calibrationCommitted = calibrationFile != null
             if (!thumbnailStaging.renameTo(thumbnailFile)) {
                 throw IOException("Unable to commit thumbnail")
             }
@@ -112,15 +159,33 @@ internal object CaptureAssetProcessor {
                 assetId = assetId,
                 capturedAtEpochMs = capturedAtEpochMs,
                 thumbnailFile = thumbnailFile,
+                bookCalibrationFile = calibrationFile,
                 bookRoiFile = bookRoiFile,
             )
         } catch (failure: Throwable) {
             if (thumbnailCommitted) thumbnailFile.delete()
+            if (calibrationCommitted) calibrationFile?.delete()
             if (bookCommitted) bookRoiFile.delete()
             throw failure
         } finally {
             thumbnailStaging.delete()
+            calibrationStaging?.delete()
             bookStaging.delete()
+        }
+    }
+
+    private fun writeCalibration(originalJpeg: File, orientation: Int, destination: File) {
+        val bounds = decodeBounds(originalJpeg)
+        val sampleSize = sampleSizeFor(bounds.first, bounds.second, CALIBRATION_MAX_LONG_EDGE)
+        val sampled = BitmapFactory.decodeFile(
+            originalJpeg.absolutePath,
+            BitmapFactory.Options().apply { inSampleSize = sampleSize },
+        ) ?: throw IOException("Unable to decode 2x calibration source")
+        val upright = orientAndLimit(sampled, orientation, CALIBRATION_MAX_LONG_EDGE)
+        try {
+            writeJpeg(upright, destination, CALIBRATION_JPEG_QUALITY)
+        } finally {
+            upright.recycle()
         }
     }
 
@@ -161,7 +226,6 @@ internal object CaptureAssetProcessor {
     private fun writeThumbnail(
         originalJpeg: File,
         orientation: Int,
-        bookRegion: NormalizedRegion,
         destination: File,
     ) {
         val bounds = decodeBounds(originalJpeg)
@@ -171,38 +235,13 @@ internal object CaptureAssetProcessor {
             BitmapFactory.Options().apply { inSampleSize = sampleSize },
         ) ?: throw IOException("Unable to decode thumbnail source")
         val upright = orientAndLimit(sampledRaw, orientation, THUMBNAIL_MAX_LONG_EDGE)
-        val composited = pixelateOutsideBook(upright, bookRegion)
         try {
-            writeJpeg(composited, destination, THUMBNAIL_JPEG_QUALITY)
+            // This private prototype uses the context image to check small face/eye motion.
+            // Keep the complete 1x frame clear instead of obscuring everything outside the book.
+            writeJpeg(upright, destination, THUMBNAIL_JPEG_QUALITY)
         } finally {
-            composited.recycle()
             upright.recycle()
         }
-    }
-
-    private fun pixelateOutsideBook(source: Bitmap, bookRegion: NormalizedRegion): Bitmap {
-        val tinyWidth = max(1, source.width / PIXEL_BLOCK_SIZE)
-        val tinyHeight = max(1, source.height / PIXEL_BLOCK_SIZE)
-        val tiny = Bitmap.createScaledBitmap(source, tinyWidth, tinyHeight, true)
-        val output = Bitmap.createBitmap(source.width, source.height, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(output)
-        val fullRect = Rect(0, 0, source.width, source.height)
-        canvas.drawBitmap(tiny, null, fullRect, Paint().apply { isFilterBitmap = false })
-
-        val bookSourceRect = Rect(
-            floor(bookRegion.left * source.width).toInt(),
-            floor(bookRegion.top * source.height).toInt(),
-            ceil(bookRegion.right * source.width).toInt(),
-            ceil(bookRegion.bottom * source.height).toInt(),
-        )
-        canvas.drawBitmap(
-            source,
-            bookSourceRect,
-            RectF(bookSourceRect),
-            Paint(Paint.ANTI_ALIAS_FLAG).apply { isFilterBitmap = true },
-        )
-        if (tiny !== source) tiny.recycle()
-        return output
     }
 
     private fun orientAndLimit(source: Bitmap, orientation: Int, maxLongEdge: Int): Bitmap {
@@ -326,6 +365,7 @@ internal object CaptureAssetProcessor {
 
     private fun CaptureAssets.deleteFiles() {
         thumbnailFile.delete()
+        bookCalibrationFile?.delete()
         bookRoiFile.delete()
     }
 }

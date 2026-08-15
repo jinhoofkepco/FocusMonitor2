@@ -40,6 +40,11 @@ class StudyWireCodecTest {
             ),
             StudyMessage.AssetRequest("m11", "snapshot-1-thumbnail", AssetKind.THUMBNAIL),
             StudyMessage.AssetRequest("m12", "snapshot-1-book", AssetKind.BOOK_ROI),
+            StudyMessage.AssetTransfer(
+                "m12a", "fresh-2x-calibration", AssetKind.BOOK_CALIBRATION, 44,
+                1_723_624_500_000,
+            ),
+            StudyMessage.AssetRequest("m12b", "fresh-2x-calibration", AssetKind.BOOK_CALIBRATION),
             StudyMessage.TextMessage("m13", PeerRole.STUDENT, "이 문제를 모르겠어요.", 1_723_624_510_000),
             StudyMessage.VoiceTransfer(
                 messageId = "m14",

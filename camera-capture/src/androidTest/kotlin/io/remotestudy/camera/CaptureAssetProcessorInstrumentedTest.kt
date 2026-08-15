@@ -40,26 +40,23 @@ class CaptureAssetProcessorInstrumentedTest {
 
         assertFalse("full-frame temporary source must be deleted", original.exists())
         assertTrue(assets.thumbnailFile.isFile)
+        assertTrue(checkNotNull(assets.bookCalibrationFile).isFile)
         assertTrue(assets.bookRoiFile.isFile)
 
         val thumbnail = checkNotNull(BitmapFactory.decodeFile(assets.thumbnailFile.absolutePath))
+        val calibration = checkNotNull(BitmapFactory.decodeFile(checkNotNull(assets.bookCalibrationFile).absolutePath))
         val book = checkNotNull(BitmapFactory.decodeFile(assets.bookRoiFile.absolutePath))
         try {
-            assertTrue(maxOf(thumbnail.width, thumbnail.height) <= 1_440)
+            assertTrue(maxOf(thumbnail.width, thumbnail.height) <= 2_400)
+            assertTrue(maxOf(calibration.width, calibration.height) <= 2_400)
             assertTrue(maxOf(book.width, book.height) <= 4_000)
             assertTrue(
                 "book ROI center should preserve the blue fixture",
                 colorDistance(Color.BLUE, book.getPixel(book.width / 2, book.height / 2)) < 24,
             )
-
-            val outsideA = thumbnail.getPixel(8, thumbnail.height / 2)
-            val outsideB = thumbnail.getPixel(12, thumbnail.height / 2)
-            assertTrue(
-                "nearby context pixels should be strongly pixelated",
-                colorDistance(outsideA, outsideB) < 18,
-            )
         } finally {
             thumbnail.recycle()
+            calibration.recycle()
             book.recycle()
         }
     }

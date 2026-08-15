@@ -133,6 +133,7 @@ class StudentActivity : ComponentActivity() {
     private var lastRenderedStatus: SessionStatus? = null
     private var latestProblemEventId: String? = null
     private var captureInFlight = false
+    private var pendingCalibrationAssetId: String? = null
     private var lastCaptureAtElapsedMs: Long? = null
     private val captureById = linkedMapOf<String, CaptureAssets>()
     private val thumbnailOfferedIds = mutableSetOf<String>()
@@ -157,6 +158,7 @@ class StudentActivity : ComponentActivity() {
     private var noMovementAlertEnabled = true
     private var requestedDetailMode = CameraDetailCaptureMode.STANDARD_12_MP
     private var pendingCameraProfileApply = false
+    private var cameraProfileApplying = false
 
     private val ticker = object : Runnable {
         override fun run() {
@@ -601,14 +603,20 @@ class StudentActivity : ComponentActivity() {
     }
 
     private fun applyRequestedCameraProfile(reportToTeacher: Boolean) {
-        if (!cameraReady) {
+        if (!cameraReady || captureInFlight) {
             pendingCameraProfileApply = pendingCameraProfileApply || reportToTeacher
-            eventLabel.text = "카메라 준비 뒤 책 상세 화질을 적용합니다"
+            eventLabel.text = if (captureInFlight) {
+                "현재 촬영 완료 뒤 책 상세 화질을 적용합니다"
+            } else {
+                "카메라 준비 뒤 책 상세 화질을 적용합니다"
+            }
             return
         }
         val shouldReport = reportToTeacher || pendingCameraProfileApply
         pendingCameraProfileApply = false
+        cameraProfileApplying = true
         cameraView.applyDetailCaptureMode(requestedDetailMode) { result ->
+            cameraProfileApplying = false
             result.onSuccess { profile ->
                 cameraView.armPresenceBaseline()
                 if (shouldReport) {
@@ -632,6 +640,11 @@ class StudentActivity : ComponentActivity() {
             }.onFailure {
                 pendingCameraProfileApply = shouldReport
                 eventLabel.text = "책 상세 화질 적용 실패: ${it.message.orEmpty()}"
+            }
+            if (result.isSuccess && pendingCameraProfileApply) {
+                applyRequestedCameraProfile(reportToTeacher = true)
+            } else if (result.isSuccess) {
+                startPendingCalibrationCaptureIfNeeded()
             }
         }
     }
@@ -1123,18 +1136,65 @@ class StudentActivity : ComponentActivity() {
             }.onFailure {
                 eventLabel.text = "학습 사진 생성 실패: ${it.message.orEmpty()}"
             }
+            if (pendingCameraProfileApply) {
+                applyRequestedCameraProfile(reportToTeacher = true)
+            } else {
+                startPendingCalibrationCaptureIfNeeded()
+            }
         }
     }
 
     private fun handleAssetRequest(request: StudyMessage.AssetRequest) {
-        if (request.kind != AssetKind.BOOK_ROI) return
-        val assets = captureById[request.assetId]
-        if (assets == null) {
-            eventLabel.text = "요청한 고화질 책 사진이 이 세션에 없습니다"
+        when (request.kind) {
+            AssetKind.THUMBNAIL -> Unit
+            AssetKind.BOOK_ROI -> {
+                val assets = captureById[request.assetId]
+                if (assets == null) {
+                    eventLabel.text = "요청한 고화질 책 사진이 이 세션에 없습니다"
+                    return
+                }
+                if (offerAsset(assets, AssetKind.BOOK_ROI)) {
+                    eventLabel.text = "2배 고화질 책 영역을 선생님께 전송 중입니다"
+                }
+            }
+            AssetKind.BOOK_CALIBRATION -> {
+                pendingCalibrationAssetId = request.assetId
+                startPendingCalibrationCaptureIfNeeded()
+            }
+        }
+    }
+
+    private fun startPendingCalibrationCaptureIfNeeded() {
+        val assetId = pendingCalibrationAssetId ?: return
+        if (captureInFlight || cameraProfileApplying) return
+        if (!cameraReady || !appInForeground) {
+            eventLabel.text = "2배 책 영역 설정 사진을 촬영할 수 없습니다 · 카메라 화면을 확인해 주세요"
             return
         }
-        if (offerAsset(assets, AssetKind.BOOK_ROI)) {
-            eventLabel.text = "고화질 책 영역을 선생님께 전송 중입니다"
+        pendingCalibrationAssetId = null
+        captureInFlight = true
+        eventLabel.text = "선생님 설정용 실제 2배 사진을 촬영 중입니다"
+        cameraView.captureAssets(
+            outputDir = File(filesDir, "study-assets"),
+            assetId = assetId,
+            capturedAtEpochMs = System.currentTimeMillis(),
+            includeCalibration = true,
+        ) { result ->
+            captureInFlight = false
+            result.onSuccess { assets ->
+                captureById[assets.assetId] = assets
+                pruneLocalAssets()
+                if (offerAsset(assets, AssetKind.BOOK_CALIBRATION)) {
+                    eventLabel.text = "실제 2배 책 영역 설정 사진을 선생님께 전송 중입니다"
+                }
+            }.onFailure {
+                eventLabel.text = "2배 책 영역 설정 사진 실패: ${it.message.orEmpty()}"
+            }
+            if (pendingCameraProfileApply) {
+                applyRequestedCameraProfile(reportToTeacher = true)
+            } else {
+                startPendingCalibrationCaptureIfNeeded()
+            }
         }
     }
 
@@ -1164,6 +1224,10 @@ class StudentActivity : ComponentActivity() {
         val file = when (transferKey.kind) {
             AssetKind.THUMBNAIL -> assets.thumbnailFile
             AssetKind.BOOK_ROI -> assets.bookRoiFile
+            AssetKind.BOOK_CALIBRATION -> assets.bookCalibrationFile ?: run {
+                pendingAssetTransfers.remove(transferKey)
+                return false
+            }
         }
         val payloadId = transport.sendFile(file)
         if (payloadId == null) {
@@ -1186,7 +1250,7 @@ class StudentActivity : ComponentActivity() {
 
     private fun retryPendingAssetTransfers() {
         pendingAssetTransfers
-            .filter { it.kind == AssetKind.BOOK_ROI }
+            .filter { it.kind != AssetKind.THUMBNAIL }
             .forEach(::trySendPendingAsset)
         val latestThumbnail = pendingAssetTransfers
             .filter { it.kind == AssetKind.THUMBNAIL }
@@ -1259,7 +1323,11 @@ class StudentActivity : ComponentActivity() {
                     }
                 }
                 if (key.transfer.kind != AssetKind.THUMBNAIL) {
-                    eventLabel.text = "고화질 책 영역을 선생님께 전송했습니다"
+                    eventLabel.text = if (key.transfer.kind == AssetKind.BOOK_CALIBRATION) {
+                        "실제 2배 책 영역 설정 사진을 선생님께 전송했습니다"
+                    } else {
+                        "2배 고화질 책 영역을 선생님께 전송했습니다"
+                    }
                 }
             }
 
@@ -1359,6 +1427,7 @@ class StudentActivity : ComponentActivity() {
             val oldest = captureById.remove(oldestId) ?: continue
             thumbnailOfferedIds.remove(oldestId)
             oldest.thumbnailFile.delete()
+            oldest.bookCalibrationFile?.delete()
             oldest.bookRoiFile.delete()
         }
     }

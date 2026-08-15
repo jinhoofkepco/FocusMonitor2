@@ -6,6 +6,7 @@ data class CaptureAssets(
     val assetId: String,
     val capturedAtEpochMs: Long,
     val thumbnailFile: File,
+    val bookCalibrationFile: File?,
     val bookRoiFile: File,
 )
 
@@ -46,6 +47,18 @@ data class BookRegion(
     }
 
     internal fun normalized() = NormalizedRegion(left, top, right, bottom)
+
+    /** Maps coordinates inside a centered zoom crop back to the complete 1x frame. */
+    internal fun inFullFrame(zoomRatio: Float): BookRegion {
+        val cropSize = 1f / zoomRatio.coerceAtLeast(1f)
+        val offset = (1f - cropSize) / 2f
+        return BookRegion(
+            left = offset + left * cropSize,
+            top = offset + top * cropSize,
+            right = offset + right * cropSize,
+            bottom = offset + bottom * cropSize,
+        )
+    }
 
     companion object {
         val DEFAULT = BookRegion(0.07f, 0.30f, 0.93f, 0.70f)

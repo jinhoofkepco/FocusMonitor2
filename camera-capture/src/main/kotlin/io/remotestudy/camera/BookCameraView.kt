@@ -14,10 +14,13 @@ import android.view.View
 import android.widget.FrameLayout
 import android.widget.TextView
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.Camera
+import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
+import androidx.camera.core.SurfaceOrientedMeteringPointFactory
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionFilter
 import androidx.camera.core.resolutionselector.ResolutionSelector
@@ -31,6 +34,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.TimeUnit
 
 /**
  * Preview, still capture, and low-rate luminance analysis for the fixed book setup.
@@ -71,6 +75,9 @@ class BookCameraView @JvmOverloads constructor(
 
     @Volatile
     private var cameraProvider: ProcessCameraProvider? = null
+
+    @Volatile
+    private var camera: Camera? = null
 
     @Volatile
     private var requestedDetailMode = DetailCaptureMode.STANDARD_12_MP
@@ -220,7 +227,7 @@ class BookCameraView @JvmOverloads constructor(
                     provider.unbindAll()
                     frameAnalyzer.reset()
                     analysis.setAnalyzer(cameraExecutor, frameAnalyzer)
-                    provider.bindToLifecycle(
+                    val boundCamera = provider.bindToLifecycle(
                         lifecycleOwner,
                         CameraSelector.DEFAULT_BACK_CAMERA,
                         candidatePreview,
@@ -229,6 +236,7 @@ class BookCameraView @JvmOverloads constructor(
                     )
                     check(!closed.get()) { "BookCameraView was closed while binding" }
                     cameraProvider = provider
+                    camera = boundCamera
                     imageCapture = capture
                     preview = candidatePreview
                     imageAnalysis = analysis
@@ -252,6 +260,7 @@ class BookCameraView @JvmOverloads constructor(
                     imageAnalysis = null
                     imageCapture = null
                     preview = null
+                    camera = null
                     completeBind(request, Result.failure(failure))
                 }
             },
@@ -278,6 +287,7 @@ class BookCameraView @JvmOverloads constructor(
         outputDir: File,
         assetId: String,
         capturedAtEpochMs: Long,
+        includeCalibration: Boolean = false,
         callback: (Result<CaptureAssets>) -> Unit,
     ) {
         runOnMain {
@@ -291,50 +301,184 @@ class BookCameraView @JvmOverloads constructor(
                 return@runOnMain
             }
             val capture = imageCapture
-            if (capture == null) {
+            val boundCamera = camera
+            if (capture == null || boundCamera == null) {
                 callback(Result.failure(IllegalStateException("Camera is not bound")))
                 return@runOnMain
             }
 
-            val original = runCatching {
-                File.createTempFile("remote-study-original-", ".jpg", context.cacheDir)
+            val fullOriginal = runCatching {
+                File.createTempFile("remote-study-full-", ".jpg", context.cacheDir)
             }.getOrElse { failure ->
                 callback(Result.failure(failure))
                 return@runOnMain
             }
-            val request = PendingCapture(original, callback)
+            val detailOriginal = runCatching {
+                File.createTempFile("remote-study-detail-", ".jpg", context.cacheDir)
+            }.getOrElse { failure ->
+                fullOriginal.delete()
+                callback(Result.failure(failure))
+                return@runOnMain
+            }
+            val request = PendingCapture(fullOriginal, detailOriginal, callback)
             pendingCaptures += request
+            captureAtOneXThenDetail(
+                capture = capture,
+                boundCamera = boundCamera,
+                request = request,
+                outputDir = outputDir,
+                assetId = assetId,
+                capturedAtEpochMs = capturedAtEpochMs,
+                includeCalibration = includeCalibration,
+            )
+        }
+    }
 
-            try {
-                capture.takePicture(
-                    ImageCapture.OutputFileOptions.Builder(original).build(),
-                    cameraExecutor,
-                    object : ImageCapture.OnImageSavedCallback {
-                        override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
-                            val result = runCatching {
-                                CaptureAssetProcessor.process(
-                                    originalJpeg = original,
-                                    outputDir = outputDir,
-                                    assetId = assetId,
-                                capturedAtEpochMs = capturedAtEpochMs,
-                                bookRegion = bookRegion,
-                                detailCaptureMode = appliedDetailMode,
-                            )
-                            }
-                            completeCapture(request, result)
+    private fun captureAtOneXThenDetail(
+        capture: ImageCapture,
+        boundCamera: Camera,
+        request: PendingCapture,
+        outputDir: File,
+        assetId: String,
+        capturedAtEpochMs: Long,
+        includeCalibration: Boolean,
+    ) {
+        setZoomRatio(boundCamera, 1f) { oneXResult ->
+            if (request.completed.get()) return@setZoomRatio
+            if (oneXResult.isFailure) {
+                failCapture(request, oneXResult.exceptionOrNull()!!)
+                return@setZoomRatio
+            }
+            captureToFile(capture, request.fullOriginalFile) { fullResult ->
+                if (request.completed.get()) return@captureToFile
+                if (fullResult.isFailure) {
+                    failCapture(request, fullResult.exceptionOrNull()!!)
+                    return@captureToFile
+                }
+                mainExecutor.execute {
+                    val maxZoom = boundCamera.cameraInfo.zoomState.value?.maxZoomRatio ?: 1f
+                    if (maxZoom + 0.01f < DETAIL_ZOOM_RATIO) {
+                        failCapture(request, IllegalStateException("이 카메라는 2배 줌 촬영을 지원하지 않습니다"))
+                        return@execute
+                    }
+                    frameAnalyzer.setSuspended(true)
+                    setZoomRatio(boundCamera, DETAIL_ZOOM_RATIO) { zoomResult ->
+                        if (request.completed.get()) return@setZoomRatio
+                        if (zoomResult.isFailure) {
+                            restoreOneXAndFail(boundCamera, request, zoomResult.exceptionOrNull()!!)
+                            return@setZoomRatio
                         }
-
-                        override fun onError(exception: ImageCaptureException) {
-                            original.delete()
-                            completeCapture(request, Result.failure(exception))
-                        }
-                    },
-                )
-            } catch (failure: Throwable) {
-                original.delete()
-                completeCapture(request, Result.failure(failure))
+                        settleFocusAndCaptureDetail(
+                            capture, boundCamera, request, outputDir, assetId, capturedAtEpochMs,
+                            includeCalibration,
+                        )
+                    }
+                }
             }
         }
+    }
+
+    private fun settleFocusAndCaptureDetail(
+        capture: ImageCapture,
+        boundCamera: Camera,
+        request: PendingCapture,
+        outputDir: File,
+        assetId: String,
+        capturedAtEpochMs: Long,
+        includeCalibration: Boolean,
+    ) {
+        val region = bookRegion
+        val content = cameraContentRect()
+        val factory = SurfaceOrientedMeteringPointFactory(
+            previewView.width.coerceAtLeast(1).toFloat(),
+            previewView.height.coerceAtLeast(1).toFloat(),
+        )
+        val point = factory.createPoint(
+            content.left + ((region.left + region.right) * 0.5f) * content.width(),
+            content.top + ((region.top + region.bottom) * 0.5f) * content.height(),
+        )
+        val action = FocusMeteringAction.Builder(point)
+            .setAutoCancelDuration(3, TimeUnit.SECONDS)
+            .build()
+        runCatching { boundCamera.cameraControl.startFocusAndMetering(action) }
+        previewView.postDelayed({
+            if (closed.get() || request.completed.get()) return@postDelayed
+            captureToFile(capture, request.detailOriginalFile) { detailResult ->
+                if (request.completed.get()) return@captureToFile
+                setZoomRatio(boundCamera, 1f) { restoreResult ->
+                    if (request.completed.get()) return@setZoomRatio
+                    frameAnalyzer.setSuspended(false)
+                    if (detailResult.isFailure) {
+                        failCapture(request, detailResult.exceptionOrNull()!!)
+                    } else if (restoreResult.isFailure) {
+                        failCapture(request, restoreResult.exceptionOrNull()!!)
+                    } else {
+                        runCatching {
+                            cameraExecutor.execute {
+                                val result = runCatching {
+                                    CaptureAssetProcessor.processDual(
+                                        fullFrameJpeg = request.fullOriginalFile,
+                                        detailFrameJpeg = request.detailOriginalFile,
+                                        outputDir = outputDir,
+                                        assetId = assetId,
+                                        capturedAtEpochMs = capturedAtEpochMs,
+                                        bookRegion = bookRegion,
+                                        detailCaptureMode = appliedDetailMode,
+                                        includeCalibration = includeCalibration,
+                                    )
+                                }
+                                completeCapture(request, result)
+                            }
+                        }.onFailure { failCapture(request, it) }
+                    }
+                }
+            }
+        }, DETAIL_SETTLE_MS)
+    }
+
+    private fun captureToFile(
+        capture: ImageCapture,
+        file: File,
+        callback: (Result<Unit>) -> Unit,
+    ) {
+        try {
+            capture.takePicture(
+                ImageCapture.OutputFileOptions.Builder(file).build(),
+                cameraExecutor,
+                object : ImageCapture.OnImageSavedCallback {
+                    override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+                        callback(Result.success(Unit))
+                    }
+
+                    override fun onError(exception: ImageCaptureException) {
+                        callback(Result.failure(exception))
+                    }
+                },
+            )
+        } catch (failure: Throwable) {
+            callback(Result.failure(failure))
+        }
+    }
+
+    private fun setZoomRatio(camera: Camera, ratio: Float, callback: (Result<Unit>) -> Unit) {
+        val future = camera.cameraControl.setZoomRatio(ratio)
+        future.addListener(
+            { callback(runCatching { future.get(); Unit }) },
+            mainExecutor,
+        )
+    }
+
+    private fun restoreOneXAndFail(camera: Camera, request: PendingCapture, failure: Throwable) {
+        setZoomRatio(camera, 1f) {
+            frameAnalyzer.setSuspended(false)
+            failCapture(request, failure)
+        }
+    }
+
+    private fun failCapture(request: PendingCapture, failure: Throwable) {
+        request.fullOriginalFile.delete()
+        request.detailOriginalFile.delete()
+        completeCapture(request, Result.failure(failure))
     }
 
     fun setCalibrated(calibrated: Boolean) {
@@ -363,8 +507,9 @@ class BookCameraView @JvmOverloads constructor(
     fun setBookRegion(region: BookRegion) {
         runOnMain {
             bookRegion = region
-            frameAnalyzer.setBookRegion(region)
-            guideView.setBookRegion(region)
+            val fullFrameRegion = region.inFullFrame(DETAIL_ZOOM_RATIO)
+            frameAnalyzer.setBookRegion(fullFrameRegion)
+            guideView.setBookRegion(fullFrameRegion)
         }
     }
 
@@ -477,7 +622,8 @@ class BookCameraView @JvmOverloads constructor(
         }
         val captureFailure = IllegalStateException("BookCameraView was closed during capture")
         pendingCaptures.toList().forEach { request ->
-            request.originalFile.delete()
+            request.fullOriginalFile.delete()
+            request.detailOriginalFile.delete()
             completeCapture(request, Result.failure(captureFailure))
         }
 
@@ -488,6 +634,7 @@ class BookCameraView @JvmOverloads constructor(
             imageCapture = null
             preview = null
             cameraProvider = null
+            camera = null
         }
         cameraExecutor.shutdownNow()
     }
@@ -511,6 +658,7 @@ class BookCameraView @JvmOverloads constructor(
         if (!request.completed.compareAndSet(false, true)) {
             result.getOrNull()?.let { assets ->
                 assets.thumbnailFile.delete()
+                assets.bookCalibrationFile?.delete()
                 assets.bookRoiFile.delete()
             }
             return
@@ -535,6 +683,23 @@ class BookCameraView @JvmOverloads constructor(
 
     private fun runOnMain(block: () -> Unit) {
         if (Looper.myLooper() == Looper.getMainLooper()) block() else mainExecutor.execute(block)
+    }
+
+    private fun cameraContentRect(): RectF {
+        val width = previewView.width.coerceAtLeast(1)
+        val height = previewView.height.coerceAtLeast(1)
+        val landscape = width > height
+        val contentAspect = if (landscape) 4f / 3f else 3f / 4f
+        val viewAspect = width.toFloat() / height
+        return if (viewAspect > contentAspect) {
+            val contentWidth = height * contentAspect
+            val left = (width - contentWidth) / 2f
+            RectF(left, 0f, left + contentWidth, height.toFloat())
+        } else {
+            val contentHeight = width / contentAspect
+            val top = (height - contentHeight) / 2f
+            RectF(0f, top, width.toFloat(), top + contentHeight)
+        }
     }
 
     private fun detailResolutionSelector(mode: DetailCaptureMode): ResolutionSelector {
@@ -574,10 +739,16 @@ class BookCameraView @JvmOverloads constructor(
     }
 
     private class PendingCapture(
-        val originalFile: File,
+        val fullOriginalFile: File,
+        val detailOriginalFile: File,
         val callback: (Result<CaptureAssets>) -> Unit,
     ) {
         val completed = AtomicBoolean(false)
+    }
+
+    companion object {
+        internal const val DETAIL_ZOOM_RATIO = 2f
+        private const val DETAIL_SETTLE_MS = 650L
     }
 }
 

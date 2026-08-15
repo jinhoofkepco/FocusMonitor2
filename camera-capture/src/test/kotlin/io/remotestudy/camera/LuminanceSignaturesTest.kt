@@ -133,4 +133,14 @@ class LuminanceSignaturesTest {
 
         assertEquals(0f, signature.average().toFloat(), 0.0001f)
     }
+
+    @Test
+    fun `two x book coordinates map into centered half of one x frame`() {
+        val full = BookRegion(0.1f, 0.2f, 0.9f, 0.8f).inFullFrame(2f)
+
+        assertEquals(0.30f, full.left, 0.0001f)
+        assertEquals(0.35f, full.top, 0.0001f)
+        assertEquals(0.70f, full.right, 0.0001f)
+        assertEquals(0.65f, full.bottom, 0.0001f)
+    }
 }

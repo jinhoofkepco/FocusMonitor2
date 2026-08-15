@@ -4,15 +4,15 @@
 
 ## 현재 실행 화면
 
-1. 학생 앱은 별도 배치 조작 없이 카메라 준비 즉시 시작할 수 있습니다. 선생님 앱에서 최신 사진 위의 노란 `책 영역`을 이동하거나 네 모서리를 끌어 크기를 정하면 학생 카메라에 적용됩니다.
+1. 학생 앱은 별도 배치 조작 없이 카메라 준비 즉시 시작할 수 있습니다. 선생님 앱에서 `책 영역 설정`을 누르면 학생폰이 새 실제 2배 사진을 촬영해 보내며, 선생님은 그 2배 사진 위의 노란 영역을 이동하거나 네 모서리를 끌어 크기를 정합니다.
 2. 학생폰과 선생님폰이 서로 발견되면 이 개인용 프로토타입은 Nearby 연결 요청을 양쪽에서 자동 승인합니다.
 3. 양쪽 앱의 조작 메뉴는 화면 맨 아래 한 줄이며, 접으면 오른쪽 아래 `⋮` 버튼 하나만 남습니다. 선생님은 설정에서 시간·촬영 간격·판정 감도·알림 사용/무음·재알림 제한을 변경할 수 있습니다. 알림·촬영 설정은 진행 중에도 즉시 적용되고 일정 시간은 다음 시작부터 적용됩니다.
 4. 학생이 직접 시작하거나 선생님이 시작을 요청합니다. 선생님 시작은 저장된 설정을 학생폰에 먼저 전달하고 항상 첫 명상 사이클부터 시작합니다.
 5. 학생폰의 monotonic clock으로 기본 `명상 5분 → 공부 40분 → 휴식 15분`을 진행하고 상태를 선생님폰에 동기화합니다.
 6. 공부 단계에서 기준 화면 차이와 자리 구역/책 영역의 프레임 간 미세 움직임을 함께 사용합니다. 복귀는 3개 연속 프레임으로 확인하고 동일 경고는 기본 5분 동안 재발송하지 않습니다. 연결 장애는 자리 비움으로 해석하지 않습니다.
-7. 명상·공부 중 10초마다 전체 `4:3` 카메라 프레임을 보존한 `1440px/JPEG 82` 썸네일과 책 상세 ROI를 분리합니다. 긴 화면을 채우기 위한 화면 비율 crop은 사용하지 않습니다. 책 영역 설정 시 선생님폰의 잘리지 않은 전체 사진 위에서 지정하고 `12MP 일반` 또는 `50MP 초고화질`을 선택하며, 학생폰이 실제 적용한 해상도를 선생님폰에 회신합니다. 50MP 출력이 CameraX에 공개되지 않거나 동시 use-case bind가 실패하면 12MP로 복구하고 대체 적용 사실을 표시합니다. 썸네일만 자동 전송하며 상세 ROI는 눌렀을 때 전송합니다.
+7. 명상·공부 중 촬영은 `1배 전체 썸네일`과 `실제 2배 책 상세`로 이원화됩니다. 1배 썸네일은 전체 `4:3` 프레임을 회전·픽셀화하지 않고 `2400px/JPEG 92`로 만들어 얼굴과 눈의 작은 움직임을 확인할 수 있게 합니다. 같은 회차에 CameraX 줌을 실제 `2.0`으로 전환하고 책 중심 초점·노출 안정화 뒤 별도의 상세 원본을 촬영한 다음 즉시 1배로 복귀합니다. 줌 전환 중에는 움직임 분석을 중지합니다. 책 영역 설정도 기존 썸네일이 아니라 학생폰이 즉시 새로 찍어 보낸 실제 2배 사진 위에서 하며, 먼저 고른 `12MP 일반` 또는 `50MP 초고화질` 모드를 적용한 뒤 촬영합니다. 학생폰은 실제 적용 해상도를 회신하고, 50MP가 CameraX에 공개되지 않거나 bind가 실패하면 12MP로 복구합니다. 썸네일만 자동 전송하며 2배 상세 ROI는 사진을 눌렀을 때 전송합니다.
    파일은 Nearby의 실제 전송 완료 뒤에만 전송됨으로 표시합니다. 실패하면 연결 중 2초 간격으로 최초 시도 뒤 최대 3회 재시도하고, 재연결하면 남은 ROI·음성 및 최신 썸네일을 다시 보냅니다.
-8. 선생님 가운데 사진은 비율을 유지한 `FIT_CENTER`로 전체가 보이며, 사진 바깥 여백은 책 영역 좌표에서 제외됩니다. 사진은 디스플레이 픽셀을 180도 변환해 보여 주고, 전체화면 상세 ROI는 화면 좌표 기반 행렬로 최대 5배 확대·경계 내 이동하므로 손가락 이동량과 사진 이동량이 일치합니다. 최근 썸네일은 최대 12개입니다.
+8. 선생님 가운데 1배 썸네일은 회전 없이 비율을 유지한 `FIT_CENTER`로 전체가 보입니다. 2배 책 상세와 2배 영역 설정 사진만 180도 변환해 표시하며, 영역 좌표를 저장할 때 카메라 좌표로 되돌립니다. 전체화면 상세 ROI는 화면 좌표 기반 행렬로 최대 5배 확대·경계 내 이동하므로 손가락 이동량과 사진 이동량이 일치합니다. 최근 썸네일은 최대 12개이며 메모리에는 480px 미리보기로 축소 보관합니다.
 9. 두 앱 모두 세로·가로 화면을 지원하며 회전 중 학생 세션과 책 영역을 유지합니다.
 10. Android 13 이상 학생폰은 하나의 `AudioRecord` 입력을 segmented `SpeechRecognizer`에 계속 공급해 시스템 마이크 재시작음을 반복하지 않습니다. 한국어 정확도를 위해 시스템 음성서비스를 우선하고 오프라인 인식을 강제하지 않으며, 후보 문장과 힌트 어휘를 넓혔습니다. 정확한 partial result를 즉시 처리하고 짧은 endpoint 힌트를 사용하며, S23 시험에서 `풀었어`가 `벌써/벌써요`로 인식되는 경우도 문제 완료로 제한 허용합니다. `아빠 풀었어/아빠 벌써`도 메시지 모드로 들어가지 않고 즉시 문제 완료로 처리합니다. 세션 장애는 0.6/1.2/2.4초로 최대 3회만 자동 복구한 뒤 오류를 표시합니다. `아빠`만 단독으로 말하면 확인음 뒤 다음 발화를 메시지로 보내고, `아빠 녹음`은 이어지는 음성을 녹음해 자동 전송합니다.
 11. 학생은 최대 60초 음성 메시지를 보내고 선생님은 이를 재생할 수 있습니다. 선생님은 텍스트 또는 최대 60초 음성으로 답하며, 학생폰은 수신 즉시 확인음을 내고 텍스트 답변을 한국어 TTS로 읽거나 음성 답변을 자동 재생합니다. 학생의 텍스트·음성·`풀었어`는 모두 선생님 대화 기록에 들어가며, 열린 대화창도 즉시 갱신되고 새 메시지는 Android 알림으로 표시됩니다. 실시간 통화는 아닙니다.
@@ -27,7 +27,7 @@
 | `activity-detection` | `setActive`, 기준 차이·자리 미세 움직임·책 움직임 | `AWAY`, `NO_BOOK_MOVEMENT` 및 두 복구 이벤트 | 3프레임 복귀 확인, hysteresis, 재알림 cooldown, stale time 무시 |
 | `transport-api` | bytes/file, approve/reject | connection/message/file event | 개인용 앱에서 발견된 상대 요청 자동 승인 |
 | `transport-nearby` | transport port 호출 | Nearby P2P point-to-point, payload별 file success/failure | UI와 Google Play services 타입 격리, 파일 완료 이벤트 exactly-once 방출 |
-| `camera-capture` | lifecycle, capture 요청, baseline arm | `FrameObservation`, thumbnail file, book ROI file | Preview/ImageCapture/ImageAnalysis 동시 사용, 분석 1fps 이하, 임시 원본과 종료 중 자산 cleanup |
+| `camera-capture` | lifecycle, capture 요청, baseline arm | `FrameObservation`, 1배 thumbnail, 2배 calibration, 2배 book ROI | Preview/ImageCapture/ImageAnalysis 동시 사용, 분석 1fps 이하, 실제 1x→2x→1x 전환, 임시 원본과 종료 중 자산 cleanup |
 | `voice-command` | start/stop, AudioRecord PCM | segmented SpeechRecognizer의 제한된 한국어 command | Android 13+, 고정 버퍼, 자동 재시작 없음, 미지원 시 명시적 오류 |
 | `voice-message` | main-thread record/stop/cancel/play, output file | AAC `.m4a` `RecordedVoiceMessage`, playback callback | 최대 60초, `.part` 성공 후 commit, 취소·실패 파일 cleanup, recorder·player 각각 활성 작업 1개 |
 | `app-voice-lab` | 세 가지 Android 음성인식 방식, 실제 발화 | 인식 문장·명령 수·세션 수·오류 코드·복사 가능한 로그 | 학생 앱과 별도 설치되며 학생 앱 음성 동작을 변경하지 않음 |
@@ -36,7 +36,7 @@
 
 상세 계약은 [`docs/remote-study-mvp-system-design-v0.1.md`](docs/remote-study-mvp-system-design-v0.1.md), 장기 wire schema는 [`docs/remote-study-protocol-v1.proto`](docs/remote-study-protocol-v1.proto)에 있습니다. 현재 빌드는 코드 생성 도구를 강제하지 않도록 같은 개념의 수동 검증 codec을 사용합니다.
 
-다음 카메라 단계의 `1x 전체 썸네일 + 실제 2x 보정 화면에서 책 영역 설정 + 2x 상세 촬영` 좌표 계약은 [`docs/book-detail-2x-contract.md`](docs/book-detail-2x-contract.md)에 고정했습니다.
+`1x 전체 썸네일 + 실제 2x 보정 화면에서 책 영역 설정 + 2x 상세 촬영` 좌표 계약은 [`docs/book-detail-2x-contract.md`](docs/book-detail-2x-contract.md)에 고정했습니다.
 
 ## 빌드와 테스트
 
@@ -71,7 +71,7 @@ Android 기기 또는 emulator가 연결된 경우 Camera asset processor의 ins
 
 ### 현재 검증 결과 (2026-08-15)
 
-- JVM/Android unit test 67개: 실패 0, 오류 0, skip 0
+- JVM/Android unit test 68개: 실패 0, 오류 0, skip 0
 - API 35 emulator camera instrumented test 1개: 통과
 - 학생/선생님/Nearby/camera/두 음성 모듈 Android lint: 오류 0
 - API 35 emulator에 두 debug APK 설치 및 cold launch 성공; 접이식 메뉴·설정 화면·세로/가로 회전·학생 카메라 화면 확인

@@ -116,6 +116,7 @@ class TeacherActivity : ComponentActivity() {
     private val outgoingVoiceRetryCountByUserMessageId = mutableMapOf<String, Int>()
     private val outgoingVoiceRetryRunnableByUserMessageId = mutableMapOf<String, Runnable>()
     private val recentThumbnails = ArrayDeque<RecentThumbnail>()
+    private var latestThumbnailBitmap: Bitmap? = null
     private val conversationHistory = ArrayDeque<ConversationEntry>()
     private var conversationDialog: AlertDialog? = null
     private var conversationList: LinearLayout? = null
@@ -123,6 +124,8 @@ class TeacherActivity : ComponentActivity() {
     private val pendingRoiAssetIds = mutableSetOf<String>()
     private var roiDialog: AlertDialog? = null
     private var fullScreenPhotoDialog: Dialog? = null
+    private var bookCalibrationDialog: Dialog? = null
+    private var pendingCalibrationAssetId: String? = null
     private var studySettings = TeacherStudySettings()
     private var detailCaptureMode = DetailCaptureMode.STANDARD_12_MP
 
@@ -178,8 +181,18 @@ class TeacherActivity : ComponentActivity() {
         handler.removeCallbacksAndMessages(null)
         roiDialog?.dismiss()
         roiDialog = null
+        bookCalibrationDialog?.dismiss()
+        bookCalibrationDialog = null
         fullScreenPhotoDialog?.dismiss()
         fullScreenPhotoDialog = null
+        latestThumbnail.setImageDrawable(null)
+        latestThumbnailBitmap?.takeUnless(Bitmap::isRecycled)?.recycle()
+        latestThumbnailBitmap = null
+        recentThumbnails.forEach { entry ->
+            entry.imageView.setImageDrawable(null)
+            if (!entry.bitmap.isRecycled) entry.bitmap.recycle()
+        }
+        recentThumbnails.clear()
         voiceRecorder.close()
         voicePlayer.close()
         transport.setListener(null)
@@ -373,7 +386,7 @@ class TeacherActivity : ComponentActivity() {
                         BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.RGB_565 },
                     ),
                 )
-                target to rotateBitmap180(decoded)
+                target to if (metadata.kind == AssetKind.THUMBNAIL) decoded else rotateBitmap180(decoded)
             }
             runOnUiThread {
                 if (activityDestroyed || isDestroyed) {
@@ -393,18 +406,33 @@ class TeacherActivity : ComponentActivity() {
     ) {
         when (metadata.kind) {
             AssetKind.THUMBNAIL -> {
+                val previousMainBitmap = latestThumbnailBitmap
                 latestThumbnail.setImageBitmap(bitmap)
+                latestThumbnailBitmap = bitmap
                 bookRegionOverlay.setImageSize(bitmap.width, bitmap.height)
                 latestThumbnail.contentDescription =
                     "가장 최근 학습 썸네일, 촬영 ${formatCapturedAt(metadata.capturedAtEpochMs)}, 고화질 요청"
                 latestThumbnail.setOnClickListener { requestBookRoi(metadata.assetId) }
                 addRecentThumbnail(metadata, bitmap)
+                if (previousMainBitmap != null && previousMainBitmap !== bitmap && !previousMainBitmap.isRecycled) {
+                    previousMainBitmap.recycle()
+                }
             }
 
             AssetKind.BOOK_ROI -> {
                 pendingRoiAssetIds.remove(metadata.assetId)
                 thumbnailLabel.text = "고화질 책 영역 수신 완료"
                 showFullScreenPhoto(bitmap, "${file.name} 책 영역")
+            }
+
+            AssetKind.BOOK_CALIBRATION -> {
+                if (pendingCalibrationAssetId != metadata.assetId) {
+                    bitmap.recycle()
+                    return
+                }
+                pendingCalibrationAssetId = null
+                thumbnailLabel.text = "실제 2배 사진에서 책 영역을 지정해 주세요"
+                showBookCalibrationEditor(bitmap)
             }
         }
     }
@@ -438,8 +466,20 @@ class TeacherActivity : ComponentActivity() {
     }
 
     private fun addRecentThumbnail(metadata: StudyMessage.AssetTransfer, bitmap: Bitmap) {
+        val longest = maxOf(bitmap.width, bitmap.height)
+        val scale = (RECENT_THUMBNAIL_LONG_EDGE.toFloat() / longest).coerceAtMost(1f)
+        val recentBitmap = if (scale < 1f) {
+            Bitmap.createScaledBitmap(
+                bitmap,
+                (bitmap.width * scale).toInt().coerceAtLeast(1),
+                (bitmap.height * scale).toInt().coerceAtLeast(1),
+                true,
+            )
+        } else {
+            bitmap.copy(bitmap.config ?: Bitmap.Config.RGB_565, false)
+        }
         val image = ImageView(this).apply {
-            setImageBitmap(bitmap)
+            setImageBitmap(recentBitmap)
             setBackgroundColor(0xFFE7EAF1.toInt())
             scaleType = ImageView.ScaleType.FIT_CENTER
             isFocusable = true
@@ -448,7 +488,7 @@ class TeacherActivity : ComponentActivity() {
             assetId = metadata.assetId,
             capturedAtEpochMs = metadata.capturedAtEpochMs,
             imageView = image,
-            bitmap = bitmap,
+            bitmap = recentBitmap,
         )
         image.setOnClickListener { requestBookRoi(entry.assetId) }
         recentThumbnails.addFirst(entry)
@@ -976,21 +1016,7 @@ class TeacherActivity : ComponentActivity() {
     }
 
     private fun toggleBookRegionEditing() {
-        if (!bookRegionOverlay.editingEnabled) {
-            showBookRegionAndQualityDialog()
-            return
-        }
-        bookRegionOverlay.editingEnabled = false
-        bookRegionButton.text = "책 영역 설정"
-        val displayRegion = bookRegionOverlay.region
-        // Teacher photos are displayed upside-down; map the selection back to camera coordinates.
-        val queued = sendCurrentBookProfile()
-        thumbnailLabel.text = if (queued) {
-            "책 영역과 ${detailModeLabel(detailCaptureMode)} 적용 요청 중"
-        } else {
-            "연결 후 책 영역을 다시 저장해 주세요"
-        }
-        saveBookProfile(displayRegion)
+        showBookRegionAndQualityDialog()
     }
 
     private fun sendCurrentBookProfile(): Boolean {
@@ -1011,8 +1037,8 @@ class TeacherActivity : ComponentActivity() {
     }
 
     private fun showBookRegionAndQualityDialog() {
-        if (latestThumbnail.drawable == null || !bookRegionOverlay.hasImageSize) {
-            eventLabel.text = "전체 사진을 받은 뒤 책 영역을 설정해 주세요"
+        if (!transportConnected) {
+            eventLabel.text = "학생폰 연결 후 책 영역을 설정해 주세요"
             return
         }
         var selected = detailCaptureMode.ordinal
@@ -1025,12 +1051,95 @@ class TeacherActivity : ComponentActivity() {
             .setNegativeButton("취소", null)
             .setPositiveButton("영역 지정") { _, _ ->
                 detailCaptureMode = DetailCaptureMode.entries[selected]
-                bookRegionOverlay.editingEnabled = true
-                bookRegionButton.text = "책 영역 저장"
-                thumbnailLabel.visibility = View.VISIBLE
-                thumbnailLabel.text = "전체 사진 위에서 사각형 안쪽은 이동, 모서리는 크기 조절"
+                requestFreshBookCalibration()
             }
             .show()
+    }
+
+    private fun requestFreshBookCalibration() {
+        if (!sendCurrentBookProfile()) {
+            thumbnailLabel.visibility = View.VISIBLE
+            thumbnailLabel.text = "상세 화질 적용 요청을 보내지 못했습니다"
+            return
+        }
+        val assetId = "calibration-${UUID.randomUUID()}"
+        val queued = reliableChannel.send(
+            StudyMessage.AssetRequest(
+                messageId = UUID.randomUUID().toString(),
+                assetId = assetId,
+                kind = AssetKind.BOOK_CALIBRATION,
+            ),
+            SystemClock.elapsedRealtime(),
+        )
+        if (queued) {
+            pendingCalibrationAssetId = assetId
+            thumbnailLabel.visibility = View.VISIBLE
+            thumbnailLabel.text = "학생폰에서 실제 2배 설정 사진 촬영 중…"
+            handler.postDelayed({
+                if (pendingCalibrationAssetId == assetId) {
+                    pendingCalibrationAssetId = null
+                    thumbnailLabel.text = "2배 설정 사진 응답이 없습니다 · 다시 시도해 주세요"
+                }
+            }, CALIBRATION_REQUEST_TIMEOUT_MS)
+        } else {
+            thumbnailLabel.visibility = View.VISIBLE
+            thumbnailLabel.text = "설정 사진 요청 대기열이 가득 찼습니다"
+        }
+    }
+
+    private fun showBookCalibrationEditor(bitmap: Bitmap) {
+        bookCalibrationDialog?.dismiss()
+        val dialog = Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
+        val frame = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        val image = ImageView(this).apply {
+            setImageBitmap(bitmap)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            contentDescription = "실제 2배 책 영역 설정 사진"
+        }
+        val overlay = TeacherBookRegionOverlay(this).apply {
+            setImageSize(bitmap.width, bitmap.height)
+            setRegion(bookRegionOverlay.region)
+            editingEnabled = true
+        }
+        frame.addView(image, FrameLayout.LayoutParams(-1, -1))
+        frame.addView(overlay, FrameLayout.LayoutParams(-1, -1))
+        val close = Button(this).apply {
+            text = "×"
+            textSize = 28f
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.TRANSPARENT)
+            contentDescription = "책 영역 설정 닫기"
+            setOnClickListener { dialog.dismiss() }
+        }
+        frame.addView(close, FrameLayout.LayoutParams(dp(56), dp(56), Gravity.TOP or Gravity.END))
+        val save = actionButton("이 영역 저장 · ${detailModeLabel(detailCaptureMode)}", COLOR_SUCCESS).apply {
+            setOnClickListener {
+                val selectedRegion = overlay.region
+                bookRegionOverlay.setRegion(selectedRegion)
+                val queued = sendCurrentBookProfile()
+                saveBookProfile(selectedRegion)
+                thumbnailLabel.text = if (queued) {
+                    "실제 2배 기준 책 영역과 ${detailModeLabel(detailCaptureMode)} 적용 요청 중"
+                } else {
+                    "연결 후 책 영역을 다시 저장해 주세요"
+                }
+                dialog.dismiss()
+            }
+        }
+        frame.addView(
+            save,
+            FrameLayout.LayoutParams(-1, dp(52), Gravity.BOTTOM).apply {
+                marginStart = dp(16); marginEnd = dp(16); bottomMargin = dp(16)
+            },
+        )
+        dialog.setContentView(frame)
+        dialog.setOnDismissListener {
+            image.setImageDrawable(null)
+            if (!bitmap.isRecycled) bitmap.recycle()
+            if (bookCalibrationDialog === dialog) bookCalibrationDialog = null
+        }
+        bookCalibrationDialog = dialog
+        dialog.show()
     }
 
     private fun showCameraProfileStatus(status: StudyMessage.CameraProfileStatus) {
@@ -1728,6 +1837,7 @@ class TeacherActivity : ComponentActivity() {
         private const val NOTIFICATION_STUDENT_TEXT = 105
         private const val MAX_RECEIVED_ASSETS = 40
         private const val MAX_RECENT_THUMBNAILS = 12
+        private const val RECENT_THUMBNAIL_LONG_EDGE = 480
         private const val MAX_CONVERSATION_ENTRIES = 100
         private const val MAX_RECEIVED_VOICE_MESSAGES = 20
         private const val MAX_STORED_OUTGOING_VOICE_MESSAGES = 20
@@ -1735,6 +1845,7 @@ class TeacherActivity : ComponentActivity() {
         private const val MAX_OUTGOING_FILE_RETRIES = 3
         private const val OUTGOING_FILE_RETRY_DELAY_MS = 2_000L
         private const val ROI_REQUEST_TIMEOUT_MS = 15_000L
+        private const val CALIBRATION_REQUEST_TIMEOUT_MS = 25_000L
         private const val MAX_MESSAGE_TEXT_BYTES = 4 * 1024
         private const val MAX_STATUS_TEXT_CHARS = 120
         private const val MAX_VOICE_DURATION_MS = 60_000L
