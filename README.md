@@ -15,7 +15,7 @@
 8. 선생님 가운데 사진은 비율을 유지한 `FIT_CENTER`로 전체가 보이며, 사진 바깥 여백은 책 영역 좌표에서 제외됩니다. 사진은 디스플레이 픽셀을 180도 변환해 보여 주고, 전체화면 상세 ROI는 화면 좌표 기반 행렬로 최대 5배 확대·경계 내 이동하므로 손가락 이동량과 사진 이동량이 일치합니다. 최근 썸네일은 최대 12개입니다.
 9. 두 앱 모두 세로·가로 화면을 지원하며 회전 중 학생 세션과 책 영역을 유지합니다.
 10. Android 13 이상 학생폰은 하나의 `AudioRecord` 입력을 segmented `SpeechRecognizer`에 계속 공급해 시스템 마이크 재시작음을 반복하지 않습니다. 한국어 정확도를 위해 시스템 음성서비스를 우선하고 오프라인 인식을 강제하지 않으며, 후보 문장과 힌트 어휘를 넓혔습니다. 학생이 `풀었어`라고 말하면 짧고 분명한 확인음을 먼저 내고 선생님폰에 문제 완료를 보냅니다. `아빠`라고 말하면 확인음 뒤 다음 발화를 인식 텍스트로 보내고 완료음을 냅니다. `아빠 녹음`이라고 말하면 이어지는 12초 음성을 녹음해 자동 전송합니다. 연속 입력을 기기 음성서비스가 지원하지 않으면 시끄러운 재시작 fallback 없이 오류만 표시합니다.
-11. 학생은 최대 60초 음성 메시지를 보내고 선생님은 이를 재생할 수 있습니다. 선생님은 텍스트 또는 최대 60초 음성으로 답하며, 학생폰은 수신 즉시 확인음을 내고 텍스트 답변을 한국어 TTS로 읽거나 음성 답변을 자동 재생합니다. 실시간 통화는 아닙니다.
+11. 학생은 최대 60초 음성 메시지를 보내고 선생님은 이를 재생할 수 있습니다. 선생님은 텍스트 또는 최대 60초 음성으로 답하며, 학생폰은 수신 즉시 확인음을 내고 텍스트 답변을 한국어 TTS로 읽거나 음성 답변을 자동 재생합니다. 학생의 텍스트·음성·`풀었어`는 모두 선생님 대화 기록에 들어가며, 열린 대화창도 즉시 갱신되고 새 메시지는 Android 알림으로 표시됩니다. 실시간 통화는 아닙니다.
 
 ## 모듈과 I/O
 
@@ -30,10 +30,13 @@
 | `camera-capture` | lifecycle, capture 요청, baseline arm | `FrameObservation`, thumbnail file, book ROI file | Preview/ImageCapture/ImageAnalysis 동시 사용, 분석 1fps 이하, 임시 원본과 종료 중 자산 cleanup |
 | `voice-command` | start/stop, AudioRecord PCM | segmented SpeechRecognizer의 제한된 한국어 command | Android 13+, 고정 버퍼, 자동 재시작 없음, 미지원 시 명시적 오류 |
 | `voice-message` | main-thread record/stop/cancel/play, output file | AAC `.m4a` `RecordedVoiceMessage`, playback callback | 최대 60초, `.part` 성공 후 commit, 취소·실패 파일 cleanup, recorder·player 각각 활성 작업 1개 |
+| `app-voice-lab` | 세 가지 Android 음성인식 방식, 실제 발화 | 인식 문장·명령 수·세션 수·오류 코드·복사 가능한 로그 | 학생 앱과 별도 설치되며 학생 앱 음성 동작을 변경하지 않음 |
 | `app-student` | touch/voice/teacher request, camera observation, teacher reply | authoritative session state, thumbnail/ROI, alert, student voice message, TTS/playback | 타이머·촬영·판정 기준은 학생폰 |
 | `app-teacher` | pairing approval, settings/start/media request, text/voice reply | concise state, 최근 썸네일 12개, 전체화면 ROI, notifications | 설정 후 첫 사이클 시작, 썸네일 자동 수신과 ROI 요청 전송 분리 |
 
 상세 계약은 [`docs/remote-study-mvp-system-design-v0.1.md`](docs/remote-study-mvp-system-design-v0.1.md), 장기 wire schema는 [`docs/remote-study-protocol-v1.proto`](docs/remote-study-protocol-v1.proto)에 있습니다. 현재 빌드는 코드 생성 도구를 강제하지 않도록 같은 개념의 수동 검증 codec을 사용합니다.
+
+다음 카메라 단계의 `1x 전체 썸네일 + 실제 2x 보정 화면에서 책 영역 설정 + 2x 상세 촬영` 좌표 계약은 [`docs/book-detail-2x-contract.md`](docs/book-detail-2x-contract.md)에 고정했습니다.
 
 ## 빌드와 테스트
 
@@ -54,8 +57,10 @@
   :voice-message:testDebugUnitTest \
   :app-student:testDebugUnitTest \
   :app-teacher:testDebugUnitTest \
+  :app-voice-lab:testDebugUnitTest \
   :app-student:assembleDebug \
-  :app-teacher:assembleDebug
+  :app-teacher:assembleDebug \
+  :app-voice-lab:assembleDebug
 ```
 
 Android 기기 또는 emulator가 연결된 경우 Camera asset processor의 instrumented test도 실행합니다. 이 테스트는 자산 분리와 원본 삭제를 검증하지만 실제 카메라 하드웨어 촬영 시험을 대신하지는 않습니다.
@@ -76,6 +81,7 @@ APK:
 
 - `app-student/build/outputs/apk/debug/app-student-debug.apk`
 - `app-teacher/build/outputs/apk/debug/app-teacher-debug.apk`
+- `app-voice-lab/build/outputs/apk/debug/app-voice-lab-debug.apk`
 
 두 실제 Android 기기에 각각 설치한 뒤 근거리 기기, Bluetooth, Wi-Fi, 위치(구형 Android), 카메라, 마이크, 알림 권한을 허용합니다. 같은 Wi-Fi에서 시험하되 Nearby Connections가 Bluetooth/BLE/Wi-Fi를 조합하므로 두 기기의 Bluetooth도 켭니다.
 

@@ -117,6 +117,9 @@ class TeacherActivity : ComponentActivity() {
     private val outgoingVoiceRetryRunnableByUserMessageId = mutableMapOf<String, Runnable>()
     private val recentThumbnails = ArrayDeque<RecentThumbnail>()
     private val conversationHistory = ArrayDeque<ConversationEntry>()
+    private var conversationDialog: AlertDialog? = null
+    private var conversationList: LinearLayout? = null
+    private var conversationScroll: ScrollView? = null
     private val pendingRoiAssetIds = mutableSetOf<String>()
     private var roiDialog: AlertDialog? = null
     private var fullScreenPhotoDialog: Dialog? = null
@@ -305,6 +308,11 @@ class TeacherActivity : ComponentActivity() {
             is StudyMessage.ProblemCompleted -> {
                 problemLabel.text = "완료한 문제 ${message.totalCount}개"
                 eventLabel.text = "방금 문제를 풀었다고 알렸어요"
+                addConversation(
+                    sender = "학생",
+                    content = "풀었어 · 완료한 문제 ${message.totalCount}개",
+                    sentAtEpochMs = System.currentTimeMillis(),
+                )
                 notifyProblemCompleted(message.totalCount)
             }
 
@@ -501,6 +509,7 @@ class TeacherActivity : ComponentActivity() {
         val sender = if (message.sender == PeerRole.STUDENT) "학생" else "선생님"
         eventLabel.text = "$sender 텍스트: ${message.text.take(MAX_STATUS_TEXT_CHARS)}"
         addConversation(sender, message.text, message.sentAtEpochMs)
+        if (message.sender == PeerRole.STUDENT) notifyNewStudentMessage(message.text)
     }
 
     private fun addConversation(
@@ -519,13 +528,40 @@ class TeacherActivity : ComponentActivity() {
             conversationButton.text = "대화 ${conversationHistory.size}"
             conversationButton.contentDescription = "대화 기록 ${conversationHistory.size}개 열기"
         }
+        renderConversationHistory()
     }
 
     private fun showConversationHistory() {
+        conversationDialog?.dismiss()
         val list = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(8), dp(12), dp(8))
         }
+        val scroll = ScrollView(this).apply { addView(list) }
+        conversationList = list
+        conversationScroll = scroll
+        renderConversationHistory()
+        conversationDialog = AlertDialog.Builder(this)
+            .setTitle("대화 기록")
+            .setView(scroll)
+            .setPositiveButton("닫기", null)
+            .create()
+            .also { dialog ->
+                dialog.setOnDismissListener {
+                    if (conversationDialog === dialog) {
+                        conversationDialog = null
+                        conversationList = null
+                        conversationScroll = null
+                    }
+                }
+                dialog.show()
+                scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+            }
+    }
+
+    private fun renderConversationHistory() {
+        val list = conversationList ?: return
+        list.removeAllViews()
         if (conversationHistory.isEmpty()) {
             list.addView(TextView(this).apply {
                 text = "아직 주고받은 메시지가 없습니다"
@@ -566,12 +602,7 @@ class TeacherActivity : ComponentActivity() {
                 list.addView(row, matchWrap(bottom = 7))
             }
         }
-        val scroll = ScrollView(this).apply { addView(list) }
-        AlertDialog.Builder(this)
-            .setTitle("대화 기록")
-            .setView(scroll)
-            .setPositiveButton("닫기", null)
-            .show()
+        conversationScroll?.post { conversationScroll?.fullScroll(View.FOCUS_DOWN) }
     }
 
     private fun registerVoiceTransfer(message: StudyMessage.VoiceTransfer) {
@@ -1467,6 +1498,22 @@ class TeacherActivity : ComponentActivity() {
         getSystemService(NotificationManager::class.java).notify(NOTIFICATION_STUDENT_VOICE, notification)
     }
 
+    private fun notifyNewStudentMessage(text: String) {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) return
+        val notification = android.app.Notification.Builder(this, NOTIFICATION_CHANNEL)
+            .setSmallIcon(android.R.drawable.ic_dialog_email)
+            .setContentTitle("학생 새 메시지")
+            .setContentText(text.take(MAX_STATUS_TEXT_CHARS))
+            .setAutoCancel(true)
+            .build()
+        getSystemService(NotificationManager::class.java).notify(
+            NOTIFICATION_STUDENT_TEXT,
+            notification,
+        )
+    }
+
     private fun pruneReceivedAssets(directory: File) {
         directory.listFiles()
             .orEmpty()
@@ -1678,6 +1725,7 @@ class TeacherActivity : ComponentActivity() {
         private const val NOTIFICATION_AWAY = 102
         private const val NOTIFICATION_NO_MOVEMENT = 103
         private const val NOTIFICATION_STUDENT_VOICE = 104
+        private const val NOTIFICATION_STUDENT_TEXT = 105
         private const val MAX_RECEIVED_ASSETS = 40
         private const val MAX_RECENT_THUMBNAILS = 12
         private const val MAX_CONVERSATION_ENTRIES = 100

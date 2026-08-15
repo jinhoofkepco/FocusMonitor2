@@ -28,4 +28,5 @@ include(
     ":transport-nearby",
     ":voice-command",
     ":voice-message",
+    ":app-voice-lab",
 )

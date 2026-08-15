@@ -278,6 +278,8 @@ class StudentVoiceCommandController @JvmOverloads constructor(
             val hypotheses = partialResults
                 ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 .orEmpty()
+            hypotheses.firstOrNull { it.isNotBlank() }
+                ?.let { listener.onRecognitionText(it.trim(), false) }
             phraseMatcher.matchFirst(hypotheses)
                 ?.takeUnless { it == VoiceCommand.DAD_MESSAGE }
                 ?.let(::emitIfNotDebounced)
@@ -329,6 +331,7 @@ class StudentVoiceCommandController @JvmOverloads constructor(
             ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
             .orEmpty()
         val primary = hypotheses.firstOrNull { it.isNotBlank() }
+        primary?.let { listener.onRecognitionText(it.trim(), true) }
         if (awaitingMessage) {
             if (primary != null) {
                 awaitingMessage = false

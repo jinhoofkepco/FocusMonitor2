@@ -66,6 +66,9 @@ interface StudentVoiceCommandListener {
     /** Final Korean dictation captured after the "아빠" wake phrase. */
     fun onMessageRecognized(text: String) = Unit
 
+    /** Diagnostic hook used by the standalone voice lab; production callers may ignore it. */
+    fun onRecognitionText(text: String, isFinal: Boolean) = Unit
+
     /** Always called on the Android main thread. */
     fun onStatus(status: VoiceCommandStatus)
 
