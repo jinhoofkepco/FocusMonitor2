@@ -18,8 +18,6 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
-import androidx.camera.core.UseCaseGroup
-import androidx.camera.core.ViewPort
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionFilter
 import androidx.camera.core.resolutionselector.ResolutionSelector
@@ -90,7 +88,9 @@ class BookCameraView @JvmOverloads constructor(
 
     private val previewView = PreviewView(context).apply {
         implementationMode = PreviewView.ImplementationMode.COMPATIBLE
-        scaleType = PreviewView.ScaleType.FILL_CENTER
+        // The monitoring frame must be complete. FILL_CENTER silently cuts away
+        // the sides of a 4:3 camera frame on tall phones such as the Galaxy S23.
+        scaleType = PreviewView.ScaleType.FIT_CENTER
     }
     private val guideView = CalibrationGuideView(context) { region ->
         bookRegion = region
@@ -121,8 +121,8 @@ class BookCameraView @JvmOverloads constructor(
     }
 
     /**
-     * Waits until PreviewView can describe its FILL_CENTER [ViewPort], then binds
-     * all three use cases in one group. The result callback runs exactly once on
+     * Waits until PreviewView can provide a display rotation, then binds all three
+     * 4:3 use cases without a screen-shaped ViewPort crop. The result callback runs exactly once on
      * main, including a close while layout/provider work is pending.
      */
     fun bind(lifecycleOwner: LifecycleOwner, onResult: (Result<Unit>) -> Unit = {}) {
@@ -134,11 +134,11 @@ class BookCameraView @JvmOverloads constructor(
                 completeBind(request, Result.failure(IllegalStateException("BookCameraView is closed")))
                 return@runOnMain
             }
-            awaitViewPort(request, lifecycleOwner)
+            awaitPreviewDisplay(request, lifecycleOwner)
         }
     }
 
-    private fun awaitViewPort(request: PendingBind, lifecycleOwner: LifecycleOwner) {
+    private fun awaitPreviewDisplay(request: PendingBind, lifecycleOwner: LifecycleOwner) {
         var layoutListener: View.OnLayoutChangeListener? = null
         var attachListener: View.OnAttachStateChangeListener? = null
         val cleanup = {
@@ -149,11 +149,11 @@ class BookCameraView @JvmOverloads constructor(
         }
         val tryBind = fun() {
             if (request.completed.get() || closed.get()) return
-            val viewPort = previewView.viewPort ?: return
-            if (!request.viewPortConsumed.compareAndSet(false, true)) return
+            val display = previewView.display ?: return
+            if (!request.previewReadyConsumed.compareAndSet(false, true)) return
             cleanup()
             request.cleanupOnMain = null
-            bindUseCaseGroup(request, lifecycleOwner, viewPort)
+            bindUseCases(request, lifecycleOwner, display.rotation)
         }
 
         layoutListener = View.OnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> tryBind() }
@@ -171,10 +171,10 @@ class BookCameraView @JvmOverloads constructor(
         previewView.post { tryBind() }
     }
 
-    private fun bindUseCaseGroup(
+    private fun bindUseCases(
         request: PendingBind,
         lifecycleOwner: LifecycleOwner,
-        viewPort: ViewPort,
+        targetRotation: Int,
     ) {
         val providerFuture = ProcessCameraProvider.getInstance(context)
         providerFuture.addListener(
@@ -193,8 +193,14 @@ class BookCameraView @JvmOverloads constructor(
                 runCatching {
                     val provider = providerFuture.get()
                     candidateProvider = provider
-                    val targetRotation = viewPort.rotation
                     val candidatePreview = Preview.Builder()
+                        .setResolutionSelector(
+                            ResolutionSelector.Builder()
+                                .setAspectRatioStrategy(
+                                    AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY,
+                                )
+                                .build(),
+                        )
                         .setTargetRotation(targetRotation)
                         .build()
                         .also { it.surfaceProvider = previewView.surfaceProvider }
@@ -217,12 +223,9 @@ class BookCameraView @JvmOverloads constructor(
                     provider.bindToLifecycle(
                         lifecycleOwner,
                         CameraSelector.DEFAULT_BACK_CAMERA,
-                        UseCaseGroup.Builder()
-                            .setViewPort(viewPort)
-                            .addUseCase(candidatePreview)
-                            .addUseCase(capture)
-                            .addUseCase(analysis)
-                            .build(),
+                        candidatePreview,
+                        capture,
+                        analysis,
                     )
                     check(!closed.get()) { "BookCameraView was closed while binding" }
                     cameraProvider = provider
@@ -564,7 +567,7 @@ class BookCameraView @JvmOverloads constructor(
         val callback: (Result<Unit>) -> Unit,
     ) {
         val completed = AtomicBoolean(false)
-        val viewPortConsumed = AtomicBoolean(false)
+        val previewReadyConsumed = AtomicBoolean(false)
 
         @Volatile
         var cleanupOnMain: (() -> Unit)? = null
@@ -599,6 +602,33 @@ private class CalibrationGuideView(
     private var lastTouchX = 0f
     private var lastTouchY = 0f
 
+    /** Camera use cases are fixed at 4:3; this is their complete FIT_CENTER area. */
+    private fun cameraContentRect(): RectF {
+        if (width <= 0 || height <= 0) return RectF()
+        val landscape = width > height
+        val contentAspect = if (landscape) 4f / 3f else 3f / 4f
+        val viewAspect = width.toFloat() / height
+        return if (viewAspect > contentAspect) {
+            val contentWidth = height * contentAspect
+            val left = (width - contentWidth) / 2f
+            RectF(left, 0f, left + contentWidth, height.toFloat())
+        } else {
+            val contentHeight = width / contentAspect
+            val top = (height - contentHeight) / 2f
+            RectF(0f, top, width.toFloat(), top + contentHeight)
+        }
+    }
+
+    private fun regionRect(content: RectF): RectF {
+        val normalized = bookRegion.normalized()
+        return RectF(
+            content.left + normalized.left * content.width(),
+            content.top + normalized.top * content.height(),
+            content.left + normalized.right * content.width(),
+            content.top + normalized.bottom * content.height(),
+        )
+    }
+
     fun setBookRegion(region: BookRegion) {
         bookRegion = region
         invalidate()
@@ -615,7 +645,7 @@ private class CalibrationGuideView(
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        val book = bookRegion.normalized().toRectF(width, height)
+        val book = regionRect(cameraContentRect())
         bookPaint.color = if (calibrated) Color.rgb(87, 214, 141) else Color.rgb(255, 196, 61)
         labelPaint.color = bookPaint.color
         canvas.drawRoundRect(book, dp(12f), dp(12f), bookPaint)
@@ -629,9 +659,11 @@ private class CalibrationGuideView(
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         if (!editingEnabled || width == 0 || height == 0) return false
-        val x = event.x.coerceIn(0f, width.toFloat())
-        val y = event.y.coerceIn(0f, height.toFloat())
-        val rect = bookRegion.normalized().toRectF(width, height)
+        val content = cameraContentRect()
+        if (content.isEmpty) return false
+        val x = event.x.coerceIn(content.left, content.right)
+        val y = event.y.coerceIn(content.top, content.bottom)
+        val rect = regionRect(content)
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 dragMode = hitTest(x, y, rect)
@@ -643,8 +675,8 @@ private class CalibrationGuideView(
             }
             MotionEvent.ACTION_MOVE -> {
                 if (dragMode == DragMode.NONE) return false
-                val dx = (x - lastTouchX) / width
-                val dy = (y - lastTouchY) / height
+                val dx = (x - lastTouchX) / content.width()
+                val dy = (y - lastTouchY) / content.height()
                 updateRegion(dx, dy)
                 lastTouchX = x
                 lastTouchY = y

@@ -29,7 +29,8 @@ import java.util.EnumMap
  *
  * Android 13+ supplies one app-owned AudioRecord stream to a segmented SpeechRecognizer session.
  * This avoids the platform start/stop chime caused by repeatedly reopening the system microphone.
- * Unsupported devices fail visibly instead of falling back to a noisy restart loop.
+ * When system recognition is allowed it is preferred for accuracy; unsupported devices fail
+ * visibly instead of falling back to a noisy restart loop.
  */
 class StudentVoiceCommandController @JvmOverloads constructor(
     context: Context,
@@ -143,9 +144,19 @@ class StudentVoiceCommandController @JvmOverloads constructor(
             return false
         }
 
+        if (allowSystemFallback) {
+            val systemRecognizer = runCatching {
+                SpeechRecognizer.createSpeechRecognizer(appContext)
+            }.getOrNull()
+            if (systemRecognizer != null) {
+                recognizer = systemRecognizer
+                recognitionMode = RecognitionMode.SYSTEM
+                return true
+            }
+        }
+
         val onDeviceAvailable = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
             SpeechRecognizer.isOnDeviceRecognitionAvailable(appContext)
-
         if (onDeviceAvailable) {
             val onDeviceRecognizer = runCatching {
                 SpeechRecognizer.createOnDeviceSpeechRecognizer(appContext)
@@ -157,29 +168,12 @@ class StudentVoiceCommandController @JvmOverloads constructor(
             }
         }
 
-        if (!allowSystemFallback) {
-            requestedActive = false
-            dispatchTerminalError(
-                kind = VoiceCommandErrorKind.RECOGNIZER_UNAVAILABLE,
-                message = "On-device speech recognition is unavailable and system fallback is disabled.",
-            )
-            return false
-        }
-
-        return runCatching {
-            recognizer = SpeechRecognizer.createSpeechRecognizer(appContext)
-            recognitionMode = RecognitionMode.SYSTEM
-        }.fold(
-            onSuccess = { true },
-            onFailure = { throwable ->
-                requestedActive = false
-                dispatchTerminalError(
-                    kind = VoiceCommandErrorKind.RECOGNIZER_UNAVAILABLE,
-                    message = throwable.message ?: "Failed to create Android SpeechRecognizer.",
-                )
-                false
-            },
+        requestedActive = false
+        dispatchTerminalError(
+            kind = VoiceCommandErrorKind.RECOGNIZER_UNAVAILABLE,
+            message = "연속 음성인식을 지원하는 음성서비스를 사용할 수 없습니다.",
         )
+        return false
     }
 
     private fun beginListening() {
@@ -478,7 +472,12 @@ class StudentVoiceCommandController @JvmOverloads constructor(
         putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, KOREAN_LOCALE)
         putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, MAX_RECOGNITION_RESULTS)
         putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-        putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+        // For the system recognizer, forcing offline recognition noticeably reduces
+        // Korean accuracy on some Samsung/Google service combinations.
+        putExtra(
+            RecognizerIntent.EXTRA_PREFER_OFFLINE,
+            recognitionMode == RecognitionMode.ON_DEVICE,
+        )
         putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, audioSource)
         putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
         putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
@@ -486,7 +485,17 @@ class StudentVoiceCommandController @JvmOverloads constructor(
         putExtra(RecognizerIntent.EXTRA_SEGMENTED_SESSION, RecognizerIntent.EXTRA_AUDIO_SOURCE)
         putStringArrayListExtra(
             RecognizerIntent.EXTRA_BIASING_STRINGS,
-            arrayListOf("풀었어", "아빠", "공부 시작", "일시 정지", "그만"),
+            arrayListOf(
+                "풀었어",
+                "풀었어요",
+                "문제 풀었어",
+                "다 풀었어",
+                "아빠",
+                "아빠 녹음",
+                "공부 시작",
+                "일시 정지",
+                "그만",
+            ),
         )
     }
 
@@ -526,7 +535,7 @@ class StudentVoiceCommandController @JvmOverloads constructor(
 
     private companion object {
         const val KOREAN_LOCALE = "ko-KR"
-        const val MAX_RECOGNITION_RESULTS = 5
+        const val MAX_RECOGNITION_RESULTS = 8
         const val COMMAND_DEBOUNCE_MILLIS = 2_000L
         const val AUDIO_SAMPLE_RATE_HZ = 16_000
         const val AUDIO_BUFFER_BYTES = 16_384

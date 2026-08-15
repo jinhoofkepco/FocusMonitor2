@@ -89,7 +89,8 @@ class StudentActivity : ComponentActivity() {
     private var session = SessionStateMachine()
     private val sessionId = UUID.randomUUID().toString()
     private val handler = Handler(Looper.getMainLooper())
-    private val tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 45)
+    // Keep acknowledgements very short, but make them unmistakable on a mounted phone.
+    private val tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 85)
     private val fileExecutor = Executors.newSingleThreadExecutor()
     private var activityMonitor = StudyActivityMonitor()
     private var captureIntervalMs = DEFAULT_CAPTURE_INTERVAL_MS

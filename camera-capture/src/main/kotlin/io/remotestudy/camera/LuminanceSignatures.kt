@@ -39,8 +39,8 @@ internal data class NormalizedRegion(
     }
 
     /**
-     * Maps this upright PreviewView region into an ImageProxy buffer region.
-     * [sourceCrop] is the ViewPort cropRect expressed in unrotated buffer pixels.
+     * Maps this upright preview region into an ImageProxy buffer region.
+     * [sourceCrop] is ImageProxy.cropRect expressed in unrotated buffer pixels.
      */
     fun inSourceCrop(sourceCrop: PixelRegion, rotationDegrees: Int): PixelRegion {
         val relativeSource = inSourceCoordinates(rotationDegrees)

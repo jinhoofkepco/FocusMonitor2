@@ -386,6 +386,7 @@ class TeacherActivity : ComponentActivity() {
         when (metadata.kind) {
             AssetKind.THUMBNAIL -> {
                 latestThumbnail.setImageBitmap(bitmap)
+                bookRegionOverlay.setImageSize(bitmap.width, bitmap.height)
                 latestThumbnail.contentDescription =
                     "가장 최근 학습 썸네일, 촬영 ${formatCapturedAt(metadata.capturedAtEpochMs)}, 고화질 요청"
                 latestThumbnail.setOnClickListener { requestBookRoi(metadata.assetId) }
@@ -432,7 +433,7 @@ class TeacherActivity : ComponentActivity() {
         val image = ImageView(this).apply {
             setImageBitmap(bitmap)
             setBackgroundColor(0xFFE7EAF1.toInt())
-            scaleType = ImageView.ScaleType.FIT_XY
+            scaleType = ImageView.ScaleType.FIT_CENTER
             isFocusable = true
         }
         val entry = RecentThumbnail(
@@ -979,6 +980,10 @@ class TeacherActivity : ComponentActivity() {
     }
 
     private fun showBookRegionAndQualityDialog() {
+        if (latestThumbnail.drawable == null || !bookRegionOverlay.hasImageSize) {
+            eventLabel.text = "전체 사진을 받은 뒤 책 영역을 설정해 주세요"
+            return
+        }
         var selected = detailCaptureMode.ordinal
         AlertDialog.Builder(this)
             .setTitle("책 영역 상세 화질")
@@ -992,7 +997,7 @@ class TeacherActivity : ComponentActivity() {
                 bookRegionOverlay.editingEnabled = true
                 bookRegionButton.text = "책 영역 저장"
                 thumbnailLabel.visibility = View.VISIBLE
-                thumbnailLabel.text = "사각형 안쪽은 이동, 모서리는 크기 조절"
+                thumbnailLabel.text = "전체 사진 위에서 사각형 안쪽은 이동, 모서리는 크기 조절"
             }
             .show()
     }
@@ -1256,7 +1261,7 @@ class TeacherActivity : ComponentActivity() {
         }
         latestThumbnail = ImageView(this).apply {
             setBackgroundColor(0xFFE7EAF1.toInt())
-            scaleType = ImageView.ScaleType.CENTER_CROP
+            scaleType = ImageView.ScaleType.FIT_CENTER
             contentDescription = "아직 수신한 학습 사진이 없음"
         }
         bookRegionOverlay = TeacherBookRegionOverlay(this).apply {
@@ -1723,6 +1728,16 @@ private class TeacherBookRegionOverlay(context: android.content.Context) : View(
     private var mode = DragMode.NONE
     private var lastX = 0f
     private var lastY = 0f
+    private var imageWidth = 0
+    private var imageHeight = 0
+
+    val hasImageSize: Boolean get() = imageWidth > 0 && imageHeight > 0
+
+    fun setImageSize(width: Int, height: Int) {
+        imageWidth = width
+        imageHeight = height
+        invalidate()
+    }
 
     fun setRegion(value: DisplayBookRegion) {
         region = value
@@ -1731,7 +1746,7 @@ private class TeacherBookRegionOverlay(context: android.content.Context) : View(
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        if (!editingEnabled) return
+        if (!editingEnabled || !hasImageSize) return
         val rect = rect()
         canvas.drawRoundRect(rect, dp(10f), dp(10f), paint)
         listOf(
@@ -1743,9 +1758,10 @@ private class TeacherBookRegionOverlay(context: android.content.Context) : View(
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        if (!editingEnabled || width == 0 || height == 0) return false
-        val x = event.x.coerceIn(0f, width.toFloat())
-        val y = event.y.coerceIn(0f, height.toFloat())
+        if (!editingEnabled || width == 0 || height == 0 || !hasImageSize) return false
+        val content = imageContentRect()
+        val x = event.x.coerceIn(content.left, content.right)
+        val y = event.y.coerceIn(content.top, content.bottom)
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 mode = hit(x, y, rect())
@@ -1756,7 +1772,7 @@ private class TeacherBookRegionOverlay(context: android.content.Context) : View(
             }
             MotionEvent.ACTION_MOVE -> {
                 if (mode == DragMode.NONE) return false
-                update((x - lastX) / width, (y - lastY) / height)
+                update((x - lastX) / content.width(), (y - lastY) / content.height())
                 lastX = x; lastY = y
                 return true
             }
@@ -1770,12 +1786,24 @@ private class TeacherBookRegionOverlay(context: android.content.Context) : View(
         return false
     }
 
-    private fun rect() = RectF(
-        region.left * width,
-        region.top * height,
-        region.right * width,
-        region.bottom * height,
-    )
+    private fun imageContentRect(): RectF {
+        val scale = minOf(width.toFloat() / imageWidth, height.toFloat() / imageHeight)
+        val drawnWidth = imageWidth * scale
+        val drawnHeight = imageHeight * scale
+        val left = (width - drawnWidth) / 2f
+        val top = (height - drawnHeight) / 2f
+        return RectF(left, top, left + drawnWidth, top + drawnHeight)
+    }
+
+    private fun rect(): RectF {
+        val content = imageContentRect()
+        return RectF(
+            content.left + region.left * content.width(),
+            content.top + region.top * content.height(),
+            content.left + region.right * content.width(),
+            content.top + region.bottom * content.height(),
+        )
+    }
 
     private fun hit(x: Float, y: Float, rect: RectF): DragMode {
         val r = dp(36f)
@@ -1815,37 +1843,93 @@ private class ZoomableImageView(context: android.content.Context) : ImageView(co
     private var zoom = 1f
     private var lastX = 0f
     private var lastY = 0f
+    private val drawMatrix = Matrix()
     private val scaleDetector = ScaleGestureDetector(
         context,
         object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScale(detector: ScaleGestureDetector): Boolean {
-                zoom = (zoom * detector.scaleFactor).coerceIn(1f, 5f)
-                scaleX = zoom
-                scaleY = zoom
-                if (zoom == 1f) {
-                    translationX = 0f
-                    translationY = 0f
-                }
+                val nextZoom = (zoom * detector.scaleFactor).coerceIn(1f, 5f)
+                val applied = nextZoom / zoom
+                zoom = nextZoom
+                drawMatrix.postScale(applied, applied, detector.focusX, detector.focusY)
+                clampAndApply()
                 return true
             }
         },
     )
 
     init {
-        scaleType = ScaleType.FIT_CENTER
+        scaleType = ScaleType.MATRIX
         isClickable = true
+    }
+
+    override fun setImageBitmap(bitmap: Bitmap?) {
+        super.setImageBitmap(bitmap)
+        post { resetToFitCenter() }
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        resetToFitCenter()
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         scaleDetector.onTouchEvent(event)
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> { lastX = event.x; lastY = event.y }
-            MotionEvent.ACTION_MOVE -> if (!scaleDetector.isInProgress && zoom > 1f) {
-                translationX += event.x - lastX
-                translationY += event.y - lastY
-                lastX = event.x; lastY = event.y
+            MotionEvent.ACTION_MOVE -> {
+                if (!scaleDetector.isInProgress && zoom > 1f) {
+                    drawMatrix.postTranslate(event.x - lastX, event.y - lastY)
+                    clampAndApply()
+                }
+                // Keep the reference point current during a pinch as well, so
+                // lifting one finger cannot cause a large one-frame pan jump.
+                lastX = event.x
+                lastY = event.y
+            }
+            MotionEvent.ACTION_POINTER_UP -> {
+                val remainingIndex = if (event.actionIndex == 0) 1 else 0
+                if (remainingIndex < event.pointerCount) {
+                    lastX = event.getX(remainingIndex)
+                    lastY = event.getY(remainingIndex)
+                }
             }
         }
         return true
+    }
+
+    private fun resetToFitCenter() {
+        val item = drawable ?: return
+        if (width <= 0 || height <= 0 || item.intrinsicWidth <= 0 || item.intrinsicHeight <= 0) return
+        val baseScale = minOf(
+            width.toFloat() / item.intrinsicWidth,
+            height.toFloat() / item.intrinsicHeight,
+        )
+        val left = (width - item.intrinsicWidth * baseScale) / 2f
+        val top = (height - item.intrinsicHeight * baseScale) / 2f
+        drawMatrix.setScale(baseScale, baseScale)
+        drawMatrix.postTranslate(left, top)
+        zoom = 1f
+        imageMatrix = drawMatrix
+    }
+
+    private fun clampAndApply() {
+        val item = drawable ?: return
+        val bounds = RectF(0f, 0f, item.intrinsicWidth.toFloat(), item.intrinsicHeight.toFloat())
+        drawMatrix.mapRect(bounds)
+        val dx = when {
+            bounds.width() <= width -> width / 2f - bounds.centerX()
+            bounds.left > 0f -> -bounds.left
+            bounds.right < width -> width - bounds.right
+            else -> 0f
+        }
+        val dy = when {
+            bounds.height() <= height -> height / 2f - bounds.centerY()
+            bounds.top > 0f -> -bounds.top
+            bounds.bottom < height -> height - bounds.bottom
+            else -> 0f
+        }
+        drawMatrix.postTranslate(dx, dy)
+        imageMatrix = drawMatrix
     }
 }

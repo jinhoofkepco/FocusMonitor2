@@ -17,9 +17,8 @@ import kotlin.math.floor
 import kotlin.math.max
 
 /**
- * Processes the JPEG saved by the ImageCapture in BookCameraView's shared
- * UseCaseGroup. CameraX has already applied that group's ViewPort crop, so the
- * normalized regions below are relative to the upright cropped JPEG.
+ * Processes the complete 4:3 JPEG saved by BookCameraView. No screen-shaped
+ * ViewPort crop is applied, so normalized regions are relative to the full upright frame.
  */
 internal object CaptureAssetProcessor {
     private const val STANDARD_BOOK_MAX_LONG_EDGE = 4_000
