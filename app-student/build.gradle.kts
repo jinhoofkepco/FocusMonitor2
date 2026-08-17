@@ -1,7 +1,18 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     kotlin("android")
 }
+
+val localProperties = Properties().apply {
+    val source = rootProject.file("local.properties")
+    if (source.isFile) source.inputStream().use(::load)
+}
+fun buildConfigString(name: String): String =
+    (localProperties.getProperty(name) ?: "")
+        .replace("\\", "\\\\")
+        .replace("\"", "\\\"")
 
 android {
     namespace = "io.remotestudy.student"
@@ -12,8 +23,10 @@ android {
         applicationId = "io.remotestudy.student"
         minSdk = 26
         targetSdk = 35
-        versionCode = 13
-        versionName = "0.10.0"
+        versionCode = 14
+        versionName = "0.11.0"
+        buildConfigField("String", "TELEGRAM_BOT_TOKEN", "\"${buildConfigString("TELEGRAM_BOT_TOKEN")}\"")
+        buildConfigField("long", "TELEGRAM_CHAT_ID", (localProperties.getProperty("TELEGRAM_CHAT_ID")?.toLongOrNull() ?: 0L).toString() + "L")
     }
 
     compileOptions {
@@ -24,18 +37,17 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+
+    buildFeatures { buildConfig = true }
 }
 
 dependencies {
     implementation(project(":activity-detection"))
-    implementation(project(":camera-capture"))
     implementation(project(":core-domain"))
-    implementation(project(":core-protocol"))
-    implementation(project(":core-sync"))
-    implementation(project(":transport-api"))
-    implementation(project(":transport-nearby"))
     implementation(project(":voice-command"))
-    implementation(project(":voice-message"))
+    implementation(project(":telegram-report"))
     implementation("androidx.activity:activity-ktx:1.8.1")
     implementation("androidx.core:core-ktx:1.13.1")
+    implementation("androidx.camera:camera-camera2:1.5.3")
+    implementation("androidx.camera:camera-lifecycle:1.5.3")
 }
