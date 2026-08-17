@@ -51,6 +51,7 @@ import io.remotestudy.domain.session.StartRequested
 import io.remotestudy.domain.session.Tick
 import io.remotestudy.domain.session.StudySchedule
 import io.remotestudy.telegram.NormalizedBookRegion
+import io.remotestudy.telegram.RemoteSessionPhase
 import io.remotestudy.telegram.TelegramCommand
 import io.remotestudy.telegram.TelegramCommandHandler
 import io.remotestudy.telegram.TelegramConfig
@@ -74,6 +75,12 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
     private val analysisExecutor = Executors.newSingleThreadExecutor { Thread(it, "study-analysis") }
     private val sessionLock = Any()
     private var session = SessionStateMachine()
+    private var schedule = StudySchedule()
+    private var teacherCountdownMs = DEFAULT_TEACHER_COUNTDOWN_MS
+    private var sessionClockOffsetMs = 0L
+    private var completedProblemCount = 0
+    private var countdownPaused = false
+    private var countdownPausedAtSessionMs = 0L
     private var sessionActive = false
     private var captureInFlight = AtomicBoolean(false)
     private var captureStartedAtElapsedMs = 0L
@@ -161,6 +168,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             },
         )
         reporter.updateBookRegion(loadBookRegion())
+        loadTimerSettings()
         if (!preferences.getBoolean(KEY_ACTIVE, false)) reporter.cleanupPreviousSessionFiles()
         restoreSession()
         if (!telegramConfig.enabled) {
@@ -197,10 +205,17 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             TelegramCommand.Pause -> pauseSession()
             TelegramCommand.Resume -> resumeSession()
             TelegramCommand.Stop -> stopSession()
+            TelegramCommand.Restart -> restartSession()
+            TelegramCommand.NextPhase -> nextPhase()
+            TelegramCommand.Settings -> reporter.sendImmediate(settingsText())
+            is TelegramCommand.SetSchedule -> setSchedule(command)
+            is TelegramCommand.SetCountdown -> setCountdown(command.seconds)
+            is TelegramCommand.SetRemaining -> setRemaining(command.seconds)
+            is TelegramCommand.GoToPhase -> goToPhase(command.phase, command.remainingSeconds)
             TelegramCommand.Status -> reporter.sendImmediate(statusText(snapshot()))
             is TelegramCommand.Unknown -> {
                 if (command.input.trim().startsWith('/')) {
-                    reporter.sendImmediate("명령: /start /pause /resume /stop /status /index /b 시간")
+                    reporter.sendImmediate(commandHelp())
                 } else {
                     speakTeacherMessage(command.input)
                 }
@@ -214,20 +229,43 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             reporter.sendImmediate("이미 세션이 진행 중입니다 · ${statusText(session.snapshot())}")
             return@synchronized
         }
-        session = SessionStateMachine()
+        completedProblemCount = 0
+        countdownPaused = false
         val nowElapsed = SystemClock.elapsedRealtime()
-        session.dispatch(StartRequested("tg-${UUID.randomUUID()}", StartOrigin.TEACHER, nowElapsed))
+        session = newSessionMachine()
+        sessionClockOffsetMs = -nowElapsed
+        session.dispatch(
+            StartRequested(
+                "tg-${UUID.randomUUID()}",
+                if (teacherCountdownMs == 0L) StartOrigin.STUDENT else StartOrigin.TEACHER,
+                sessionNow(nowElapsed),
+            ),
+        )
+        session.dispatch(Tick(sessionNow(nowElapsed)))
         sessionActive = true
         preferences.edit().putBoolean(KEY_ACTIVE, true).putLong(KEY_STARTED_EPOCH, System.currentTimeMillis()).commit()
         reporter.startFreshSession(System.currentTimeMillis(), nowElapsed)
         motionAnalyzer.resetBaseline()
         persistSnapshot(session.snapshot())
-        broadcastState("5초 뒤 공부 시작")
+        val started = session.snapshot()
+        reporter.sendImmediate("세션 시작 · ${settingsText(oneLine = true)}")
+        broadcastState(if (started.status == SessionStatus.START_COUNTDOWN) "${teacherCountdownMs / 1_000}초 뒤 시작" else statusText(started))
     }
 
     private fun pauseSession() = synchronized(sessionLock) {
         if (!sessionActive) { reporter.sendImmediate("진행 중인 세션이 없습니다"); return@synchronized }
-        val snapshot = session.dispatch(Pause("tg-${UUID.randomUUID()}", SystemClock.elapsedRealtime()))
+        if (session.snapshot().status == SessionStatus.START_COUNTDOWN) {
+            if (!countdownPaused) {
+                countdownPaused = true
+                countdownPausedAtSessionMs = sessionNow()
+                preferences.edit().putBoolean(KEY_COUNTDOWN_PAUSED, true).commit()
+                persistSnapshot(session.snapshot())
+            }
+            reporter.sendImmediate("시작 대기 일시정지 · ${statusText(session.snapshot())}")
+            broadcastState("시작 대기 일시정지")
+            return@synchronized
+        }
+        val snapshot = session.dispatch(Pause("tg-${UUID.randomUUID()}", sessionNow()))
         persistSnapshot(snapshot)
         reporter.sendImmediate("일시정지 · ${statusText(snapshot)}")
         updateMonitor(snapshot)
@@ -235,7 +273,16 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
 
     private fun resumeSession() = synchronized(sessionLock) {
         if (!sessionActive) { reporter.sendImmediate("진행 중인 세션이 없습니다"); return@synchronized }
-        val snapshot = session.dispatch(Resume("tg-${UUID.randomUUID()}", SystemClock.elapsedRealtime()))
+        if (countdownPaused && session.snapshot().status == SessionStatus.START_COUNTDOWN) {
+            sessionClockOffsetMs = countdownPausedAtSessionMs - SystemClock.elapsedRealtime()
+            countdownPaused = false
+            preferences.edit().putBoolean(KEY_COUNTDOWN_PAUSED, false).commit()
+            persistSnapshot(session.snapshot())
+            reporter.sendImmediate("시작 대기 재개 · ${statusText(session.snapshot())}")
+            broadcastState(statusText(session.snapshot()))
+            return@synchronized
+        }
+        val snapshot = session.dispatch(Resume("tg-${UUID.randomUUID()}", sessionNow()))
         persistSnapshot(snapshot)
         reporter.sendImmediate("공부 재개 · ${statusText(snapshot)}")
         updateMonitor(snapshot)
@@ -245,17 +292,160 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         if (!sessionActive) { reporter.sendImmediate("진행 중인 세션이 없습니다"); return@synchronized }
         val snapshot = session.snapshot()
         sessionActive = false
-        preferences.edit().clear().commit()
+        clearSessionState()
         updateMonitor(snapshot.copy(status = SessionStatus.COMPLETED))
-        reporter.finishSession("세션 종료 · 완료한 문제 ${snapshot.completedProblemCount}개 · 몽타주 대기 ${reporter.pendingUploadCount()}건")
+        reporter.finishSession("세션 종료 · 완료한 문제 ${completedProblemCount}개 · 몽타주 대기 ${reporter.pendingUploadCount()}건")
         broadcastState("세션 종료")
+    }
+
+    private fun restartSession() = synchronized(sessionLock) {
+        if (sessionActive) {
+            reporter.finishSession("선생님 명령으로 현재 회차 종료 · 완료한 문제 ${completedProblemCount}개")
+            sessionActive = false
+            clearSessionState()
+        }
+        startSession()
+    }
+
+    private fun setSchedule(command: TelegramCommand.SetSchedule) = synchronized(sessionLock) {
+        val oldSchedule = schedule
+        schedule = StudySchedule(
+            command.meditationMinutes * 60_000L,
+            command.studyMinutes * 60_000L,
+            command.breakMinutes * 60_000L,
+        )
+        saveTimerSettings()
+        val current = session.snapshot()
+        if (sessionActive && current.status in setOf(SessionStatus.RUNNING, SessionStatus.PAUSED)) {
+            val elapsedInPhase = (phaseDuration(oldSchedule, current.phase) - current.phaseRemainingMs).coerceAtLeast(0L)
+            val newRemaining = (phaseDuration(schedule, current.phase) - elapsedInPhase).coerceAtLeast(0L)
+            positionAt(current.phase, newRemaining, current.status == SessionStatus.PAUSED)
+            val updated = session.snapshot()
+            if (!finishIfCompleted(updated, "시간 단축으로 세션 완료")) {
+                persistSnapshot(updated)
+                updateMonitor(updated)
+                broadcastState(statusText(updated))
+            }
+        } else if (sessionActive && current.status == SessionStatus.START_COUNTDOWN) {
+            rebuildAtProgress((teacherCountdownMs - current.countdownRemainingMs).coerceAtLeast(0L), paused = false)
+            reconcileCountdownPauseAfterRebuild()
+            persistSnapshot(session.snapshot())
+        }
+        reporter.sendImmediate("시간 설정 즉시 적용 · ${settingsText(oneLine = true)}")
+    }
+
+    private fun setCountdown(seconds: Int) = synchronized(sessionLock) {
+        val current = session.snapshot()
+        val oldCountdown = teacherCountdownMs
+        teacherCountdownMs = seconds * 1_000L
+        saveTimerSettings()
+        if (sessionActive && current.status == SessionStatus.START_COUNTDOWN) {
+            val elapsed = (oldCountdown - current.countdownRemainingMs).coerceAtLeast(0L)
+            val remaining = (teacherCountdownMs - elapsed).coerceAtLeast(0L)
+            rebuildAtProgress((teacherCountdownMs - remaining).coerceAtLeast(0L), paused = false)
+            reconcileCountdownPauseAfterRebuild()
+            persistSnapshot(session.snapshot())
+            broadcastState(statusText(session.snapshot()))
+        }
+        reporter.sendImmediate("시작 대기 ${seconds}초 적용 · 0초면 /start 즉시 시작")
+    }
+
+    private fun setRemaining(seconds: Int) = synchronized(sessionLock) {
+        if (!sessionActive) {
+            reporter.sendImmediate("진행 중인 세션이 없습니다 · /start 또는 /restart 후 사용하세요")
+            return@synchronized
+        }
+        val current = session.snapshot()
+        if (current.status == SessionStatus.START_COUNTDOWN) {
+            if (seconds > 60) {
+                reporter.sendImmediate("시작 대기시간은 최대 60초입니다")
+                return@synchronized
+            }
+            teacherCountdownMs = maxOf(teacherCountdownMs, seconds * 1_000L)
+            saveTimerSettings()
+            rebuildAtProgress(teacherCountdownMs - seconds * 1_000L, paused = false)
+            reconcileCountdownPauseAfterRebuild()
+        } else if (current.status in setOf(SessionStatus.RUNNING, SessionStatus.PAUSED)) {
+            ensurePhaseCanHold(current.phase, seconds * 1_000L)
+            positionAt(current.phase, seconds * 1_000L, current.status == SessionStatus.PAUSED)
+        } else {
+            reporter.sendImmediate("현재 상태에서는 남은 시간을 바꿀 수 없습니다")
+            return@synchronized
+        }
+        val updated = session.snapshot()
+        if (finishIfCompleted(updated, "남은 시간 변경으로 세션 완료")) return@synchronized
+        persistSnapshot(updated)
+        updateMonitor(updated)
+        broadcastState(statusText(updated))
+        reporter.sendImmediate("현재 남은 시간 변경 완료 · ${statusText(updated)}")
+    }
+
+    private fun goToPhase(remotePhase: RemoteSessionPhase, remainingSeconds: Int?) = synchronized(sessionLock) {
+        if (!sessionActive) initializeRemoteSession()
+        countdownPaused = false
+        preferences.edit().putBoolean(KEY_COUNTDOWN_PAUSED, false).apply()
+        val phase = when (remotePhase) {
+            RemoteSessionPhase.MEDITATION -> SessionPhase.MEDITATION
+            RemoteSessionPhase.STUDY -> SessionPhase.STUDY
+            RemoteSessionPhase.BREAK -> SessionPhase.BREAK
+        }
+        val requested = remainingSeconds?.times(1_000L) ?: phaseDuration(schedule, phase)
+        ensurePhaseCanHold(phase, requested)
+        positionAt(phase, requested, paused = false)
+        val updated = session.snapshot()
+        if (finishIfCompleted(updated, "단계 이동으로 세션 완료")) return@synchronized
+        persistSnapshot(updated)
+        updateMonitor(updated)
+        broadcastState(statusText(updated))
+        reporter.sendImmediate("단계 이동 완료 · ${statusText(updated)}")
+    }
+
+    private fun nextPhase() = synchronized(sessionLock) {
+        if (!sessionActive) {
+            reporter.sendImmediate("진행 중인 세션이 없습니다")
+            return@synchronized
+        }
+        val current = session.snapshot()
+        if (current.status == SessionStatus.START_COUNTDOWN) {
+            countdownPaused = false
+            preferences.edit().putBoolean(KEY_COUNTDOWN_PAUSED, false).apply()
+            positionAt(SessionPhase.MEDITATION, schedule.meditationDurationMs, paused = false)
+        } else when (current.phase) {
+            SessionPhase.MEDITATION -> positionAt(SessionPhase.STUDY, schedule.studyDurationMs, paused = false)
+            SessionPhase.STUDY -> positionAt(SessionPhase.BREAK, schedule.breakDurationMs, paused = false)
+            SessionPhase.BREAK, SessionPhase.COMPLETE -> {
+                val snapshot = session.snapshot()
+                sessionActive = false
+                clearSessionState()
+                updateMonitor(snapshot.copy(status = SessionStatus.COMPLETED))
+                reporter.finishSession("선생님 명령으로 세션 완료 · 완료한 문제 ${completedProblemCount}개")
+                broadcastState("세션 완료")
+                return@synchronized
+            }
+        }
+        val updated = session.snapshot()
+        persistSnapshot(updated)
+        updateMonitor(updated)
+        broadcastState(statusText(updated))
+        reporter.sendImmediate("다음 단계 · ${statusText(updated)}")
+    }
+
+    private fun finishIfCompleted(snapshot: SessionSnapshot, reason: String): Boolean {
+        if (snapshot.status != SessionStatus.COMPLETED) return false
+        sessionActive = false
+        clearSessionState()
+        updateMonitor(snapshot)
+        reporter.finishSession("$reason · 완료한 문제 ${completedProblemCount}개")
+        broadcastState("세션 완료")
+        return true
     }
 
     private fun tickSession() {
         if (!sessionActive) return
         synchronized(sessionLock) {
+            if (countdownPaused) return@synchronized
             val before = session.snapshot()
-            val current = session.dispatch(Tick(SystemClock.elapsedRealtime()))
+            val current = session.dispatch(Tick(sessionNow()))
             if (current.status != before.status || current.phase != before.phase || current.phaseRemainingMs / 60_000 != before.phaseRemainingMs / 60_000) {
                 persistSnapshot(current)
                 broadcastState(statusText(current))
@@ -263,8 +453,8 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             updateMonitor(current)
             if (current.status == SessionStatus.COMPLETED) {
                 sessionActive = false
-                preferences.edit().clear().commit()
-                reporter.finishSession("세션 완료 · 완료한 문제 ${current.completedProblemCount}개")
+                clearSessionState()
+                reporter.finishSession("세션 완료 · 완료한 문제 ${completedProblemCount}개")
             }
         }
     }
@@ -357,10 +547,12 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
     private fun handleVoiceCommand(command: VoiceCommand) {
         when (command) {
             VoiceCommand.PROBLEM_DONE -> synchronized(sessionLock) {
-                val current = session.dispatch(ProblemCompleted("voice-${UUID.randomUUID()}", SystemClock.elapsedRealtime()))
+                val before = session.snapshot().completedProblemCount
+                val current = session.dispatch(ProblemCompleted("voice-${UUID.randomUUID()}", sessionNow()))
+                if (current.completedProblemCount > before) completedProblemCount += 1
                 persistSnapshot(current)
                 tone.startTone(ToneGenerator.TONE_PROP_ACK, 70)
-                reporter.sendImmediate("✅ 풀었어 · 완료 ${current.completedProblemCount}개")
+                reporter.sendImmediate("✅ 풀었어 · 완료 ${completedProblemCount}개")
                 broadcastState(statusText(current))
             }
             VoiceCommand.DAD_MESSAGE -> tone.startTone(ToneGenerator.TONE_PROP_ACK, 60)
@@ -400,14 +592,15 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
     private fun snapshot(): SessionSnapshot = synchronized(sessionLock) { session.snapshot() }
 
     private fun statusText(snapshot: SessionSnapshot): String {
-        val phase = when (snapshot.phase) {
+        val phase = if (snapshot.status == SessionStatus.START_COUNTDOWN) "시작 대기" else when (snapshot.phase) {
             io.remotestudy.domain.session.SessionPhase.MEDITATION -> "명상"
             io.remotestudy.domain.session.SessionPhase.STUDY -> "공부"
             io.remotestudy.domain.session.SessionPhase.BREAK -> "휴식"
             io.remotestudy.domain.session.SessionPhase.COMPLETE -> "완료"
         }
         val seconds = if (snapshot.status == SessionStatus.START_COUNTDOWN) snapshot.countdownRemainingMs / 1_000 else snapshot.phaseRemainingMs / 1_000
-        return "$phase · %02d:%02d · 완료 ${snapshot.completedProblemCount}개".format(seconds / 60, seconds % 60)
+        val paused = if (countdownPaused && snapshot.status == SessionStatus.START_COUNTDOWN) " · 일시정지" else ""
+        return "$phase · %02d:%02d$paused · 완료 ${completedProblemCount}개".format(seconds / 60, seconds % 60)
     }
 
     private fun persistSnapshot(snapshot: SessionSnapshot) {
@@ -418,9 +611,142 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             .putString(KEY_PHASE, snapshot.phase.name)
             .putLong(KEY_PHASE_REMAINING, snapshot.phaseRemainingMs)
             .putLong(KEY_COUNTDOWN_REMAINING, snapshot.countdownRemainingMs)
-            .putInt(KEY_PROBLEMS, snapshot.completedProblemCount)
+            .putInt(KEY_PROBLEMS, completedProblemCount)
             .commit()
     }
+
+    private fun initializeRemoteSession() {
+        val nowElapsed = SystemClock.elapsedRealtime()
+        completedProblemCount = 0
+        countdownPaused = false
+        sessionActive = true
+        preferences.edit()
+            .putBoolean(KEY_ACTIVE, true)
+            .putLong(KEY_STARTED_EPOCH, System.currentTimeMillis())
+            .commit()
+        reporter.startFreshSession(System.currentTimeMillis(), nowElapsed)
+        motionAnalyzer.resetBaseline()
+    }
+
+    private fun positionAt(phase: SessionPhase, remainingMs: Long, paused: Boolean) {
+        rebuildAtProgress(
+            RemoteTimerMath.progressForPosition(schedule, teacherCountdownMs, phase, remainingMs),
+            paused,
+        )
+    }
+
+    private fun rebuildAtProgress(progressMs: Long, paused: Boolean) {
+        val actualNow = SystemClock.elapsedRealtime()
+        val maximum = teacherCountdownMs + totalPhaseDurationMs()
+        val target = progressMs.coerceIn(0L, maximum)
+        session = newSessionMachine()
+        sessionClockOffsetMs = -actualNow
+        session.dispatch(
+            StartRequested(
+                "position-${UUID.randomUUID()}",
+                if (teacherCountdownMs == 0L) StartOrigin.STUDENT else StartOrigin.TEACHER,
+                0L,
+            ),
+        )
+        session.dispatch(Tick(target))
+        sessionClockOffsetMs = target - actualNow
+        if (paused && session.snapshot().status == SessionStatus.RUNNING) {
+            session.dispatch(Pause("position-pause-${UUID.randomUUID()}", target))
+        }
+    }
+
+    private fun reconcileCountdownPauseAfterRebuild() {
+        if (!countdownPaused) return
+        if (session.snapshot().status == SessionStatus.START_COUNTDOWN) {
+            countdownPausedAtSessionMs = sessionNow()
+        } else {
+            countdownPaused = false
+            preferences.edit().putBoolean(KEY_COUNTDOWN_PAUSED, false).commit()
+        }
+    }
+
+    private fun newSessionMachine() = SessionStateMachine(
+        schedule = schedule,
+        teacherCountdownDurationMs = teacherCountdownMs.coerceAtLeast(1L),
+    )
+
+    private fun sessionNow(actualElapsedMs: Long = SystemClock.elapsedRealtime()): Long =
+        (actualElapsedMs + sessionClockOffsetMs).coerceAtLeast(0L)
+
+    private fun phaseDuration(value: StudySchedule, phase: SessionPhase): Long =
+        RemoteTimerMath.phaseDuration(value, phase)
+
+    private fun totalPhaseDurationMs(): Long =
+        RemoteTimerMath.totalPhaseDuration(schedule)
+
+    private fun ensurePhaseCanHold(phase: SessionPhase, remainingMs: Long) {
+        schedule = when (phase) {
+            SessionPhase.MEDITATION -> if (remainingMs > schedule.meditationDurationMs) {
+                schedule.copy(meditationDurationMs = remainingMs)
+            } else schedule
+            SessionPhase.STUDY -> if (remainingMs > schedule.studyDurationMs) {
+                schedule.copy(studyDurationMs = remainingMs)
+            } else schedule
+            SessionPhase.BREAK -> if (remainingMs > schedule.breakDurationMs) {
+                schedule.copy(breakDurationMs = remainingMs.coerceAtLeast(1L))
+            } else schedule
+            SessionPhase.COMPLETE -> schedule
+        }
+        saveTimerSettings()
+    }
+
+    private fun loadTimerSettings() {
+        val meditation = preferences.getLong(KEY_MEDITATION_DURATION, StudySchedule.DEFAULT_MEDITATION_DURATION_MS)
+        val study = preferences.getLong(KEY_STUDY_DURATION, StudySchedule.DEFAULT_STUDY_DURATION_MS)
+        val rest = preferences.getLong(KEY_BREAK_DURATION, StudySchedule.DEFAULT_BREAK_DURATION_MS)
+        schedule = runCatching { StudySchedule(meditation, study, rest) }.getOrDefault(StudySchedule())
+        teacherCountdownMs = preferences.getLong(KEY_TEACHER_COUNTDOWN, DEFAULT_TEACHER_COUNTDOWN_MS)
+            .coerceIn(0L, 60_000L)
+    }
+
+    private fun saveTimerSettings() {
+        preferences.edit()
+            .putLong(KEY_MEDITATION_DURATION, schedule.meditationDurationMs)
+            .putLong(KEY_STUDY_DURATION, schedule.studyDurationMs)
+            .putLong(KEY_BREAK_DURATION, schedule.breakDurationMs)
+            .putLong(KEY_TEACHER_COUNTDOWN, teacherCountdownMs)
+            .commit()
+    }
+
+    private fun clearSessionState() {
+        preferences.edit()
+            .putBoolean(KEY_ACTIVE, false)
+            .remove(KEY_STARTED_EPOCH)
+            .remove(KEY_SAVED_EPOCH)
+            .remove(KEY_STATUS)
+            .remove(KEY_PHASE)
+            .remove(KEY_PHASE_REMAINING)
+            .remove(KEY_COUNTDOWN_REMAINING)
+            .remove(KEY_PROBLEMS)
+            .remove(KEY_COUNTDOWN_PAUSED)
+            .commit()
+    }
+
+    private fun settingsText(oneLine: Boolean = false): String {
+        val separator = if (oneLine) " · " else "\n"
+        return listOf(
+            "명상 ${schedule.meditationDurationMs / 60_000}분",
+            "공부 ${schedule.studyDurationMs / 60_000}분",
+            "휴식 ${schedule.breakDurationMs / 60_000}분",
+            "시작 대기 ${teacherCountdownMs / 1_000}초",
+        ).joinToString(separator)
+    }
+
+    private fun commandHelp(): String =
+        "명령\n" +
+            "/settings 현재 설정\n" +
+            "/set 0 40 15 명상·공부·휴식(분)\n" +
+            "/set countdown 5 시작 대기(초)\n" +
+            "/start /restart /pause /resume /stop\n" +
+            "/time 25:30 현재 남은 시간\n" +
+            "/phase meditation|study|break [분 또는 분:초]\n" +
+            "/next 다음 단계\n" +
+            "/status /index /b 시간"
 
     private fun restoreSession() {
         if (!preferences.getBoolean(KEY_ACTIVE, false)) return
@@ -439,27 +765,20 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         )
         val countdownRemaining = preferences.getLong(KEY_COUNTDOWN_REMAINING, 0L)
         val progressAtSave = sessionProgressMs(savedStatus, savedPhase, phaseRemaining, countdownRemaining)
-        val runningAfterSave = if (savedStatus in setOf(SessionStatus.RUNNING, SessionStatus.START_COUNTDOWN)) {
+        countdownPaused = preferences.getBoolean(KEY_COUNTDOWN_PAUSED, false) &&
+            savedStatus == SessionStatus.START_COUNTDOWN
+        val runningAfterSave = if (
+            savedStatus in setOf(SessionStatus.RUNNING, SessionStatus.START_COUNTDOWN) && !countdownPaused
+        ) {
             (System.currentTimeMillis() - savedEpoch).coerceAtLeast(0L)
         } else 0L
-        val totalProgress = (progressAtSave + runningAfterSave).coerceAtMost(TOTAL_SESSION_WITH_COUNTDOWN_MS)
-        val nowElapsed = SystemClock.elapsedRealtime()
-        val syntheticStart = (nowElapsed - totalProgress).coerceAtLeast(0L)
-        session = SessionStateMachine()
-        session.dispatch(StartRequested("restore", StartOrigin.TEACHER, syntheticStart))
-        val problemCount = preferences.getInt(KEY_PROBLEMS, 0)
-        if (problemCount > 0 && totalProgress > STUDY_START_PROGRESS_MS) {
-            val problemTime = (syntheticStart + STUDY_START_PROGRESS_MS + 1L).coerceAtMost(nowElapsed)
-            session.dispatch(Tick(problemTime))
-            repeat(problemCount) {
-                session.dispatch(ProblemCompleted("restore-$it", problemTime))
-            }
-        }
-        session.dispatch(Tick(nowElapsed))
-        if (savedStatus == SessionStatus.PAUSED && session.snapshot().status == SessionStatus.RUNNING) {
-            session.dispatch(Pause("restore-pause", nowElapsed))
-        }
+        val totalProgress = (progressAtSave + runningAfterSave)
+            .coerceAtMost(teacherCountdownMs + totalPhaseDurationMs())
+        completedProblemCount = preferences.getInt(KEY_PROBLEMS, 0).coerceAtLeast(0)
+        rebuildAtProgress(totalProgress, savedStatus == SessionStatus.PAUSED)
+        reconcileCountdownPauseAfterRebuild()
         sessionActive = session.snapshot().status != SessionStatus.COMPLETED
+        if (!sessionActive) clearSessionState()
         updateMonitor(session.snapshot())
     }
 
@@ -468,20 +787,14 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         phase: SessionPhase,
         phaseRemainingMs: Long,
         countdownRemainingMs: Long,
-    ): Long = when (status) {
-        SessionStatus.READY -> 0L
-        SessionStatus.START_COUNTDOWN -> TEACHER_COUNTDOWN_MS - countdownRemainingMs
-        SessionStatus.RUNNING, SessionStatus.PAUSED -> TEACHER_COUNTDOWN_MS + when (phase) {
-            SessionPhase.MEDITATION -> StudySchedule.DEFAULT_MEDITATION_DURATION_MS - phaseRemainingMs
-            SessionPhase.STUDY -> StudySchedule.DEFAULT_MEDITATION_DURATION_MS +
-                StudySchedule.DEFAULT_STUDY_DURATION_MS - phaseRemainingMs
-            SessionPhase.BREAK -> StudySchedule.DEFAULT_MEDITATION_DURATION_MS +
-                StudySchedule.DEFAULT_STUDY_DURATION_MS +
-                StudySchedule.DEFAULT_BREAK_DURATION_MS - phaseRemainingMs
-            SessionPhase.COMPLETE -> TOTAL_STUDY_PHASES_MS
-        }
-        SessionStatus.COMPLETED -> TOTAL_SESSION_WITH_COUNTDOWN_MS
-    }.coerceIn(0L, TOTAL_SESSION_WITH_COUNTDOWN_MS)
+    ): Long = RemoteTimerMath.progressForSnapshot(
+        schedule,
+        teacherCountdownMs,
+        status,
+        phase,
+        phaseRemainingMs,
+        countdownRemainingMs,
+    )
 
     private fun loadBookRegion(): NormalizedBookRegion = NormalizedBookRegion(
         preferences.getFloat(KEY_REGION_LEFT, NormalizedBookRegion.DEFAULT.left),
@@ -611,10 +924,11 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         private const val KEY_REGION_TOP = "region_top"
         private const val KEY_REGION_RIGHT = "region_right"
         private const val KEY_REGION_BOTTOM = "region_bottom"
-        private const val TEACHER_COUNTDOWN_MS = 5_000L
-        private const val STUDY_START_PROGRESS_MS = TEACHER_COUNTDOWN_MS + StudySchedule.DEFAULT_MEDITATION_DURATION_MS
-        private const val TOTAL_STUDY_PHASES_MS = StudySchedule.DEFAULT_MEDITATION_DURATION_MS +
-            StudySchedule.DEFAULT_STUDY_DURATION_MS + StudySchedule.DEFAULT_BREAK_DURATION_MS
-        private const val TOTAL_SESSION_WITH_COUNTDOWN_MS = TEACHER_COUNTDOWN_MS + TOTAL_STUDY_PHASES_MS
+        private const val KEY_MEDITATION_DURATION = "meditation_duration"
+        private const val KEY_STUDY_DURATION = "study_duration"
+        private const val KEY_BREAK_DURATION = "break_duration"
+        private const val KEY_TEACHER_COUNTDOWN = "teacher_countdown"
+        private const val KEY_COUNTDOWN_PAUSED = "countdown_paused"
+        private const val DEFAULT_TEACHER_COUNTDOWN_MS = 5_000L
     }
 }

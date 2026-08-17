@@ -23,8 +23,8 @@ android {
         applicationId = "io.remotestudy.student"
         minSdk = 26
         targetSdk = 35
-        versionCode = 15
-        versionName = "0.12.0"
+        versionCode = 16
+        versionName = "0.13.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "TELEGRAM_BOT_TOKEN", "\"${buildConfigString("TELEGRAM_BOT_TOKEN")}\"")
         buildConfigField("long", "TELEGRAM_CHAT_ID", (localProperties.getProperty("TELEGRAM_CHAT_ID")?.toLongOrNull() ?: 0L).toString() + "L")
@@ -51,6 +51,7 @@ dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.camera:camera-camera2:1.5.3")
     implementation("androidx.camera:camera-lifecycle:1.5.3")
+    testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test:core:1.6.1")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")

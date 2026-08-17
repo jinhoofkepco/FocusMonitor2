@@ -24,11 +24,24 @@ sealed interface TelegramCommand {
     data object Pause : TelegramCommand
     data object Resume : TelegramCommand
     data object Stop : TelegramCommand
+    data object Restart : TelegramCommand
+    data object NextPhase : TelegramCommand
+    data object Settings : TelegramCommand
     data object Index : TelegramCommand
     data object Status : TelegramCommand
+    data class SetSchedule(
+        val meditationMinutes: Int,
+        val studyMinutes: Int,
+        val breakMinutes: Int,
+    ) : TelegramCommand
+    data class SetCountdown(val seconds: Int) : TelegramCommand
+    data class SetRemaining(val seconds: Int) : TelegramCommand
+    data class GoToPhase(val phase: RemoteSessionPhase, val remainingSeconds: Int?) : TelegramCommand
     data class Book(val selection: BookSelection) : TelegramCommand
     data class Unknown(val input: String) : TelegramCommand
 }
+
+enum class RemoteSessionPhase { MEDITATION, STUDY, BREAK }
 
 sealed interface BookSelection {
     data class Minute(val hour: Int, val minute: Int) : BookSelection
