@@ -13,11 +13,17 @@
 - 자리 이탈·복귀·책 움직임 없음·움직임 재개·`풀었어`·학생 음성 인식 메시지는 몽타주를 기다리지 않고 즉시 텍스트 큐에 들어갑니다.
 - 일반 텔레그램 텍스트는 학생폰에서 확인음 뒤 한국어 TTS로 읽습니다. `/`로 시작하는 알 수 없는 입력에는 명령 도움말을 보냅니다.
 
-## 텔레그램 설정
+## 텔레그램 설정 — 학생폰만으로 가능
 
-1. 텔레그램 `@BotFather`에서 개인 봇을 만들고 토큰을 받습니다.
-2. 선생님 계정에서 그 봇에게 메시지를 한 번 보낸 뒤 Bot API `getUpdates` 결과의 `message.chat.id`를 확인합니다.
-3. 커밋되지 않는 루트 `local.properties`에 다음을 추가합니다.
+1. 텔레그램 `@BotFather`에서 개인 봇을 만들고 토큰을 복사합니다.
+2. 선생님 계정에서 새 봇을 열어 `/연결` 또는 `/connect`를 보냅니다.
+3. 학생 앱 첫 화면에 BotFather 토큰을 붙여넣고 `내 텔레그램 채팅 찾기`를 누릅니다.
+4. 앱이 표시한 텔레그램 이름·username·chat ID를 확인하고 `연결`을 누릅니다.
+5. 텔레그램에서 `학생폰 연결 완료` 메시지를 확인합니다. 이후 `/start`로 공부를 시작합니다.
+
+토큰은 Android Keystore에서 생성한 AES-GCM 키로 암호화되어 학생폰에만 저장됩니다. 설정 화면은 `/연결`을 보낸 개인 채팅 후보를 보여주기만 하며 명령을 실행하지 않습니다. 사용자가 이름과 ID를 승인한 뒤부터 해당 `chat_id` 화이트리스트가 적용됩니다. 학생 화면의 `텔레그램 연결 초기화`는 암호화 토큰과 기존 봇의 미전송 큐를 함께 삭제합니다.
+
+개발용으로는 커밋되지 않는 루트 `local.properties`에 미리 넣어 빌드할 수도 있습니다.
 
 ```properties
 sdk.dir=/absolute/path/to/Android/sdk
@@ -25,11 +31,11 @@ TELEGRAM_BOT_TOKEN=replace_with_real_token
 TELEGRAM_CHAT_ID=123456789
 ```
 
-형식은 `local.properties.example`에도 있습니다. 토큰과 chat ID가 비어 있으면 APK는 실행되지만 학생 화면에 “텔레그램 설정 필요”만 표시하고 카메라 세션을 시작하지 않습니다.
+형식은 `local.properties.example`에도 있습니다. 런타임에 저장된 설정이 BuildConfig보다 우선합니다. 둘 다 비어 있으면 APK는 권한이나 촬영 서비스를 시작하지 않고 텔레그램 연결 화면만 표시합니다.
 
 `chat_id`가 다른 update는 명령 파싱 전에 버립니다. 앱은 시작할 때 기존 webhook을 해제한 뒤 `getUpdates(timeout=50)` 롱폴링을 하나만 실행하고, 각 명령 결과가 디스크 큐에 기록된 뒤에만 offset을 원자적으로 저장합니다.
 
-> 봇 토큰은 BuildConfig를 통해 APK 안에 들어갑니다. 공개 APK에서는 토큰을 추출할 수 있으므로 이 프로젝트의 전제처럼 개인용·제한된 배포에서만 사용하고, APK가 노출되면 BotFather에서 토큰을 즉시 재발급해야 합니다. chat ID 화이트리스트는 다른 채팅의 명령 실행을 막지만 유출된 토큰 자체를 보호하지는 않습니다.
+> `local.properties`로 미리 넣은 봇 토큰은 BuildConfig를 통해 APK 안에 들어가므로 공개 APK에 사용하지 마세요. GitHub 배포 APK는 토큰 없이 만들고 학생폰 최초 실행 설정을 사용합니다. chat ID 화이트리스트는 다른 채팅의 명령 실행을 막지만 유출된 토큰 자체를 보호하지는 않습니다.
 
 ## 모듈 경계
 
@@ -70,6 +76,12 @@ TELEGRAM_CHAT_ID=123456789
   :telegram-report:lintDebug
 ```
 
+Android 기기나 emulator가 연결돼 있으면 Keystore 암호화 저장·복호화·초기화 시험도 실행합니다.
+
+```bash
+./gradlew --no-daemon :app-student:connectedDebugAndroidTest
+```
+
 학생 APK는 `app-student/build/outputs/apk/debug/app-student-debug.apk`입니다. 선생님 APK는 더 이상 만들지 않습니다.
 
 ## 실기기 완료 시험
@@ -83,3 +95,12 @@ TELEGRAM_CHAT_ID=123456789
 5. 40분 동안 `adb logcat -s RemoteStudyService`를 저장하고 `camera_stall` 0회 및 `thermal_status` 추이를 확인.
 
 현재 자동 검증은 Telegram parser/JSONL 재시작·ACK/backoff 단위 테스트, 학생 APK assemble, 학생/Telegram 모듈 lint 오류 0까지 포함합니다. 실제 Bot API 왕복과 40분 발열·카메라 스톨은 비밀값과 실기기가 없으면 자동 검증할 수 없습니다.
+
+## 이전 선생 앱과 달라진 점
+
+- 일반 텔레그램 텍스트는 학생폰에서 짧은 확인음 뒤 한국어 TTS로 즉시 읽습니다.
+- `풀었어/벌써`와 `아빠` 다음 발화는 텔레그램 텍스트 메시지로 즉시 전송됩니다.
+- 대화 기록과 새 메시지 알림은 별도 선생 앱 대신 텔레그램 채팅과 텔레그램 알림이 담당합니다.
+- 현재 Telegram 버전은 학생의 실제 녹음 음성파일 전송과 선생님의 Telegram 음성메시지 자동재생을 지원하지 않습니다.
+- 시간은 기본 명상 5분·공부 40분·휴식 15분, 촬영 10초로 고정되어 있습니다. 원격 수치 설정 명령은 아직 없습니다.
+- 책 영역은 학생 화면의 최신 전체 사진에서 조절합니다. Telegram 안에서 영역을 편집하는 UI는 없습니다.

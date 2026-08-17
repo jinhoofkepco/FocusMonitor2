@@ -122,9 +122,14 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
                 })
             }
         }
+        val storedCredentials = TelegramCredentialStore(this).load()
+        val telegramConfig = TelegramConfig(
+            botToken = storedCredentials?.botToken ?: BuildConfig.TELEGRAM_BOT_TOKEN,
+            allowedChatId = storedCredentials?.chatId ?: BuildConfig.TELEGRAM_CHAT_ID,
+        )
         reporter = TelegramReporter(
             rootDirectory = File(filesDir, "telegram-report"),
-            config = TelegramConfig(BuildConfig.TELEGRAM_BOT_TOKEN, BuildConfig.TELEGRAM_CHAT_ID),
+            config = telegramConfig,
             commandHandler = this,
         )
         motionAnalyzer = MotionAnalyzer(
@@ -158,8 +163,8 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         reporter.updateBookRegion(loadBookRegion())
         if (!preferences.getBoolean(KEY_ACTIVE, false)) reporter.cleanupPreviousSessionFiles()
         restoreSession()
-        if (BuildConfig.TELEGRAM_BOT_TOKEN.isBlank() || BuildConfig.TELEGRAM_CHAT_ID == 0L) {
-            broadcastState("텔레그램 설정 필요 · local.properties 확인")
+        if (!telegramConfig.enabled) {
+            broadcastState("텔레그램 설정 필요 · 학생 앱에서 연결하세요")
         } else {
             reporter.start()
             bindCamera()

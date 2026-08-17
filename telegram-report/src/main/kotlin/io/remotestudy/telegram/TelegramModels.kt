@@ -40,6 +40,13 @@ sealed interface BookSelection {
 data class TelegramUpdate(val updateId: Long, val chatId: Long?, val text: String?)
 data class TelegramApiResult(val messageId: Long? = null)
 
+data class TelegramSetupChat(
+    val updateId: Long,
+    val chatId: Long,
+    val displayName: String,
+    val username: String?,
+)
+
 data class ArchivedOriginal(val capturedAtEpochMs: Long, val file: File)
 
 data class NormalizedBookRegion(
