@@ -22,6 +22,8 @@ class TelegramCommandParser {
             text == "/menu" || text == "/help" -> TelegramCommand.Menu
             text == "/area" -> TelegramCommand.ShowAreaGrid
             text.startsWith("/area ") -> parseArea(text.removePrefix("/area ").trim())
+            text == "/rotate" -> TelegramCommand.ShowBookRotation
+            text.startsWith("/rotate ") -> parseRotation(text.removePrefix("/rotate ").trim())
             text.startsWith("/set ") -> parseSetting(text.removePrefix("/set ").trim())
             text.startsWith("/time ") -> parseRemaining(text.removePrefix("/time ").trim())
             text.startsWith("/phase ") -> parsePhase(text.removePrefix("/phase ").trim())
@@ -46,12 +48,26 @@ class TelegramCommandParser {
     }
 
     private fun parseArea(argument: String): TelegramCommand {
-        val match = AREA.matchEntire(argument.uppercase())
+        val normalized = argument.uppercase().replace(Regex("\\s+"), " ").trim()
+        val compact = AREA_COMPACT.matchEntire(normalized)
+        val legacy = AREA_LEGACY.matchEntire(normalized)
+        val left = compact?.groupValues?.get(1)?.get(0) ?: legacy?.groupValues?.get(1)?.get(0)
             ?: return TelegramCommand.Unknown("/area $argument")
-        val leftCell = match.groupValues[1][0] - 'A'
-        val topCell = match.groupValues[2].toInt() - 1
-        val rightCell = match.groupValues[3][0] - 'A'
-        val bottomCell = match.groupValues[4].toInt() - 1
+        val right = compact?.groupValues?.get(1)?.get(1) ?: legacy?.groupValues?.get(3)?.get(0)
+            ?: return TelegramCommand.Unknown("/area $argument")
+        val packedRows = compact?.groupValues?.get(2)?.takeIf(String::isNotBlank)
+        val topText = packedRows?.substring(0, 1)
+            ?: compact?.groupValues?.get(3)?.takeIf(String::isNotBlank)
+            ?: legacy?.groupValues?.get(2)
+            ?: return TelegramCommand.Unknown("/area $argument")
+        val bottomText = packedRows?.substring(1, 2)
+            ?: compact?.groupValues?.get(4)?.takeIf(String::isNotBlank)
+            ?: legacy?.groupValues?.get(4)
+            ?: return TelegramCommand.Unknown("/area $argument")
+        val leftCell = left - 'A'
+        val topCell = topText.toInt() - 1
+        val rightCell = right - 'A'
+        val bottomCell = bottomText.toInt() - 1
         if (leftCell !in 0..9 || rightCell !in 0..9 || topCell !in 0..9 || bottomCell !in 0..9) {
             return TelegramCommand.Unknown("/area $argument")
         }
@@ -63,9 +79,14 @@ class TelegramCommandParser {
                 right = (rightCell + 1) / 10f,
                 bottom = (bottomCell + 1) / 10f,
             ),
-            "${match.groupValues[1]}${match.groupValues[2]}–${match.groupValues[3]}${match.groupValues[4]}",
+            "$left${topCell + 1}–$right${bottomCell + 1}",
         )
     }
+
+    private fun parseRotation(argument: String): TelegramCommand =
+        argument.toIntOrNull()?.takeIf { it in setOf(0, 90, 180, 270) }
+            ?.let { TelegramCommand.SetBookRotation(it) }
+            ?: TelegramCommand.Unknown("/rotate $argument")
 
     private fun parseRemaining(argument: String): TelegramCommand {
         parseDurationSeconds(argument, maxMinutes = 480)?.let { return TelegramCommand.SetRemaining(it) }
@@ -130,6 +151,8 @@ class TelegramCommandParser {
         val EXACT = Regex("^(\\d{1,2}):(\\d{2}):(\\d{2})$")
         val RANGE = Regex("^(\\d{1,2}):(\\d{2})-(\\d{1,2}):(\\d{2})$")
         val RECENT = Regex("^-(\\d+)$")
-        val AREA = Regex("^([A-J])(10|[1-9])\\s+([A-J])(10|[1-9])$")
+        // Preferred: /area IJ 56. Rows involving 10 use a separator: /area IJ 5-10.
+        val AREA_COMPACT = Regex("^([A-J]{2})\\s+(?:([1-9]{2})|(10|[1-9])-(10|[1-9]))$")
+        val AREA_LEGACY = Regex("^([A-J])(10|[1-9])\\s+([A-J])(10|[1-9])$")
     }
 }

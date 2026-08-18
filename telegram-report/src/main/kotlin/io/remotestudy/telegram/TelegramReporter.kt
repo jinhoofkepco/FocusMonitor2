@@ -140,7 +140,7 @@ class TelegramReporter(
         queue.enqueue(
             UploadKind.PHOTO,
             grid,
-            "책을 포함할 왼쪽 위 칸과 오른쪽 아래 칸을 보내세요.\n예: /area B2 H8",
+            "책 범위의 왼쪽·오른쪽 열과 위·아래 행을 보내세요.\n예: /area IJ 56\n10행 포함 예: /area IJ 5-10",
             now(),
         )
         wakeUploader()
@@ -153,7 +153,12 @@ class TelegramReporter(
             sendImmediate("미리 볼 사진이 없습니다. 새 사진이 촬영된 뒤 다시 시도해주세요.")
             return
         }
-        val preview = AreaGridRenderer.createCropPreview(source.file, command.region, detailDir)
+        val preview = AreaGridRenderer.createCropPreview(
+            source.file,
+            command.region,
+            detailDir,
+            loadBookRotation(),
+        )
         queue.enqueue(
             UploadKind.PHOTO,
             preview,
@@ -162,6 +167,16 @@ class TelegramReporter(
             replyMarkup = areaConfirmation(command.region),
         )
         wakeUploader()
+    }
+
+    fun sendRotationMenu() = sendImmediate(
+        "책 상세사진 회전 · 현재 ${loadBookRotation()}°\n전체 썸네일과 격자 사진은 회전하지 않습니다.",
+        ROTATION_MENU,
+    )
+
+    fun updateBookRotation(degrees: Int) {
+        require(degrees in setOf(0, 90, 180, 270))
+        rootDirectory.resolve("book-rotation.txt").writeText(degrees.toString())
     }
 
     fun sendIndex() {
@@ -193,7 +208,7 @@ class TelegramReporter(
         }
         val region = loadBookRegion()
         limited.forEach { archived ->
-            val detail = archive.createBookCrop(archived, region, detailDir)
+            val detail = archive.createBookCrop(archived, region, detailDir, loadBookRotation())
             // Detail is always DOCUMENT by type; this path cannot call sendPhoto.
             queue.enqueue(UploadKind.DOCUMENT, detail, "책 영역 · ${formatTime(archived.capturedAtEpochMs)}", now())
         }
@@ -308,6 +323,7 @@ class TelegramReporter(
                             TelegramCommand.Menu -> sendControlMenu()
                             TelegramCommand.ShowAreaGrid -> sendAreaGrid()
                             is TelegramCommand.PreviewBookRegion -> sendAreaPreview(command)
+                            TelegramCommand.ShowBookRotation -> sendRotationMenu()
                             TelegramCommand.Index -> sendIndex()
                             is TelegramCommand.Book -> sendBookDetails(command.selection)
                             else -> commandHandler.handle(command)
@@ -337,7 +353,7 @@ class TelegramReporter(
                 runCatching { api.answerCallbackQuery(callbackId, "원본이 삭제됐습니다") }
                 return
             }
-            val detail = archive.createBookCrop(source, loadBookRegion(), detailDir)
+            val detail = archive.createBookCrop(source, loadBookRegion(), detailDir, loadBookRotation())
             queue.enqueue(UploadKind.DOCUMENT, detail, "책 영역 · ${formatTime(source.capturedAtEpochMs)}", now())
             wakeUploader()
             runCatching { api.answerCallbackQuery(callbackId, "${formatTime(source.capturedAtEpochMs)} 책 사진 전송 중") }
@@ -371,6 +387,15 @@ class TelegramReporter(
                 runCatching { api.answerCallbackQuery(callbackId, "10×10 격자를 보냈습니다") }
                 return
             }
+            "cmd:rotate" -> {
+                sendRotationMenu()
+                runCatching { api.answerCallbackQuery(callbackId, "회전 메뉴를 열었습니다") }
+                return
+            }
+            "rotate:0" -> TelegramCommand.SetBookRotation(0)
+            "rotate:90" -> TelegramCommand.SetBookRotation(90)
+            "rotate:180" -> TelegramCommand.SetBookRotation(180)
+            "rotate:270" -> TelegramCommand.SetBookRotation(270)
             "cmd:stop" -> return sendCallbackMenu(callbackId, "공부를 종료할까요?", CONFIRM_STOP_MENU)
             "cmd:restart" -> return sendCallbackMenu(callbackId, "현재 진행을 버리고 처음부터 다시 시작할까요?", CONFIRM_RESTART_MENU)
             "confirm:stop" -> TelegramCommand.Stop
@@ -445,6 +470,10 @@ class TelegramReporter(
         val values = rootDirectory.resolve("book-region.txt").readText().split(',').map(String::toFloat)
         NormalizedBookRegion(values[0], values[1], values[2], values[3])
     }.getOrDefault(NormalizedBookRegion.DEFAULT)
+
+    private fun loadBookRotation(): Int = rootDirectory.resolve("book-rotation.txt")
+        .takeIf(File::isFile)?.readText()?.trim()?.toIntOrNull()
+        ?.takeIf { it in setOf(0, 90, 180, 270) } ?: DEFAULT_BOOK_ROTATION
 
     private fun loadOffset() = rootDirectory.resolve("update-offset.txt").takeIf(File::isFile)
         ?.readText()?.trim()?.toLongOrNull() ?: 0L
@@ -532,7 +561,9 @@ class TelegramReporter(
         val PHOTO_SEQUENCE = Regex("^#(\\d+)")
         val BOOK_BUTTON = Regex("^book:(\\d{1,19})$")
         val AREA_SET_BUTTON = Regex("^area:set:(\\d{1,3}):(\\d{1,3}):(\\d{1,3}):(\\d{1,3})$")
-        const val CONTROL_MENU = """{"inline_keyboard":[[{"text":"▶ 시작","callback_data":"cmd:start"},{"text":"⏸ 일시정지","callback_data":"cmd:pause"},{"text":"▶ 계속","callback_data":"cmd:resume"}],[{"text":"⏭ 다음 단계","callback_data":"cmd:next"},{"text":"⏹ 종료","callback_data":"cmd:stop"},{"text":"🔄 처음부터","callback_data":"cmd:restart"}],[{"text":"📊 현재 상태","callback_data":"cmd:status"},{"text":"📷 최근 5분","callback_data":"cmd:recent"},{"text":"🎯 초점","callback_data":"cmd:focus"}],[{"text":"📐 책 영역 설정","callback_data":"cmd:area"}],[{"text":"⏱ 시간 설정","callback_data":"menu:time"},{"text":"🖼 사진 목록","callback_data":"cmd:index"},{"text":"⚙ 현재 설정","callback_data":"cmd:settings"}]]}"""
+        const val CONTROL_MENU = """{"inline_keyboard":[[{"text":"▶ 시작","callback_data":"cmd:start"},{"text":"⏸ 일시정지","callback_data":"cmd:pause"},{"text":"▶ 계속","callback_data":"cmd:resume"}],[{"text":"⏭ 다음 단계","callback_data":"cmd:next"},{"text":"⏹ 종료","callback_data":"cmd:stop"},{"text":"🔄 처음부터","callback_data":"cmd:restart"}],[{"text":"📊 현재 상태","callback_data":"cmd:status"},{"text":"📷 최근 5분","callback_data":"cmd:recent"},{"text":"🎯 초점","callback_data":"cmd:focus"}],[{"text":"📐 책 영역 설정","callback_data":"cmd:area"},{"text":"🔃 책 회전","callback_data":"cmd:rotate"}],[{"text":"⏱ 시간 설정","callback_data":"menu:time"},{"text":"🖼 사진 목록","callback_data":"cmd:index"},{"text":"⚙ 현재 설정","callback_data":"cmd:settings"}]]}"""
+        const val ROTATION_MENU = """{"inline_keyboard":[[{"text":"0°","callback_data":"rotate:0"},{"text":"90°","callback_data":"rotate:90"},{"text":"180°","callback_data":"rotate:180"},{"text":"270°","callback_data":"rotate:270"}],[{"text":"‹ 기본 메뉴","callback_data":"menu:main"}]]}"""
+        const val DEFAULT_BOOK_ROTATION = 180
         const val TIME_MENU = """{"inline_keyboard":[[{"text":"0·40·15","callback_data":"set:0:40:15"},{"text":"5·40·15","callback_data":"set:5:40:15"},{"text":"5·50·10","callback_data":"set:5:50:10"}],[{"text":"‹ 기본 메뉴","callback_data":"menu:main"}]]}"""
         const val CONFIRM_STOP_MENU = """{"inline_keyboard":[[{"text":"종료","callback_data":"confirm:stop"},{"text":"취소","callback_data":"menu:main"}]]}"""
         const val CONFIRM_RESTART_MENU = """{"inline_keyboard":[[{"text":"처음부터 시작","callback_data":"confirm:restart"},{"text":"취소","callback_data":"menu:main"}]]}"""

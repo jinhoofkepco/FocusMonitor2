@@ -48,6 +48,17 @@ class OriginalArchiveInstrumentedTest {
             assertEquals(book.length(), detail.length())
             assertTrue(book.readBytes().contentEquals(detail.readBytes()))
 
+            val rotated = archive.createBookCrop(
+                stored,
+                NormalizedBookRegion.DEFAULT,
+                root.resolve("details"),
+                rotationDegrees = 90,
+            )
+            val rotatedBounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(rotated.absolutePath, rotatedBounds)
+            assertEquals(540, rotatedBounds.outWidth)
+            assertEquals(600, rotatedBounds.outHeight)
+
             val grid = AreaGridRenderer.createGrid(stored.file, root.resolve("grid"))
             val gridBitmap = requireNotNull(BitmapFactory.decodeFile(grid.absolutePath))
             assertTrue(gridBitmap.width <= 1600 && gridBitmap.height <= 1600)
@@ -57,6 +68,7 @@ class OriginalArchiveInstrumentedTest {
                 stored.file,
                 NormalizedBookRegion(0.1f, 0.1f, 0.8f, 0.8f),
                 root.resolve("grid"),
+                rotationDegrees = 180,
             )
             assertTrue(preview.isFile && preview.length() > 0L)
         } finally {

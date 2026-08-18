@@ -46,8 +46,29 @@ class TelegramCommandParserTest {
             ),
             parser.parse("/area b2 h8"),
         )
+        assertEquals(
+            TelegramCommand.PreviewBookRegion(
+                NormalizedBookRegion(0.8f, 0.4f, 1.0f, 0.6f),
+                "I5–J6",
+            ),
+            parser.parse("/area ij 56"),
+        )
+        assertEquals(
+            TelegramCommand.PreviewBookRegion(
+                NormalizedBookRegion(0.8f, 0.4f, 1.0f, 1.0f),
+                "I5–J10",
+            ),
+            parser.parse("/area IJ 5-10"),
+        )
         assertTrue(parser.parse("/area H8 B2") is TelegramCommand.Unknown)
+        assertTrue(parser.parse("/area JI 65") is TelegramCommand.Unknown)
         assertTrue(parser.parse("/area A0 J10") is TelegramCommand.Unknown)
+    }
+
+    @Test fun parsesBookRotation() {
+        assertEquals(TelegramCommand.ShowBookRotation, parser.parse("/rotate"))
+        assertEquals(TelegramCommand.SetBookRotation(180), parser.parse("/rotate 180"))
+        assertTrue(parser.parse("/rotate 45") is TelegramCommand.Unknown)
     }
 
     @Test fun rejectsUnsafeRemoteTimerValues() {

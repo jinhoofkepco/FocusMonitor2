@@ -24,9 +24,17 @@ internal object AreaGridRenderer {
         }
     }
 
-    fun createCropPreview(source: File, region: NormalizedBookRegion, outputDirectory: File): File {
+    fun createCropPreview(
+        source: File,
+        region: NormalizedBookRegion,
+        outputDirectory: File,
+        rotationDegrees: Int = 0,
+    ): File {
         outputDirectory.mkdirs()
-        val bitmap = ImageFiles.decodeUprightRegion(source, region, PREVIEW_LONG_EDGE)
+        val bitmap = ImageFiles.rotate(
+            ImageFiles.decodeUprightRegion(source, region, PREVIEW_LONG_EDGE),
+            rotationDegrees,
+        )
         try {
             return outputDirectory.resolve("area-preview-${UUID.randomUUID()}.jpg").also {
                 ImageFiles.writeJpeg(bitmap, it, PREVIEW_QUALITY)

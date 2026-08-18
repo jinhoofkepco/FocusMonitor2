@@ -237,6 +237,11 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
                 resetBookFocus()
                 reporter.sendImmediate("책 영역 적용 완료 · 다음 촬영부터 새 영역과 초점을 사용합니다")
             }
+            TelegramCommand.ShowBookRotation -> reporter.sendRotationMenu()
+            is TelegramCommand.SetBookRotation -> {
+                reporter.updateBookRotation(command.degrees)
+                reporter.sendImmediate("책 상세사진 회전을 ${command.degrees}°로 변경했습니다 · 지금부터 적용됩니다")
+            }
             is TelegramCommand.Unknown -> {
                 if (command.input.trim().startsWith('/')) {
                     reporter.sendImmediate(commandHelp())
@@ -923,6 +928,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         "명령\n" +
             "/menu 버튼 메뉴 열기\n" +
             "/area 10×10 책 영역 격자\n" +
+            "/rotate 0|90|180|270 책 상세사진 회전\n" +
             "/settings 현재 설정\n" +
             "/set 0 40 15 명상·공부·휴식(분)\n" +
             "/set countdown 5 시작 대기(초)\n" +

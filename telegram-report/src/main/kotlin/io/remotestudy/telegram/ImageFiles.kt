@@ -77,6 +77,21 @@ internal object ImageFiles {
         }
     }
 
+    /** Returns the source for 0 degrees; otherwise returns a rotated bitmap and recycles source. */
+    fun rotate(source: Bitmap, degrees: Int): Bitmap {
+        require(degrees in setOf(0, 90, 180, 270))
+        if (degrees == 0) return source
+        return Bitmap.createBitmap(
+            source,
+            0,
+            0,
+            source.width,
+            source.height,
+            Matrix().apply { setRotate(degrees.toFloat()) },
+            true,
+        ).also { source.recycle() }
+    }
+
     private fun powerOfTwoSample(width: Int, height: Int, maxLongEdge: Int): Int {
         var sample = 1
         while (maxOf(width / (sample * 2), height / (sample * 2)) >= maxLongEdge) sample *= 2

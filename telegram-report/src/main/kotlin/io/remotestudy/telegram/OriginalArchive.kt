@@ -91,14 +91,23 @@ class OriginalArchive(
     }
 
     @Synchronized
-    fun createBookCrop(source: ArchivedOriginal, region: NormalizedBookRegion, outputDir: File): File {
+    fun createBookCrop(
+        source: ArchivedOriginal,
+        region: NormalizedBookRegion,
+        outputDir: File,
+        rotationDegrees: Int = 0,
+    ): File {
+        require(rotationDegrees in setOf(0, 90, 180, 270))
         outputDir.mkdirs()
         val target = outputDir.resolve("book-${source.capturedAtEpochMs}-${UUID.randomUUID()}.jpg")
-        source.bookFile?.takeIf(File::isFile)?.let {
+        source.bookFile?.takeIf(File::isFile)?.takeIf { rotationDegrees == 0 }?.let {
             it.copyTo(target, overwrite = false)
             return target
         }
-        val bitmap = ImageFiles.decodeRegion(source.file, region)
+        val decoded = source.bookFile?.takeIf(File::isFile)?.let {
+            ImageFiles.decodeUpright(it, BOOK_LONG_EDGE)
+        } ?: ImageFiles.decodeRegion(source.file, region)
+        val bitmap = ImageFiles.rotate(decoded, rotationDegrees)
         try { ImageFiles.writeJpeg(bitmap, target, DETAIL_JPEG_QUALITY) } finally { bitmap.recycle() }
         return target
     }
