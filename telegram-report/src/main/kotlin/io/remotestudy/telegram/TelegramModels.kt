@@ -29,6 +29,9 @@ sealed interface TelegramCommand {
     data object Index : TelegramCommand
     data object Status : TelegramCommand
     data object Menu : TelegramCommand
+    data object ShowAreaGrid : TelegramCommand
+    data class PreviewBookRegion(val region: NormalizedBookRegion, val label: String) : TelegramCommand
+    data class SetBookRegion(val region: NormalizedBookRegion) : TelegramCommand
     data class SetSchedule(
         val meditationMinutes: Int,
         val studyMinutes: Int,

@@ -20,6 +20,8 @@ class TelegramCommandParser {
             text == "/index" -> TelegramCommand.Index
             text == "/status" -> TelegramCommand.Status
             text == "/menu" || text == "/help" -> TelegramCommand.Menu
+            text == "/area" -> TelegramCommand.ShowAreaGrid
+            text.startsWith("/area ") -> parseArea(text.removePrefix("/area ").trim())
             text.startsWith("/set ") -> parseSetting(text.removePrefix("/set ").trim())
             text.startsWith("/time ") -> parseRemaining(text.removePrefix("/time ").trim())
             text.startsWith("/phase ") -> parsePhase(text.removePrefix("/phase ").trim())
@@ -41,6 +43,28 @@ class TelegramCommandParser {
             if (seconds != null && seconds in 0..60) return TelegramCommand.SetCountdown(seconds)
         }
         return TelegramCommand.Unknown("/set $argument")
+    }
+
+    private fun parseArea(argument: String): TelegramCommand {
+        val match = AREA.matchEntire(argument.uppercase())
+            ?: return TelegramCommand.Unknown("/area $argument")
+        val leftCell = match.groupValues[1][0] - 'A'
+        val topCell = match.groupValues[2].toInt() - 1
+        val rightCell = match.groupValues[3][0] - 'A'
+        val bottomCell = match.groupValues[4].toInt() - 1
+        if (leftCell !in 0..9 || rightCell !in 0..9 || topCell !in 0..9 || bottomCell !in 0..9) {
+            return TelegramCommand.Unknown("/area $argument")
+        }
+        if (rightCell < leftCell || bottomCell < topCell) return TelegramCommand.Unknown("/area $argument")
+        return TelegramCommand.PreviewBookRegion(
+            NormalizedBookRegion(
+                left = leftCell / 10f,
+                top = topCell / 10f,
+                right = (rightCell + 1) / 10f,
+                bottom = (bottomCell + 1) / 10f,
+            ),
+            "${match.groupValues[1]}${match.groupValues[2]}–${match.groupValues[3]}${match.groupValues[4]}",
+        )
     }
 
     private fun parseRemaining(argument: String): TelegramCommand {
@@ -106,5 +130,6 @@ class TelegramCommandParser {
         val EXACT = Regex("^(\\d{1,2}):(\\d{2}):(\\d{2})$")
         val RANGE = Regex("^(\\d{1,2}):(\\d{2})-(\\d{1,2}):(\\d{2})$")
         val RECENT = Regex("^-(\\d+)$")
+        val AREA = Regex("^([A-J])(10|[1-9])\\s+([A-J])(10|[1-9])$")
     }
 }

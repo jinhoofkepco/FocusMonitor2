@@ -37,6 +37,19 @@ class TelegramCommandParserTest {
         )
     }
 
+    @Test fun parsesTenByTenAreaSelection() {
+        assertEquals(TelegramCommand.ShowAreaGrid, parser.parse("/area"))
+        assertEquals(
+            TelegramCommand.PreviewBookRegion(
+                NormalizedBookRegion(0.1f, 0.1f, 0.8f, 0.8f),
+                "B2–H8",
+            ),
+            parser.parse("/area b2 h8"),
+        )
+        assertTrue(parser.parse("/area H8 B2") is TelegramCommand.Unknown)
+        assertTrue(parser.parse("/area A0 J10") is TelegramCommand.Unknown)
+    }
+
     @Test fun rejectsUnsafeRemoteTimerValues() {
         assertTrue(parser.parse("/set -1 40 15") is TelegramCommand.Unknown)
         assertTrue(parser.parse("/set 0 0 15") is TelegramCommand.Unknown)

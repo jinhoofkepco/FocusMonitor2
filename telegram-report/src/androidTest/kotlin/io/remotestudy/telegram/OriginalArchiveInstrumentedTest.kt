@@ -47,6 +47,18 @@ class OriginalArchiveInstrumentedTest {
             )
             assertEquals(book.length(), detail.length())
             assertTrue(book.readBytes().contentEquals(detail.readBytes()))
+
+            val grid = AreaGridRenderer.createGrid(stored.file, root.resolve("grid"))
+            val gridBitmap = requireNotNull(BitmapFactory.decodeFile(grid.absolutePath))
+            assertTrue(gridBitmap.width <= 1600 && gridBitmap.height <= 1600)
+            gridBitmap.recycle()
+
+            val preview = AreaGridRenderer.createCropPreview(
+                stored.file,
+                NormalizedBookRegion(0.1f, 0.1f, 0.8f, 0.8f),
+                root.resolve("grid"),
+            )
+            assertTrue(preview.isFile && preview.length() > 0L)
         } finally {
             root.deleteRecursively()
         }

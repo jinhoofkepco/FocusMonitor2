@@ -11,6 +11,7 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.roundToInt
 
 class TelegramReporter(
     private val rootDirectory: File,
@@ -127,6 +128,41 @@ class TelegramReporter(
         "원하는 기능을 누르세요. 기존 직접 명령도 그대로 사용할 수 있습니다.",
         CONTROL_MENU,
     )
+
+    fun sendAreaGrid() {
+        archive.startFreshSession(now())
+        val source = archive.all().lastOrNull()
+        if (source == null) {
+            sendImmediate("설정할 사진이 없습니다. 공부를 시작해 첫 사진이 촬영된 뒤 다시 눌러주세요.")
+            return
+        }
+        val grid = AreaGridRenderer.createGrid(source.file, detailDir)
+        queue.enqueue(
+            UploadKind.PHOTO,
+            grid,
+            "책을 포함할 왼쪽 위 칸과 오른쪽 아래 칸을 보내세요.\n예: /area B2 H8",
+            now(),
+        )
+        wakeUploader()
+    }
+
+    fun sendAreaPreview(command: TelegramCommand.PreviewBookRegion) {
+        archive.startFreshSession(now())
+        val source = archive.all().lastOrNull()
+        if (source == null) {
+            sendImmediate("미리 볼 사진이 없습니다. 새 사진이 촬영된 뒤 다시 시도해주세요.")
+            return
+        }
+        val preview = AreaGridRenderer.createCropPreview(source.file, command.region, detailDir)
+        queue.enqueue(
+            UploadKind.PHOTO,
+            preview,
+            "선택 영역 ${command.label} · 이 범위로 설정할까요?",
+            now(),
+            replyMarkup = areaConfirmation(command.region),
+        )
+        wakeUploader()
+    }
 
     fun sendIndex() {
         val text = synchronized(lock) {
@@ -270,6 +306,8 @@ class TelegramReporter(
                         val command = parser.parse(text)
                         when (command) {
                             TelegramCommand.Menu -> sendControlMenu()
+                            TelegramCommand.ShowAreaGrid -> sendAreaGrid()
+                            is TelegramCommand.PreviewBookRegion -> sendAreaPreview(command)
                             TelegramCommand.Index -> sendIndex()
                             is TelegramCommand.Book -> sendBookDetails(command.selection)
                             else -> commandHandler.handle(command)
@@ -305,6 +343,19 @@ class TelegramReporter(
             runCatching { api.answerCallbackQuery(callbackId, "${formatTime(source.capturedAtEpochMs)} 책 사진 전송 중") }
             return
         }
+        AREA_SET_BUTTON.matchEntire(data)?.let { match ->
+            val values = match.groupValues.drop(1).map(String::toInt)
+            val region = runCatching {
+                NormalizedBookRegion(values[0] / 100f, values[1] / 100f, values[2] / 100f, values[3] / 100f)
+            }.getOrNull()
+            if (region == null) {
+                runCatching { api.answerCallbackQuery(callbackId, "잘못된 영역입니다") }
+                return
+            }
+            commandHandler.handle(TelegramCommand.SetBookRegion(region))
+            runCatching { api.answerCallbackQuery(callbackId, "책 영역을 적용했습니다") }
+            return
+        }
         val command = when (data) {
             "cmd:start" -> TelegramCommand.Start
             "cmd:pause" -> TelegramCommand.Pause
@@ -315,6 +366,11 @@ class TelegramReporter(
             "cmd:focus" -> TelegramCommand.Refocus
             "cmd:index" -> TelegramCommand.Index
             "cmd:recent" -> TelegramCommand.Book(BookSelection.RecentMinutes(5))
+            "cmd:area", "area:grid" -> {
+                sendAreaGrid()
+                runCatching { api.answerCallbackQuery(callbackId, "10×10 격자를 보냈습니다") }
+                return
+            }
             "cmd:stop" -> return sendCallbackMenu(callbackId, "공부를 종료할까요?", CONFIRM_STOP_MENU)
             "cmd:restart" -> return sendCallbackMenu(callbackId, "현재 진행을 버리고 처음부터 다시 시작할까요?", CONFIRM_RESTART_MENU)
             "confirm:stop" -> TelegramCommand.Stop
@@ -355,6 +411,9 @@ class TelegramReporter(
         }
         append("]]}")
     }
+
+    private fun areaConfirmation(region: NormalizedBookRegion): String =
+        """{"inline_keyboard":[[{"text":"✅ 확정","callback_data":"area:set:${(region.left * 100).roundToInt()}:${(region.top * 100).roundToInt()}:${(region.right * 100).roundToInt()}:${(region.bottom * 100).roundToInt()}"},{"text":"↩ 다시 선택","callback_data":"area:grid"}]]}"""
 
     private fun requireFile(entry: UploadEntry): File = requireNotNull(entry.filePath).let(::File).also {
         require(it.isFile) { "Queued file was removed: $it" }
@@ -472,7 +531,8 @@ class TelegramReporter(
         val TIME: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm:ss")
         val PHOTO_SEQUENCE = Regex("^#(\\d+)")
         val BOOK_BUTTON = Regex("^book:(\\d{1,19})$")
-        const val CONTROL_MENU = """{"inline_keyboard":[[{"text":"▶ 시작","callback_data":"cmd:start"},{"text":"⏸ 일시정지","callback_data":"cmd:pause"},{"text":"▶ 계속","callback_data":"cmd:resume"}],[{"text":"⏭ 다음 단계","callback_data":"cmd:next"},{"text":"⏹ 종료","callback_data":"cmd:stop"},{"text":"🔄 처음부터","callback_data":"cmd:restart"}],[{"text":"📊 현재 상태","callback_data":"cmd:status"},{"text":"📷 최근 5분","callback_data":"cmd:recent"},{"text":"🎯 초점","callback_data":"cmd:focus"}],[{"text":"⏱ 시간 설정","callback_data":"menu:time"},{"text":"🖼 사진 목록","callback_data":"cmd:index"},{"text":"⚙ 현재 설정","callback_data":"cmd:settings"}]]}"""
+        val AREA_SET_BUTTON = Regex("^area:set:(\\d{1,3}):(\\d{1,3}):(\\d{1,3}):(\\d{1,3})$")
+        const val CONTROL_MENU = """{"inline_keyboard":[[{"text":"▶ 시작","callback_data":"cmd:start"},{"text":"⏸ 일시정지","callback_data":"cmd:pause"},{"text":"▶ 계속","callback_data":"cmd:resume"}],[{"text":"⏭ 다음 단계","callback_data":"cmd:next"},{"text":"⏹ 종료","callback_data":"cmd:stop"},{"text":"🔄 처음부터","callback_data":"cmd:restart"}],[{"text":"📊 현재 상태","callback_data":"cmd:status"},{"text":"📷 최근 5분","callback_data":"cmd:recent"},{"text":"🎯 초점","callback_data":"cmd:focus"}],[{"text":"📐 책 영역 설정","callback_data":"cmd:area"}],[{"text":"⏱ 시간 설정","callback_data":"menu:time"},{"text":"🖼 사진 목록","callback_data":"cmd:index"},{"text":"⚙ 현재 설정","callback_data":"cmd:settings"}]]}"""
         const val TIME_MENU = """{"inline_keyboard":[[{"text":"0·40·15","callback_data":"set:0:40:15"},{"text":"5·40·15","callback_data":"set:5:40:15"},{"text":"5·50·10","callback_data":"set:5:50:10"}],[{"text":"‹ 기본 메뉴","callback_data":"menu:main"}]]}"""
         const val CONFIRM_STOP_MENU = """{"inline_keyboard":[[{"text":"종료","callback_data":"confirm:stop"},{"text":"취소","callback_data":"menu:main"}]]}"""
         const val CONFIRM_RESTART_MENU = """{"inline_keyboard":[[{"text":"처음부터 시작","callback_data":"confirm:restart"},{"text":"취소","callback_data":"menu:main"}]]}"""

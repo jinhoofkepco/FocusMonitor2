@@ -228,6 +228,15 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             is TelegramCommand.GoToPhase -> goToPhase(command.phase, command.remainingSeconds)
             TelegramCommand.Status -> reporter.sendImmediate(statusText(snapshot()))
             TelegramCommand.Menu -> reporter.sendControlMenu()
+            TelegramCommand.ShowAreaGrid -> reporter.sendAreaGrid()
+            is TelegramCommand.PreviewBookRegion -> reporter.sendAreaPreview(command)
+            is TelegramCommand.SetBookRegion -> {
+                saveBookRegion(command.region)
+                reporter.updateBookRegion(command.region)
+                motionAnalyzer.resetBaseline()
+                resetBookFocus()
+                reporter.sendImmediate("책 영역 적용 완료 · 다음 촬영부터 새 영역과 초점을 사용합니다")
+            }
             is TelegramCommand.Unknown -> {
                 if (command.input.trim().startsWith('/')) {
                     reporter.sendImmediate(commandHelp())
@@ -913,6 +922,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
     private fun commandHelp(): String =
         "명령\n" +
             "/menu 버튼 메뉴 열기\n" +
+            "/area 10×10 책 영역 격자\n" +
             "/settings 현재 설정\n" +
             "/set 0 40 15 명상·공부·휴식(분)\n" +
             "/set countdown 5 시작 대기(초)\n" +
