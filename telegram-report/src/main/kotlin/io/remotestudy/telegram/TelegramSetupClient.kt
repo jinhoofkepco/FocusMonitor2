@@ -18,11 +18,25 @@ class TelegramSetupClient {
 
     fun findConnectionChats(token: String): List<TelegramSetupChat> {
         request(token, "deleteWebhook", mapOf("drop_pending_updates" to "false"))
-        val updates = request(
-            token,
-            "getUpdates",
-            mapOf("timeout" to "0", "allowed_updates" to "[\"message\"]"),
-        ).getJSONArray("result")
+        repeat(3) { attempt ->
+            try {
+                val response = request(
+                    token,
+                    "getUpdates",
+                    mapOf("timeout" to "7", "limit" to "100", "allowed_updates" to "[\"message\"]"),
+                )
+                val chats = extractConnectionChats(response)
+                if (chats.isNotEmpty()) return chats
+            } catch (error: TelegramApiException) {
+                if (error.statusCode != 409 || attempt == 2) throw error
+                Thread.sleep(1_500L)
+            }
+        }
+        return emptyList()
+    }
+
+    internal fun extractConnectionChats(response: JSONObject): List<TelegramSetupChat> {
+        val updates = response.getJSONArray("result")
         val newestByChat = linkedMapOf<Long, TelegramSetupChat>()
         repeat(updates.length()) { index ->
             val update = updates.getJSONObject(index)
@@ -30,7 +44,7 @@ class TelegramSetupClient {
             val chat = message.optJSONObject("chat") ?: return@repeat
             if (chat.optString("type") != "private") return@repeat
             val text = message.optString("text").trim().substringBefore('@')
-            if (text !in setOf("/연결", "/connect")) return@repeat
+            if (text !in setOf("/연결", "/connect", "/start")) return@repeat
             val chatId = chat.optLong("id")
             if (chatId == 0L) return@repeat
             val displayName = listOf(chat.optString("first_name"), chat.optString("last_name"))

@@ -118,7 +118,7 @@ class StudentActivity : Activity() {
                     return@setOnClickListener
                 }
                 isEnabled = false
-                setupState.text = "봇과 /연결 메시지를 확인하는 중…"
+                setupState.text = "봇과 선생님 채팅을 확인하는 중…\n최대 20초 정도 걸릴 수 있습니다."
                 setupExecutor.execute {
                     val result = runCatching {
                         val client = TelegramSetupClient()
@@ -130,7 +130,8 @@ class StudentActivity : Activity() {
                         result.onSuccess { (botName, chats) ->
                             when {
                                 chats.isEmpty() -> setupState.text =
-                                    "찾지 못했습니다. 텔레그램에서 @$botName 봇을 열어 /연결 을 보낸 뒤 다시 누르세요."
+                                    "@$botName 봇은 확인했지만 선생님 채팅을 찾지 못했습니다. " +
+                                        "그 봇에게 /connect 를 새로 보낸 직후 다시 누르세요."
                                 chats.size == 1 -> confirmChat(token, botName, chats.first(), setupState, this)
                                 else -> chooseChat(token, botName, chats, setupState, this)
                             }
@@ -304,7 +305,8 @@ class StudentActivity : Activity() {
 
     private fun friendlySetupError(error: Throwable): String = when {
         error.message?.contains("Unauthorized", ignoreCase = true) == true -> "토큰이 틀렸습니다. BotFather 토큰을 다시 복사하세요."
-        error.message?.contains("Conflict", ignoreCase = true) == true -> "이 봇을 다른 프로그램이 사용 중입니다. 잠시 뒤 다시 시도하세요."
+        error.message?.contains("Conflict", ignoreCase = true) == true ->
+            "이 봇을 다른 앱이 동시에 확인 중입니다. 다른 봇 프로그램을 끄고 1분 뒤 다시 누르세요."
         else -> error.message ?: "인터넷 연결을 확인하세요"
     }
 
