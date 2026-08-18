@@ -27,4 +27,11 @@ class DiskUploadQueueTest {
         assertTrue(retried.nextAttemptEpochMs > 1_000L)
         assertNull(queue.due(1_001L))
     }
+
+    @Test fun montageButtonsSurviveProcessRestart() {
+        val journal = Files.createTempDirectory("telegram-buttons").resolve("q.jsonl").toFile()
+        val markup = "{\"inline_keyboard\":[[{\"text\":\"1\",\"callback_data\":\"book:123\"}]]}"
+        DiskUploadQueue(journal).enqueue(UploadKind.PHOTO, null, "#1", 10L, markup)
+        assertEquals(markup, DiskUploadQueue(journal).due(10L)?.replyMarkup)
+    }
 }

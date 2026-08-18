@@ -65,7 +65,7 @@ class MontageComposer(
         outputDir.mkdirs()
         val file = outputDir.resolve("montage-${times.first()}-${sequence.toString().padStart(5, '0')}.jpg")
         ImageFiles.writeJpeg(canvasBitmap, file, 80)
-        return MontageResult(sequence, times.first(), times.last(), file, count)
+        return MontageResult(sequence, times.first(), times.last(), file, count, times.toList())
     }
 
     override fun close() {
@@ -80,6 +80,7 @@ class MontageComposer(
         val lastCapturedAtEpochMs: Long,
         val file: File,
         val cells: Int,
+        val capturedAtEpochMs: List<Long>,
     )
 
     private companion object {

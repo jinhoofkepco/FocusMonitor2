@@ -23,8 +23,8 @@ android {
         applicationId = "io.remotestudy.student"
         minSdk = 26
         targetSdk = 35
-        versionCode = 17
-        versionName = "0.13.1"
+        versionCode = 18
+        versionName = "0.14.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "TELEGRAM_BOT_TOKEN", "\"${buildConfigString("TELEGRAM_BOT_TOKEN")}\"")
         buildConfigField("long", "TELEGRAM_CHAT_ID", (localProperties.getProperty("TELEGRAM_CHAT_ID")?.toLongOrNull() ?: 0L).toString() + "L")

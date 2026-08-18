@@ -16,8 +16,10 @@ class TelegramCommandParser {
             text == "/restart" -> TelegramCommand.Restart
             text == "/next" -> TelegramCommand.NextPhase
             text == "/settings" -> TelegramCommand.Settings
+            text == "/focus" -> TelegramCommand.Refocus
             text == "/index" -> TelegramCommand.Index
             text == "/status" -> TelegramCommand.Status
+            text == "/menu" || text == "/help" -> TelegramCommand.Menu
             text.startsWith("/set ") -> parseSetting(text.removePrefix("/set ").trim())
             text.startsWith("/time ") -> parseRemaining(text.removePrefix("/time ").trim())
             text.startsWith("/phase ") -> parsePhase(text.removePrefix("/phase ").trim())

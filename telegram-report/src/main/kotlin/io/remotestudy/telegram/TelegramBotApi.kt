@@ -14,15 +14,26 @@ import java.util.UUID
 class TelegramBotApi(private val config: TelegramConfig) {
     private val baseUrl = "https://api.telegram.org/bot${config.botToken}/"
 
-    fun sendPhoto(photo: File, caption: String): TelegramApiResult =
-        multipart("sendPhoto", "photo", photo, caption)
+    fun sendPhoto(photo: File, caption: String, replyMarkup: String? = null): TelegramApiResult =
+        multipart("sendPhoto", "photo", photo, caption, replyMarkup)
 
     fun sendDocument(document: File, caption: String): TelegramApiResult =
         multipart("sendDocument", "document", document, caption)
 
-    fun sendMessage(text: String): TelegramApiResult = postForm(
+    fun sendMessage(text: String, replyMarkup: String? = null): TelegramApiResult = postForm(
         "sendMessage",
-        mapOf("chat_id" to config.allowedChatId.toString(), "text" to text),
+        buildMap {
+            put("chat_id", config.allowedChatId.toString())
+            put("text", text)
+            replyMarkup?.let { put("reply_markup", it) }
+        },
+    ).result()
+
+    fun setMyCommands(): TelegramApiResult = postForm(
+        "setMyCommands",
+        mapOf(
+            "commands" to """[{"command":"menu","description":"조작 버튼 열기"},{"command":"status","description":"현재 공부 상태"},{"command":"start","description":"처음부터 시작"},{"command":"pause","description":"일시정지"},{"command":"resume","description":"계속하기"},{"command":"focus","description":"책 초점 다시 맞추기"},{"command":"index","description":"오늘 사진 목록"},{"command":"b","description":"책 사진 요청"}]""",
+        ),
     ).result()
 
     fun pinChatMessage(messageId: Long): TelegramApiResult = postForm(
@@ -40,7 +51,7 @@ class TelegramBotApi(private val config: TelegramConfig) {
             mapOf(
                 "offset" to offset.toString(),
                 "timeout" to timeoutSeconds.toString(),
-                "allowed_updates" to "[\"message\"]",
+                "allowed_updates" to "[\"message\",\"callback_query\"]",
             ),
             readTimeoutMs = (timeoutSeconds + 10) * 1_000,
         ).body.getJSONArray("result")
@@ -48,11 +59,16 @@ class TelegramBotApi(private val config: TelegramConfig) {
             repeat(result.length()) { index ->
                 val update = result.getJSONObject(index)
                 val message = update.optJSONObject("message")
+                val callback = update.optJSONObject("callback_query")
+                val callbackMessage = callback?.optJSONObject("message")
                 add(
                     TelegramUpdate(
                         updateId = update.getLong("update_id"),
-                        chatId = message?.optJSONObject("chat")?.optLong("id"),
+                        chatId = message?.optJSONObject("chat")?.optLong("id")
+                            ?: callbackMessage?.optJSONObject("chat")?.optLong("id"),
                         text = message?.optString("text")?.takeIf(String::isNotBlank),
+                        callbackQueryId = callback?.optString("id")?.takeIf(String::isNotBlank),
+                        callbackData = callback?.optString("data")?.takeIf(String::isNotBlank),
                     ),
                 )
             }
@@ -64,7 +80,18 @@ class TelegramBotApi(private val config: TelegramConfig) {
         mapOf("drop_pending_updates" to "false"),
     ).result()
 
-    private fun multipart(method: String, field: String, file: File, caption: String): TelegramApiResult {
+    fun answerCallbackQuery(callbackQueryId: String, text: String): TelegramApiResult = postForm(
+        "answerCallbackQuery",
+        mapOf("callback_query_id" to callbackQueryId, "text" to text.take(200)),
+    ).result()
+
+    private fun multipart(
+        method: String,
+        field: String,
+        file: File,
+        caption: String,
+        replyMarkup: String? = null,
+    ): TelegramApiResult {
         require(file.isFile) { "Upload file does not exist: $file" }
         val boundary = "----RemoteStudy${UUID.randomUUID()}"
         val connection = open(method).apply {
@@ -84,6 +111,7 @@ class TelegramBotApi(private val config: TelegramConfig) {
                 }
                 fieldPart("chat_id", config.allowedChatId.toString())
                 fieldPart("caption", caption)
+                replyMarkup?.let { fieldPart("reply_markup", it) }
                 output.write("--$boundary\r\n".toByteArray())
                 output.write(
                     "Content-Disposition: form-data; name=\"$field\"; filename=\"${safeFilename(file.name)}\"\r\n".toByteArray(),

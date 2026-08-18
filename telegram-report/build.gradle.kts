@@ -8,7 +8,10 @@ android {
     compileSdk = 35
     buildToolsVersion = "35.0.1"
 
-    defaultConfig { minSdk = 26 }
+    defaultConfig {
+        minSdk = 26
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -17,4 +20,9 @@ android {
     kotlinOptions { jvmTarget = "17" }
 }
 
-dependencies { testImplementation("junit:junit:4.13.2") }
+dependencies {
+    testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test:core:1.6.1")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+}

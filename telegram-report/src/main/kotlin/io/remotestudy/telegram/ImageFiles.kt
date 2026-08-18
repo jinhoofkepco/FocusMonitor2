@@ -7,6 +7,9 @@ import android.graphics.Matrix
 import android.graphics.Rect
 import android.media.ExifInterface
 import java.io.File
+import kotlin.math.ceil
+import kotlin.math.floor
+import kotlin.math.max
 
 internal object ImageFiles {
     fun decodeUpright(file: File, maxLongEdge: Int): Bitmap {
@@ -30,15 +33,33 @@ internal object ImageFiles {
 
     @Suppress("DEPRECATION")
     fun decodeRegion(file: File, region: NormalizedBookRegion): Bitmap {
+        return decodeUprightRegion(file, region, Int.MAX_VALUE)
+    }
+
+    @Suppress("DEPRECATION")
+    fun decodeUprightRegion(file: File, region: NormalizedBookRegion, maxLongEdge: Int): Bitmap {
+        require(maxLongEdge > 0)
         val decoder = requireNotNull(BitmapRegionDecoder.newInstance(file.absolutePath, false))
+        val orientation = readOrientation(file)
         try {
-            val rect = Rect(
-                (region.left * decoder.width).toInt().coerceIn(0, decoder.width - 1),
-                (region.top * decoder.height).toInt().coerceIn(0, decoder.height - 1),
-                (region.right * decoder.width).toInt().coerceIn(1, decoder.width),
-                (region.bottom * decoder.height).toInt().coerceIn(1, decoder.height),
+            val rect = rawRegionForUprightNormalized(
+                decoder.width,
+                decoder.height,
+                orientation,
+                region,
             )
-            return requireNotNull(decoder.decodeRegion(rect, BitmapFactory.Options()))
+            val raw = requireNotNull(
+                decoder.decodeRegion(
+                    rect,
+                    BitmapFactory.Options().apply {
+                        inSampleSize = powerOfTwoSample(rect.width(), rect.height(), maxLongEdge)
+                        inPreferredConfig = Bitmap.Config.ARGB_8888
+                    },
+                ),
+            )
+            val upright = transform(raw, orientation)
+            if (upright !== raw) raw.recycle()
+            return limit(upright, maxLongEdge)
         } finally {
             decoder.recycle()
         }
@@ -60,6 +81,56 @@ internal object ImageFiles {
         var sample = 1
         while (maxOf(width / (sample * 2), height / (sample * 2)) >= maxLongEdge) sample *= 2
         return sample
+    }
+
+    private fun limit(source: Bitmap, maxLongEdge: Int): Bitmap {
+        val longest = max(source.width, source.height)
+        if (longest <= maxLongEdge) return source
+        val scale = maxLongEdge.toFloat() / longest
+        return Bitmap.createScaledBitmap(
+            source,
+            max(1, (source.width * scale).toInt()),
+            max(1, (source.height * scale).toInt()),
+            true,
+        ).also { if (it !== source) source.recycle() }
+    }
+
+    private fun readOrientation(file: File): Int = runCatching {
+        @Suppress("DEPRECATION")
+        ExifInterface(file.absolutePath).getAttributeInt(
+            ExifInterface.TAG_ORIENTATION,
+            ExifInterface.ORIENTATION_NORMAL,
+        )
+    }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
+
+    private fun rawRegionForUprightNormalized(
+        width: Int,
+        height: Int,
+        orientation: Int,
+        region: NormalizedBookRegion,
+    ): Rect {
+        val corners = listOf(
+            sourcePoint(region.left, region.top, orientation),
+            sourcePoint(region.right, region.top, orientation),
+            sourcePoint(region.left, region.bottom, orientation),
+            sourcePoint(region.right, region.bottom, orientation),
+        )
+        val left = floor(corners.minOf { it.first } * width).toInt().coerceIn(0, width - 1)
+        val top = floor(corners.minOf { it.second } * height).toInt().coerceIn(0, height - 1)
+        val right = ceil(corners.maxOf { it.first } * width).toInt().coerceIn(left + 1, width)
+        val bottom = ceil(corners.maxOf { it.second } * height).toInt().coerceIn(top + 1, height)
+        return Rect(left, top, right, bottom)
+    }
+
+    private fun sourcePoint(x: Float, y: Float, orientation: Int): Pair<Float, Float> = when (orientation) {
+        ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> (1f - x) to y
+        ExifInterface.ORIENTATION_ROTATE_180 -> (1f - x) to (1f - y)
+        ExifInterface.ORIENTATION_FLIP_VERTICAL -> x to (1f - y)
+        ExifInterface.ORIENTATION_TRANSPOSE -> y to x
+        ExifInterface.ORIENTATION_ROTATE_90 -> y to (1f - x)
+        ExifInterface.ORIENTATION_TRANSVERSE -> (1f - y) to (1f - x)
+        ExifInterface.ORIENTATION_ROTATE_270 -> (1f - y) to x
+        else -> x to y
     }
 
     private fun transform(source: Bitmap, orientation: Int): Bitmap {

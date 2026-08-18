@@ -11,6 +11,7 @@ import android.hardware.display.DisplayManager
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.media.AudioManager
+import android.media.AudioAttributes
 import android.media.ToneGenerator
 import android.os.Build
 import android.os.Handler
@@ -24,9 +25,12 @@ import android.util.Log
 import android.util.Size
 import android.view.Surface
 import androidx.camera.core.AspectRatio
+import androidx.camera.core.Camera
+import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.SurfaceOrientedMeteringPointFactory
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
@@ -65,6 +69,7 @@ import java.io.File
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
@@ -86,6 +91,11 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
     private var captureStartedAtElapsedMs = 0L
     private var imageCapture: ImageCapture? = null
     private var cameraProvider: ProcessCameraProvider? = null
+    private var camera: Camera? = null
+    private var focusLocked = false
+    private var focusGeneration = 0
+    private var nextFocusAttemptElapsedMs = 0L
+    private var destroyed = false
     private lateinit var reporter: TelegramReporter
     private lateinit var voice: StudentVoiceCommandController
     private lateinit var tts: TextToSpeech
@@ -117,10 +127,12 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         promoteToForeground("텔레그램 연결 준비")
         lifecycleRegistry.currentState = Lifecycle.State.RESUMED
 
-        tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 90)
+        // Student feedback must follow media volume so it remains audible when
+        // notification volume is muted but video/music playback is enabled.
+        tone = ToneGenerator(AudioManager.STREAM_MUSIC, 90)
         tts = TextToSpeech(this) { status ->
             if (status == TextToSpeech.SUCCESS) {
-                tts.language = Locale.KOREAN
+                configureTts()
                 tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                     override fun onStart(utteranceId: String?) = Unit
                     override fun onDone(utteranceId: String?) { mainHandler.post(::restartVoiceAfterSpeech) }
@@ -191,6 +203,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
                 saveBookRegion(region)
                 reporter.updateBookRegion(region)
                 motionAnalyzer.resetBaseline()
+                resetBookFocus()
             }
             ACTION_STOP_SERVICE -> stopSelf()
         }
@@ -208,11 +221,13 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             TelegramCommand.Restart -> restartSession()
             TelegramCommand.NextPhase -> nextPhase()
             TelegramCommand.Settings -> reporter.sendImmediate(settingsText())
+            TelegramCommand.Refocus -> requestBookRefocus()
             is TelegramCommand.SetSchedule -> setSchedule(command)
             is TelegramCommand.SetCountdown -> setCountdown(command.seconds)
             is TelegramCommand.SetRemaining -> setRemaining(command.seconds)
             is TelegramCommand.GoToPhase -> goToPhase(command.phase, command.remainingSeconds)
             TelegramCommand.Status -> reporter.sendImmediate(statusText(snapshot()))
+            TelegramCommand.Menu -> reporter.sendControlMenu()
             is TelegramCommand.Unknown -> {
                 if (command.input.trim().startsWith('/')) {
                     reporter.sendImmediate(commandHelp())
@@ -470,6 +485,21 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         val capture = imageCapture ?: return
         if (!captureInFlight.compareAndSet(false, true)) return
         captureStartedAtElapsedMs = SystemClock.elapsedRealtime()
+        ensureBookFocus { focusResult ->
+            if (destroyed) {
+                captureInFlight.set(false)
+                return@ensureBookFocus
+            }
+            focusResult.onFailure {
+                if (SystemClock.elapsedRealtime() >= nextFocusAttemptElapsedMs - FOCUS_RETRY_DELAY_MS) {
+                    reporter.sendImmediate("책 영역 초점 실패 · 촬영은 계속하고 1분 뒤 재시도합니다")
+                }
+            }
+            captureFocusedFrame(capture)
+        }
+    }
+
+    private fun captureFocusedFrame(capture: ImageCapture) {
         val temp = runCatching { File.createTempFile("one-x-", ".jpg", cacheDir) }.getOrElse {
             captureInFlight.set(false)
             return
@@ -498,6 +528,109 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
                 }
             },
         )
+    }
+
+    private fun ensureBookFocus(callback: (Result<Unit>) -> Unit) {
+        if (destroyed) {
+            callback(Result.failure(IllegalStateException("서비스가 종료됐습니다")))
+            return
+        }
+        if (focusLocked || SystemClock.elapsedRealtime() < nextFocusAttemptElapsedMs) {
+            callback(Result.success(Unit))
+            return
+        }
+        val boundCamera = camera
+        if (boundCamera == null) {
+            callback(Result.failure(IllegalStateException("카메라가 연결되지 않았습니다")))
+            return
+        }
+        val region = loadBookRegion()
+        val point = SurfaceOrientedMeteringPointFactory(1f, 1f).createPoint(
+            (region.left + region.right) * 0.5f,
+            (region.top + region.bottom) * 0.5f,
+        )
+        val generation = focusGeneration
+        focusAttempt(boundCamera, point, generation, attemptsLeft = 2, callback)
+    }
+
+    private fun focusAttempt(
+        boundCamera: Camera,
+        point: androidx.camera.core.MeteringPoint,
+        generation: Int,
+        attemptsLeft: Int,
+        callback: (Result<Unit>) -> Unit,
+    ) {
+        if (generation != focusGeneration) {
+            callback(Result.failure(IllegalStateException("책 영역이 변경되어 초점을 다시 맞춥니다")))
+            return
+        }
+        val completed = AtomicBoolean(false)
+        val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF)
+            .disableAutoCancel()
+            .build()
+        val future = runCatching { boundCamera.cameraControl.startFocusAndMetering(action) }.getOrElse {
+            handleFocusFailure(boundCamera, point, generation, attemptsLeft, it, callback)
+            return
+        }
+        val timeout = Runnable {
+            if (!completed.compareAndSet(false, true)) return@Runnable
+            handleFocusFailure(
+                boundCamera,
+                point,
+                generation,
+                attemptsLeft,
+                IllegalStateException("책 영역 초점 시간이 초과됐습니다"),
+                callback,
+            )
+        }
+        mainHandler.postDelayed(timeout, FOCUS_TIMEOUT_MS)
+        future.addListener({
+            if (!completed.compareAndSet(false, true)) return@addListener
+            mainHandler.removeCallbacks(timeout)
+            val result = runCatching { future.get() }
+            if (generation == focusGeneration && result.getOrNull()?.isFocusSuccessful == true) {
+                focusLocked = true
+                nextFocusAttemptElapsedMs = 0L
+                callback(Result.success(Unit))
+            } else {
+                handleFocusFailure(
+                    boundCamera,
+                    point,
+                    generation,
+                    attemptsLeft,
+                    result.exceptionOrNull() ?: IllegalStateException("책 영역 초점에 실패했습니다"),
+                    callback,
+                )
+            }
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun handleFocusFailure(
+        boundCamera: Camera,
+        point: androidx.camera.core.MeteringPoint,
+        generation: Int,
+        attemptsLeft: Int,
+        failure: Throwable,
+        callback: (Result<Unit>) -> Unit,
+    ) {
+        if (generation != focusGeneration) {
+            callback(Result.failure(IllegalStateException("책 영역 변경으로 이전 초점 요청을 취소했습니다")))
+            return
+        }
+        if (attemptsLeft > 1 && generation == focusGeneration) {
+            focusAttempt(boundCamera, point, generation, attemptsLeft - 1, callback)
+        } else {
+            focusLocked = false
+            nextFocusAttemptElapsedMs = SystemClock.elapsedRealtime() + FOCUS_RETRY_DELAY_MS
+            callback(Result.failure(failure))
+        }
+    }
+
+    private fun resetBookFocus() {
+        focusGeneration += 1
+        focusLocked = false
+        nextFocusAttemptElapsedMs = 0L
+        camera?.cameraControl?.cancelFocusAndMetering()
     }
 
     private fun bindCamera(force: Boolean = false) {
@@ -532,12 +665,20 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
                     .build()
                 analysis.setAnalyzer(analysisExecutor, motionAnalyzer)
                 provider.unbindAll()
-                provider.bindToLifecycle(this, androidx.camera.core.CameraSelector.DEFAULT_BACK_CAMERA, capture, analysis)
+                val boundCamera = provider.bindToLifecycle(
+                    this,
+                    androidx.camera.core.CameraSelector.DEFAULT_BACK_CAMERA,
+                    capture,
+                    analysis,
+                )
                 cameraProvider = provider
+                camera = boundCamera
                 imageCapture = capture
+                resetBookFocus()
                 Log.i(TAG, "camera_bound one_x resolution=${capture.resolutionInfo?.resolution}")
             }.onFailure {
                 imageCapture = null
+                camera = null
                 Log.e(TAG, "camera_bind_failed", it)
                 broadcastState("카메라 연결 실패: ${it.message.orEmpty()}")
             }
@@ -569,7 +710,6 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             voice.stop()
             tone.startTone(ToneGenerator.TONE_PROP_ACK, 70)
             mainHandler.postDelayed({
-                tts.setSpeechRate(0.92f)
                 tts.speak(clean, TextToSpeech.QUEUE_FLUSH, null, "telegram-${System.nanoTime()}")
             }, 180L)
         }
@@ -578,6 +718,39 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
     private fun restartVoiceAfterSpeech() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
             voice.start()
+        }
+    }
+
+    private fun configureTts() {
+        tts.language = Locale.KOREA
+        tts.setSpeechRate(0.88f)
+        tts.setPitch(1.0f)
+        tts.setAudioAttributes(
+            AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build(),
+        )
+        val bestKoreanLocal = runCatching {
+            tts.voices.orEmpty()
+                .filter { voice ->
+                    voice.locale.language == Locale.KOREAN.language &&
+                        !voice.isNetworkConnectionRequired &&
+                        TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED !in voice.features.orEmpty()
+                }
+                .sortedWith(compareByDescending<android.speech.tts.Voice> { it.quality }.thenBy { it.latency })
+                .firstOrNull()
+        }.getOrNull()
+        bestKoreanLocal?.let { selected ->
+            runCatching { tts.voice = selected }
+            Log.i(TAG, "tts_voice=${selected.name} quality=${selected.quality} latency=${selected.latency}")
+        }
+    }
+
+    private fun requestBookRefocus() {
+        mainHandler.post {
+            resetBookFocus()
+            reporter.sendImmediate("책 영역 초점 초기화 완료 · 다음 촬영 전에 다시 맞춥니다")
         }
     }
 
@@ -739,6 +912,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
 
     private fun commandHelp(): String =
         "명령\n" +
+            "/menu 버튼 메뉴 열기\n" +
             "/settings 현재 설정\n" +
             "/set 0 40 15 명상·공부·휴식(분)\n" +
             "/set countdown 5 시작 대기(초)\n" +
@@ -746,6 +920,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             "/time 25:30 현재 남은 시간\n" +
             "/phase meditation|study|break [분 또는 분:초]\n" +
             "/next 다음 단계\n" +
+            "/focus 책 영역 초점 다시 맞추기\n" +
             "/status /index /b 시간"
 
     private fun restoreSession() {
@@ -882,12 +1057,15 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
     }
 
     override fun onDestroy() {
+        destroyed = true
+        focusGeneration += 1
         mainHandler.removeCallbacksAndMessages(null)
         voice.destroy()
         tts.stop(); tts.shutdown()
         tone.release()
         reporter.close()
         cameraProvider?.unbindAll()
+        camera = null
         cameraExecutor.shutdownNow(); analysisExecutor.shutdownNow()
         if (Build.VERSION.SDK_INT >= 29) runCatching {
             getSystemService(PowerManager::class.java).removeThermalStatusListener(thermalListener)
@@ -912,6 +1090,8 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         private const val NOTIFICATION_ID = 41
         private const val CAPTURE_INTERVAL_MS = 10_000L
         private const val CAPTURE_STALL_MS = 30_000L
+        private const val FOCUS_TIMEOUT_MS = 2_500L
+        private const val FOCUS_RETRY_DELAY_MS = 60_000L
         private const val KEY_ACTIVE = "active"
         private const val KEY_STARTED_EPOCH = "started_epoch"
         private const val KEY_SAVED_EPOCH = "saved_epoch"

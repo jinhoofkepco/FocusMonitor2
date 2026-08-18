@@ -15,7 +15,10 @@ class TelegramCommandParserTest {
         assertEquals(TelegramCommand.Restart, parser.parse("/restart"))
         assertEquals(TelegramCommand.NextPhase, parser.parse("/next"))
         assertEquals(TelegramCommand.Settings, parser.parse("/settings"))
+        assertEquals(TelegramCommand.Refocus, parser.parse("/focus"))
         assertEquals(TelegramCommand.Index, parser.parse("/index"))
+        assertEquals(TelegramCommand.Menu, parser.parse("/menu"))
+        assertEquals(TelegramCommand.Menu, parser.parse("/help"))
     }
 
     @Test fun parsesRemoteTimerControls() {

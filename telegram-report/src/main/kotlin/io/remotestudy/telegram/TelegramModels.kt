@@ -7,7 +7,6 @@ data class TelegramConfig(
     val allowedChatId: Long,
     val captureIntervalMs: Long = 10_000L,
     val montagePeriodMs: Long = 60_000L,
-    val originalBudgetBytes: Long = 300L * 1024L * 1024L,
 ) {
     val enabled: Boolean get() = botToken.isNotBlank() && allowedChatId != 0L
     val cellsPerMontage: Int = (montagePeriodMs / captureIntervalMs).toInt().coerceAtLeast(1)
@@ -15,7 +14,6 @@ data class TelegramConfig(
     init {
         require(captureIntervalMs > 0L)
         require(montagePeriodMs >= captureIntervalMs)
-        require(originalBudgetBytes > 0L)
     }
 }
 
@@ -27,8 +25,10 @@ sealed interface TelegramCommand {
     data object Restart : TelegramCommand
     data object NextPhase : TelegramCommand
     data object Settings : TelegramCommand
+    data object Refocus : TelegramCommand
     data object Index : TelegramCommand
     data object Status : TelegramCommand
+    data object Menu : TelegramCommand
     data class SetSchedule(
         val meditationMinutes: Int,
         val studyMinutes: Int,
@@ -50,7 +50,13 @@ sealed interface BookSelection {
     data class RecentMinutes(val minutes: Int) : BookSelection
 }
 
-data class TelegramUpdate(val updateId: Long, val chatId: Long?, val text: String?)
+data class TelegramUpdate(
+    val updateId: Long,
+    val chatId: Long?,
+    val text: String?,
+    val callbackQueryId: String? = null,
+    val callbackData: String? = null,
+)
 data class TelegramApiResult(val messageId: Long? = null)
 
 data class TelegramSetupChat(
@@ -60,7 +66,11 @@ data class TelegramSetupChat(
     val username: String?,
 )
 
-data class ArchivedOriginal(val capturedAtEpochMs: Long, val file: File)
+data class ArchivedOriginal(
+    val capturedAtEpochMs: Long,
+    val file: File,
+    val bookFile: File? = null,
+)
 
 data class NormalizedBookRegion(
     val left: Float,
@@ -87,6 +97,7 @@ data class UploadEntry(
     val text: String,
     val attempts: Int,
     val nextAttemptEpochMs: Long,
+    val replyMarkup: String? = null,
 )
 
 interface TelegramCommandHandler {

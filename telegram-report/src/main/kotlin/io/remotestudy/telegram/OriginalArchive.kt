@@ -10,31 +10,45 @@ import kotlin.math.abs
 
 class OriginalArchive(
     private val directory: File,
-    private val budgetBytes: Long,
     private val zoneId: ZoneId = ZoneId.systemDefault(),
 ) {
     init { directory.mkdirs() }
 
-    /** Deliberately clears previous-session material; Telegram remains the long-term archive. */
+    /** Keeps only material captured on the current local calendar date. */
     @Synchronized
-    fun startFreshSession() {
-        directory.listFiles()?.forEach(File::delete)
-    }
+    fun startFreshSession(nowEpochMs: Long = System.currentTimeMillis()) = pruneExpired(nowEpochMs)
 
     @Synchronized
-    fun store(cameraJpeg: File, capturedAtEpochMs: Long): ArchivedOriginal {
+    fun store(
+        cameraJpeg: File,
+        capturedAtEpochMs: Long,
+        bookRegion: NormalizedBookRegion,
+    ): ArchivedOriginal {
         val target = directory.resolve("$capturedAtEpochMs.jpg")
-        val bitmap = ImageFiles.decodeUpright(cameraJpeg, ORIGINAL_LONG_EDGE)
-        try { ImageFiles.writeJpeg(bitmap, target, ORIGINAL_JPEG_QUALITY) } finally { bitmap.recycle() }
-        prune()
-        return ArchivedOriginal(capturedAtEpochMs, target)
+        val bookTarget = directory.resolve("${capturedAtEpochMs}_book.jpg")
+        try {
+            val book = ImageFiles.decodeUprightRegion(cameraJpeg, bookRegion, BOOK_LONG_EDGE)
+            try { ImageFiles.writeJpeg(book, bookTarget, BOOK_JPEG_QUALITY) } finally { book.recycle() }
+            val bitmap = ImageFiles.decodeUpright(cameraJpeg, ORIGINAL_LONG_EDGE)
+            try { ImageFiles.writeJpeg(bitmap, target, ORIGINAL_JPEG_QUALITY) } finally { bitmap.recycle() }
+        } catch (failure: Throwable) {
+            target.delete()
+            bookTarget.delete()
+            throw failure
+        }
+        pruneExpired(capturedAtEpochMs)
+        return ArchivedOriginal(capturedAtEpochMs, target, bookTarget)
     }
 
     @Synchronized
     fun all(): List<ArchivedOriginal> = directory.listFiles()
         .orEmpty()
         .filter { it.isFile && it.extension.equals("jpg", ignoreCase = true) }
-        .mapNotNull { file -> file.nameWithoutExtension.toLongOrNull()?.let { ArchivedOriginal(it, file) } }
+        .mapNotNull { file ->
+            file.nameWithoutExtension.toLongOrNull()?.let { epoch ->
+                ArchivedOriginal(epoch, file, directory.resolve("${epoch}_book.jpg").takeIf(File::isFile))
+            }
+        }
         .sortedBy(ArchivedOriginal::capturedAtEpochMs)
 
     @Synchronized
@@ -80,18 +94,22 @@ class OriginalArchive(
     fun createBookCrop(source: ArchivedOriginal, region: NormalizedBookRegion, outputDir: File): File {
         outputDir.mkdirs()
         val target = outputDir.resolve("book-${source.capturedAtEpochMs}-${UUID.randomUUID()}.jpg")
+        source.bookFile?.takeIf(File::isFile)?.let {
+            it.copyTo(target, overwrite = false)
+            return target
+        }
         val bitmap = ImageFiles.decodeRegion(source.file, region)
         try { ImageFiles.writeJpeg(bitmap, target, DETAIL_JPEG_QUALITY) } finally { bitmap.recycle() }
         return target
     }
 
-    private fun prune() {
-        val files = all().toMutableList()
-        var bytes = files.sumOf { it.file.length() }
-        for (entry in files) {
-            if (bytes <= budgetBytes) break
-            val length = entry.file.length()
-            if (entry.file.delete()) bytes -= length
+    private fun pruneExpired(nowEpochMs: Long) {
+        val today = Instant.ofEpochMilli(nowEpochMs).atZone(zoneId).toLocalDate()
+        all().filter {
+            Instant.ofEpochMilli(it.capturedAtEpochMs).atZone(zoneId).toLocalDate().isBefore(today)
+        }.forEach { entry ->
+            entry.file.delete()
+            entry.bookFile?.delete()
         }
     }
 
@@ -114,6 +132,8 @@ class OriginalArchive(
     private companion object {
         const val ORIGINAL_LONG_EDGE = 2_000
         const val ORIGINAL_JPEG_QUALITY = 90
+        const val BOOK_LONG_EDGE = 4_000
+        const val BOOK_JPEG_QUALITY = 95
         const val DETAIL_JPEG_QUALITY = 95
     }
 }

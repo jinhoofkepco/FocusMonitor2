@@ -21,7 +21,13 @@ class DiskUploadQueue(private val journal: File) {
     }
 
     @Synchronized
-    fun enqueue(kind: UploadKind, file: File?, text: String, nowEpochMs: Long): UploadEntry {
+    fun enqueue(
+        kind: UploadKind,
+        file: File?,
+        text: String,
+        nowEpochMs: Long,
+        replyMarkup: String? = null,
+    ): UploadEntry {
         val entry = UploadEntry(
             id = UUID.randomUUID().toString(),
             kind = kind,
@@ -29,6 +35,7 @@ class DiskUploadQueue(private val journal: File) {
             text = text,
             attempts = 0,
             nextAttemptEpochMs = nowEpochMs,
+            replyMarkup = replyMarkup,
         )
         entries[entry.id] = entry
         append("PUT", entry)
@@ -80,6 +87,7 @@ class DiskUploadQueue(private val journal: File) {
                         text = fields["text"].orEmpty(),
                         attempts = fields["attempts"]?.toInt() ?: 0,
                         nextAttemptEpochMs = fields["next"]?.toLong() ?: 0L,
+                        replyMarkup = fields["markup"].orEmpty().ifBlank { null },
                     )
                 }.getOrNull()?.let { entries[id] = it }
             }
@@ -90,7 +98,8 @@ class DiskUploadQueue(private val journal: File) {
     private fun append(op: String, entry: UploadEntry) = appendRaw(
         "{\"op\":\"$op\",\"id\":\"${escape(entry.id)}\",\"kind\":\"${entry.kind}\"," +
             "\"file\":\"${escape(entry.filePath.orEmpty())}\",\"text\":\"${escape(entry.text)}\"," +
-            "\"attempts\":\"${entry.attempts}\",\"next\":\"${entry.nextAttemptEpochMs}\"}",
+            "\"attempts\":\"${entry.attempts}\",\"next\":\"${entry.nextAttemptEpochMs}\"," +
+            "\"markup\":\"${escape(entry.replyMarkup.orEmpty())}\"}",
     )
 
     private fun appendRaw(line: String) {
@@ -113,7 +122,8 @@ class DiskUploadQueue(private val journal: File) {
                     writer.append(
                         "{\"op\":\"PUT\",\"id\":\"${escape(entry.id)}\",\"kind\":\"${entry.kind}\"," +
                             "\"file\":\"${escape(entry.filePath.orEmpty())}\",\"text\":\"${escape(entry.text)}\"," +
-                            "\"attempts\":\"${entry.attempts}\",\"next\":\"${entry.nextAttemptEpochMs}\"}\n",
+                            "\"attempts\":\"${entry.attempts}\",\"next\":\"${entry.nextAttemptEpochMs}\"," +
+                            "\"markup\":\"${escape(entry.replyMarkup.orEmpty())}\"}\n",
                     )
                 }
                 writer.flush()

@@ -21,7 +21,7 @@ class TelegramReporter(
 ) : Closeable {
     private val api = TelegramBotApi(config)
     private val queue = DiskUploadQueue(rootDirectory.resolve("upload-queue.jsonl"))
-    private val archive = OriginalArchive(rootDirectory.resolve("originals"), config.originalBudgetBytes, zoneId)
+    private val archive = OriginalArchive(rootDirectory.resolve("originals"), zoneId)
     private val montageDir = rootDirectory.resolve("montages")
     private val detailDir = rootDirectory.resolve("details")
     private val parser = TelegramCommandParser()
@@ -82,10 +82,10 @@ class TelegramReporter(
         sendImmediate("공부 세션을 시작합니다")
     }
 
-    /** Source is copied to the 300MB archive before this call returns. */
+    /** Source is copied to today's disk archive before this call returns. */
     fun recordCapture(cameraJpeg: File, capturedAtEpochMs: Long, elapsedRealtimeMs: Long) {
         synchronized(lock) {
-            val archived = archive.store(cameraJpeg, capturedAtEpochMs)
+            val archived = archive.store(cameraJpeg, capturedAtEpochMs, loadBookRegion())
             val activeComposer = composer ?: MontageComposer(config.cellsPerMontage, montageDir, zoneId).also {
                 composer = it
             }
@@ -99,7 +99,13 @@ class TelegramReporter(
                     it.atEpochMs in result.firstCapturedAtEpochMs..result.lastCapturedAtEpochMs
                 }
                 val caption = buildCaption(result, elapsedMinutes, includedAway)
-                queue.enqueue(UploadKind.PHOTO, result.file, caption, now())
+                queue.enqueue(
+                    UploadKind.PHOTO,
+                    result.file,
+                    caption,
+                    now(),
+                    replyMarkup = montageButtons(result),
+                )
                 montageIndex += MontageIndexEntry(result.sequence, result.firstCapturedAtEpochMs, result.lastCapturedAtEpochMs)
                 persistSessionState()
                 wakeUploader()
@@ -112,10 +118,15 @@ class TelegramReporter(
         sendImmediate("자리 이탈 · ${formatTime(atEpochMs)} · ${durationMs / 1_000}초")
     }
 
-    fun sendImmediate(message: String) {
-        queue.enqueue(UploadKind.MESSAGE, null, message, now())
+    fun sendImmediate(message: String, replyMarkup: String? = null) {
+        queue.enqueue(UploadKind.MESSAGE, null, message, now(), replyMarkup = replyMarkup)
         wakeUploader()
     }
+
+    fun sendControlMenu() = sendImmediate(
+        "원하는 기능을 누르세요. 기존 직접 명령도 그대로 사용할 수 있습니다.",
+        CONTROL_MENU,
+    )
 
     fun sendIndex() {
         val text = synchronized(lock) {
@@ -164,7 +175,13 @@ class TelegramReporter(
             composer?.takeIf { it.size > 0 }?.let { partial ->
                 val result = partial.finish(++montageSequence)
                 val elapsedMinutes = (SystemClock.elapsedRealtime() - sessionStartedAtElapsedMs).coerceAtLeast(0L) / 60_000L
-                queue.enqueue(UploadKind.PHOTO, result.file, buildCaption(result, elapsedMinutes, emptyList()), now())
+                queue.enqueue(
+                    UploadKind.PHOTO,
+                    result.file,
+                    buildCaption(result, elapsedMinutes, emptyList()),
+                    now(),
+                    replyMarkup = montageButtons(result),
+                )
                 montageIndex += MontageIndexEntry(result.sequence, result.firstCapturedAtEpochMs, result.lastCapturedAtEpochMs)
             }
             composer?.close()
@@ -204,9 +221,9 @@ class TelegramReporter(
 
     private fun upload(entry: UploadEntry) {
         when (entry.kind) {
-            UploadKind.PHOTO -> api.sendPhoto(requireFile(entry), entry.text)
+            UploadKind.PHOTO -> api.sendPhoto(requireFile(entry), entry.text, entry.replyMarkup)
             UploadKind.DOCUMENT -> api.sendDocument(requireFile(entry), entry.text)
-            UploadKind.MESSAGE -> api.sendMessage(entry.text)
+            UploadKind.MESSAGE -> api.sendMessage(entry.text, entry.replyMarkup)
             UploadKind.MESSAGE_AND_PIN -> {
                 val message = api.sendMessage(entry.text)
                 api.pinChatMessage(requireNotNull(message.messageId))
@@ -221,6 +238,7 @@ class TelegramReporter(
             while (!closed.get() && runCatching { api.deleteWebhook() }.isFailure) {
                 runCatching { Thread.sleep(POLL_FAILURE_DELAY_MS) }
             }
+            runCatching { api.setMyCommands() }
             while (!closed.get()) {
                 val updatesResult = runCatching { api.getUpdates(offset, 50) }
                 if (updatesResult.isFailure) {
@@ -236,6 +254,13 @@ class TelegramReporter(
                         continue
                     }
                     val text = update.text
+                    if (update.callbackQueryId != null) {
+                        val handled = runCatching { handleCallback(update) }.isSuccess
+                        if (!handled) break
+                        offset = update.updateId + 1
+                        commitOffset(offset)
+                        continue
+                    }
                     if (text == null) {
                         offset = update.updateId + 1
                         commitOffset(offset)
@@ -244,6 +269,7 @@ class TelegramReporter(
                     val handled = runCatching {
                         val command = parser.parse(text)
                         when (command) {
+                            TelegramCommand.Menu -> sendControlMenu()
                             TelegramCommand.Index -> sendIndex()
                             is TelegramCommand.Book -> sendBookDetails(command.selection)
                             else -> commandHandler.handle(command)
@@ -260,6 +286,74 @@ class TelegramReporter(
 
     private fun wakeUploader() {
         if (!uploadRunning.get()) startUploadLoop()
+    }
+
+    private fun handleCallback(update: TelegramUpdate) {
+        val callbackId = requireNotNull(update.callbackQueryId)
+        val data = update.callbackData.orEmpty()
+        BOOK_BUTTON.matchEntire(data)?.let { match ->
+            val capturedAt = match.groupValues[1].toLong()
+            val source = archive.all().firstOrNull { it.capturedAtEpochMs == capturedAt }
+            if (source == null) {
+                sendImmediate("선택한 사진은 날짜가 지나 학생폰에서 삭제됐습니다")
+                runCatching { api.answerCallbackQuery(callbackId, "원본이 삭제됐습니다") }
+                return
+            }
+            val detail = archive.createBookCrop(source, loadBookRegion(), detailDir)
+            queue.enqueue(UploadKind.DOCUMENT, detail, "책 영역 · ${formatTime(source.capturedAtEpochMs)}", now())
+            wakeUploader()
+            runCatching { api.answerCallbackQuery(callbackId, "${formatTime(source.capturedAtEpochMs)} 책 사진 전송 중") }
+            return
+        }
+        val command = when (data) {
+            "cmd:start" -> TelegramCommand.Start
+            "cmd:pause" -> TelegramCommand.Pause
+            "cmd:resume" -> TelegramCommand.Resume
+            "cmd:next" -> TelegramCommand.NextPhase
+            "cmd:status" -> TelegramCommand.Status
+            "cmd:settings" -> TelegramCommand.Settings
+            "cmd:focus" -> TelegramCommand.Refocus
+            "cmd:index" -> TelegramCommand.Index
+            "cmd:recent" -> TelegramCommand.Book(BookSelection.RecentMinutes(5))
+            "cmd:stop" -> return sendCallbackMenu(callbackId, "공부를 종료할까요?", CONFIRM_STOP_MENU)
+            "cmd:restart" -> return sendCallbackMenu(callbackId, "현재 진행을 버리고 처음부터 다시 시작할까요?", CONFIRM_RESTART_MENU)
+            "confirm:stop" -> TelegramCommand.Stop
+            "confirm:restart" -> TelegramCommand.Restart
+            "menu:time" -> return sendCallbackMenu(
+                callbackId,
+                "시간 조합을 선택하세요. 직접 설정은 /set 명상 공부 휴식 형식입니다.",
+                TIME_MENU,
+            )
+            "set:0:40:15" -> TelegramCommand.SetSchedule(0, 40, 15)
+            "set:5:40:15" -> TelegramCommand.SetSchedule(5, 40, 15)
+            "set:5:50:10" -> TelegramCommand.SetSchedule(5, 50, 10)
+            "menu:main" -> return sendCallbackMenu(callbackId, "원하는 기능을 누르세요.", CONTROL_MENU)
+            else -> {
+                runCatching { api.answerCallbackQuery(callbackId, "지원하지 않는 버튼입니다") }
+                return
+            }
+        }
+        when (command) {
+            TelegramCommand.Index -> sendIndex()
+            is TelegramCommand.Book -> sendBookDetails(command.selection)
+            else -> commandHandler.handle(command)
+        }
+        runCatching { api.answerCallbackQuery(callbackId, "처리했습니다") }
+    }
+
+    private fun sendCallbackMenu(callbackId: String, text: String, replyMarkup: String) {
+        sendImmediate(text, replyMarkup)
+        runCatching { api.answerCallbackQuery(callbackId, "메뉴를 열었습니다") }
+    }
+
+    private fun montageButtons(result: MontageComposer.MontageResult): String = buildString {
+        append("{\"inline_keyboard\":[[")
+        result.capturedAtEpochMs.forEachIndexed { index, capturedAt ->
+            if (index > 0) append(',')
+            append("{\"text\":\"").append(index + 1)
+                .append("\",\"callback_data\":\"book:").append(capturedAt).append("\"}")
+        }
+        append("]]}")
     }
 
     private fun requireFile(entry: UploadEntry): File = requireNotNull(entry.filePath).let(::File).also {
@@ -377,5 +471,10 @@ class TelegramReporter(
         const val POLL_FAILURE_DELAY_MS = 3_000L
         val TIME: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm:ss")
         val PHOTO_SEQUENCE = Regex("^#(\\d+)")
+        val BOOK_BUTTON = Regex("^book:(\\d{1,19})$")
+        const val CONTROL_MENU = """{"inline_keyboard":[[{"text":"▶ 시작","callback_data":"cmd:start"},{"text":"⏸ 일시정지","callback_data":"cmd:pause"},{"text":"▶ 계속","callback_data":"cmd:resume"}],[{"text":"⏭ 다음 단계","callback_data":"cmd:next"},{"text":"⏹ 종료","callback_data":"cmd:stop"},{"text":"🔄 처음부터","callback_data":"cmd:restart"}],[{"text":"📊 현재 상태","callback_data":"cmd:status"},{"text":"📷 최근 5분","callback_data":"cmd:recent"},{"text":"🎯 초점","callback_data":"cmd:focus"}],[{"text":"⏱ 시간 설정","callback_data":"menu:time"},{"text":"🖼 사진 목록","callback_data":"cmd:index"},{"text":"⚙ 현재 설정","callback_data":"cmd:settings"}]]}"""
+        const val TIME_MENU = """{"inline_keyboard":[[{"text":"0·40·15","callback_data":"set:0:40:15"},{"text":"5·40·15","callback_data":"set:5:40:15"},{"text":"5·50·10","callback_data":"set:5:50:10"}],[{"text":"‹ 기본 메뉴","callback_data":"menu:main"}]]}"""
+        const val CONFIRM_STOP_MENU = """{"inline_keyboard":[[{"text":"종료","callback_data":"confirm:stop"},{"text":"취소","callback_data":"menu:main"}]]}"""
+        const val CONFIRM_RESTART_MENU = """{"inline_keyboard":[[{"text":"처음부터 시작","callback_data":"confirm:restart"},{"text":"취소","callback_data":"menu:main"}]]}"""
     }
 }
