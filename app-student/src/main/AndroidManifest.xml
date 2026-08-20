@@ -40,6 +40,6 @@
             android:name=".StudentStudyService"
             android:exported="false"
             android:foregroundServiceType="camera|microphone|dataSync"
-            android:stopWithTask="false" />
+            android:stopWithTask="true" />
     </application>
 </manifest>

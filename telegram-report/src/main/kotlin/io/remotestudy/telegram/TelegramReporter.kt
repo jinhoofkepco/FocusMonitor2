@@ -87,13 +87,22 @@ class TelegramReporter(
     }
 
     /** Source is copied to today's disk archive before this call returns. */
-    fun recordCapture(cameraJpeg: File, capturedAtEpochMs: Long, elapsedRealtimeMs: Long) {
+    fun recordCapture(
+        cameraJpeg: File,
+        capturedAtEpochMs: Long,
+        elapsedRealtimeMs: Long,
+        physicalThreeXJpeg: File? = null,
+    ) {
         synchronized(lock) {
-            val archived = archive.store(cameraJpeg, capturedAtEpochMs, loadBookRegion())
+            var archived = archive.store(cameraJpeg, capturedAtEpochMs, loadBookRegion())
+            if (physicalThreeXJpeg?.isFile == true) {
+                archived = archive.storePhysicalThreeX(archived, physicalThreeXJpeg)
+            }
             val activeComposer = composer ?: MontageComposer(config.cellsPerMontage, montageDir, zoneId).also {
                 composer = it
             }
-            activeComposer.add(archived.file, capturedAtEpochMs)
+            val montageSource = archived.physicalThreeXFile ?: archived.file
+            activeComposer.add(montageSource, capturedAtEpochMs, badge = if (archived.physicalThreeXFile != null) "3×" else null)
             if (activeComposer.isComplete) {
                 val result = activeComposer.finish(++montageSequence)
                 activeComposer.close()
@@ -115,6 +124,10 @@ class TelegramReporter(
                 wakeUploader()
             }
         }
+    }
+
+    fun isNextMontageCellFirst(): Boolean = synchronized(lock) {
+        composer == null || composer?.size == 0
     }
 
     fun recordAway(atEpochMs: Long, durationMs: Long) {
@@ -390,10 +403,20 @@ class TelegramReporter(
                 runCatching { api.answerCallbackQuery(callbackId, "원본이 삭제됐습니다") }
                 return
             }
-            val detail = archive.createBookCrop(source, loadBookRegion(), detailDir, loadBookRotation())
-            queue.enqueue(UploadKind.DOCUMENT, detail, "책 영역 · ${formatTime(source.capturedAtEpochMs)}", now())
+            val physical = source.physicalThreeXFile?.takeIf(File::isFile)
+            val detail = if (physical != null) {
+                archive.createPhysicalThreeX(source, detailDir, loadBookRotation())
+            } else {
+                archive.createBookCrop(source, loadBookRegion(), detailDir, loadBookRotation())
+            }
+            val caption = if (physical != null) {
+                "3× 전체 원본 · ${formatTime(source.capturedAtEpochMs)}"
+            } else {
+                "1× 책 영역 · ${formatTime(source.capturedAtEpochMs)}"
+            }
+            queue.enqueue(UploadKind.DOCUMENT, detail, caption, now())
             wakeUploader()
-            runCatching { api.answerCallbackQuery(callbackId, "${formatTime(source.capturedAtEpochMs)} 책 사진 전송 중") }
+            runCatching { api.answerCallbackQuery(callbackId, "${formatTime(source.capturedAtEpochMs)} ${if (physical != null) "3×" else "책"} 사진 전송 중") }
             return
         }
         AREA_SET_BUTTON.matchEntire(data)?.let { match ->

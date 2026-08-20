@@ -571,6 +571,8 @@ class StudentVoiceCommandController @JvmOverloads constructor(
                 "아빠",
                 "아빠 녹음",
                 "공부 시작",
+                "시작할게",
+                "시작할게요",
                 "일시 정지",
                 "그만",
             ),

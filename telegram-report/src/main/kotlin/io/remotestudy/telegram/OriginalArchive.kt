@@ -1,5 +1,6 @@
 package io.remotestudy.telegram
 
+import android.media.ExifInterface
 import java.io.File
 import java.time.Instant
 import java.time.LocalDate
@@ -46,6 +47,27 @@ class OriginalArchive(
         return ArchivedOriginal(capturedAtEpochMs, target, bookTarget, bookRegion)
     }
 
+    /** Attaches an un-cropped physical 3× JPEG to an already committed 1× capture. */
+    @Synchronized
+    fun storePhysicalThreeX(source: ArchivedOriginal, physicalJpeg: File): ArchivedOriginal {
+        require(source.file.isFile) { "The matching 1x capture is missing" }
+        require(physicalJpeg.isFile) { "The physical 3x capture is missing" }
+        val target = directory.resolve("${source.capturedAtEpochMs}_physical-3x.jpg")
+        val staging = directory.resolve(target.name + ".part")
+        try {
+            physicalJpeg.copyTo(staging, overwrite = true)
+            if (!staging.renameTo(target)) {
+                staging.copyTo(target, overwrite = true)
+                staging.delete()
+            }
+        } catch (failure: Throwable) {
+            staging.delete()
+            target.delete()
+            throw failure
+        }
+        return source.copy(physicalThreeXFile = target)
+    }
+
     @Synchronized
     fun all(): List<ArchivedOriginal> = directory.listFiles()
         .orEmpty()
@@ -57,6 +79,7 @@ class OriginalArchive(
                     file,
                     directory.resolve("${epoch}_book.jpg").takeIf(File::isFile),
                     readBookRegion(directory.resolve("${epoch}_book-region.txt")),
+                    directory.resolve("${epoch}_physical-3x.jpg").takeIf(File::isFile),
                 )
             }
         }
@@ -126,6 +149,45 @@ class OriginalArchive(
         return target
     }
 
+    @Synchronized
+    fun createPhysicalThreeX(
+        source: ArchivedOriginal,
+        outputDir: File,
+        rotationDegrees: Int = 0,
+    ): File {
+        require(rotationDegrees in setOf(0, 90, 180, 270))
+        val physical = requireNotNull(source.physicalThreeXFile?.takeIf(File::isFile)) {
+            "Physical 3x file is missing"
+        }
+        outputDir.mkdirs()
+        val target = outputDir.resolve("physical-3x-${source.capturedAtEpochMs}-${UUID.randomUUID()}.jpg")
+        physical.copyTo(target, overwrite = false)
+        if (rotationDegrees != 0) {
+            ExifInterface(target.absolutePath).apply {
+                val currentDegrees = when (
+                    getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+                ) {
+                    ExifInterface.ORIENTATION_ROTATE_90 -> 90
+                    ExifInterface.ORIENTATION_ROTATE_180 -> 180
+                    ExifInterface.ORIENTATION_ROTATE_270 -> 270
+                    else -> 0
+                }
+                val combined = (currentDegrees + rotationDegrees) % 360
+                setAttribute(
+                    ExifInterface.TAG_ORIENTATION,
+                    when (combined) {
+                        90 -> ExifInterface.ORIENTATION_ROTATE_90
+                        180 -> ExifInterface.ORIENTATION_ROTATE_180
+                        270 -> ExifInterface.ORIENTATION_ROTATE_270
+                        else -> ExifInterface.ORIENTATION_NORMAL
+                    }.toString(),
+                )
+                saveAttributes()
+            }
+        }
+        return target
+    }
+
     private fun pruneExpired(nowEpochMs: Long) {
         val today = Instant.ofEpochMilli(nowEpochMs).atZone(zoneId).toLocalDate()
         all().filter {
@@ -133,6 +195,7 @@ class OriginalArchive(
         }.forEach { entry ->
             entry.file.delete()
             entry.bookFile?.delete()
+            entry.physicalThreeXFile?.delete()
             directory.resolve("${entry.capturedAtEpochMs}_book-region.txt").delete()
         }
     }
@@ -143,6 +206,7 @@ class OriginalArchive(
             val epoch = when {
                 file.name.endsWith("_book.jpg") -> file.name.removeSuffix("_book.jpg").toLongOrNull()
                 file.name.endsWith("_book-region.txt") -> file.name.removeSuffix("_book-region.txt").toLongOrNull()
+                file.name.endsWith("_physical-3x.jpg") -> file.name.removeSuffix("_physical-3x.jpg").toLongOrNull()
                 file.name.endsWith(".part") || file.name.endsWith(".tmp") -> {
                     file.delete()
                     null

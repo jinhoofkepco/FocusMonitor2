@@ -79,6 +79,7 @@ data class ArchivedOriginal(
     val file: File,
     val bookFile: File? = null,
     val bookRegion: NormalizedBookRegion? = null,
+    val physicalThreeXFile: File? = null,
 )
 
 data class NormalizedBookRegion(

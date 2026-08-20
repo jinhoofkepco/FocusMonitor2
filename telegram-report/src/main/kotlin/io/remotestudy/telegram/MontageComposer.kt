@@ -36,7 +36,7 @@ class MontageComposer(
     val isComplete: Boolean get() = count >= expectedCells
     val size: Int get() = count
 
-    fun add(jpeg: File, capturedAtEpochMs: Long) {
+    fun add(jpeg: File, capturedAtEpochMs: Long, badge: String? = null) {
         check(!closed && !isComplete)
         val cell = ImageFiles.decodeUpright(jpeg, CELL_LONG_EDGE)
         try {
@@ -53,6 +53,12 @@ class MontageComposer(
             val labelWidth = labelPaint.measureText(label)
             canvas.drawRect(cellRect.left.toFloat(), cellRect.top.toFloat(), cellRect.left + labelWidth + 20f, cellRect.top + 44f, LABEL_BACKGROUND)
             canvas.drawText(label, cellRect.left + 10f, cellRect.top + 34f, labelPaint)
+            badge?.let {
+                val badgeWidth = labelPaint.measureText(it)
+                val badgeLeft = cellRect.right - badgeWidth - 20f
+                canvas.drawRect(badgeLeft - 10f, cellRect.top.toFloat(), cellRect.right.toFloat(), cellRect.top + 44f, BADGE_BACKGROUND)
+                canvas.drawText(it, badgeLeft, cellRect.top + 34f, labelPaint)
+            }
         } finally {
             cell.recycle()
         }
@@ -89,5 +95,6 @@ class MontageComposer(
         const val CELL_HEIGHT = 400
         val TIME: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm:ss")
         val LABEL_BACKGROUND = Paint().apply { color = Color.argb(190, 0, 0, 0) }
+        val BADGE_BACKGROUND = Paint().apply { color = Color.argb(220, 0, 100, 60) }
     }
 }

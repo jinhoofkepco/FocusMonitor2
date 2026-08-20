@@ -15,6 +15,10 @@ class KoreanVoiceCommandPhraseMatcherTest {
             "공부를 시작해",
             "공부 시작해 주세요!",
             "공부 시작할게",
+            "시작할게",
+            "시작할께",
+            "시작할게요",
+            "시작할께요",
         )
     }
 

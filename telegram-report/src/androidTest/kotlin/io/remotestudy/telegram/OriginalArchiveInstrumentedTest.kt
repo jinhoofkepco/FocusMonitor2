@@ -16,6 +16,43 @@ import java.util.UUID
 
 @RunWith(AndroidJUnit4::class)
 class OriginalArchiveInstrumentedTest {
+    @Test fun attachesAndReturnsUncroppedPhysicalThreeXOriginal() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val root = File(context.cacheDir, "archive-physical-test-${UUID.randomUUID()}").apply { mkdirs() }
+        try {
+            fun jpeg(name: String, width: Int, height: Int, color: Int): File {
+                val file = root.resolve(name)
+                val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                bitmap.eraseColor(color)
+                file.outputStream().use { bitmap.compress(Bitmap.CompressFormat.JPEG, 98, it) }
+                bitmap.recycle()
+                return file
+            }
+            val archive = OriginalArchive(root.resolve("archive"))
+            val stored = archive.store(
+                jpeg("main.jpg", 1200, 900, Color.WHITE),
+                456_789L,
+                NormalizedBookRegion.DEFAULT,
+            )
+            val physical = jpeg("physical.jpg", 1600, 1200, Color.BLUE)
+            val attached = archive.storePhysicalThreeX(stored, physical)
+            assertTrue(requireNotNull(attached.physicalThreeXFile).isFile)
+
+            val reopened = OriginalArchive(root.resolve("archive")).all().single()
+            assertTrue(requireNotNull(reopened.physicalThreeXFile).isFile)
+            val detail = archive.createPhysicalThreeX(reopened, root.resolve("details"), rotationDegrees = 0)
+            assertTrue(reopened.physicalThreeXFile!!.readBytes().contentEquals(detail.readBytes()))
+
+            val rotated = archive.createPhysicalThreeX(reopened, root.resolve("details"), rotationDegrees = 90)
+            val upright = ImageFiles.decodeUpright(rotated, 4_000)
+            assertEquals(1200, upright.width)
+            assertEquals(1600, upright.height)
+            upright.recycle()
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
     @Test fun reusesOnlyMatchingBookCropAndRecropsChangedRegionFromFullFrame() {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
         val root = File(context.cacheDir, "archive-test-${UUID.randomUUID()}").apply { mkdirs() }
@@ -118,6 +155,7 @@ class OriginalArchiveInstrumentedTest {
             archiveDir.resolve("$yesterday.jpg").writeBytes(byteArrayOf(1))
             archiveDir.resolve("${yesterday}_book.jpg").writeBytes(byteArrayOf(2))
             archiveDir.resolve("${yesterday}_book-region.txt").writeText("0.1,0.1,0.9,0.9")
+            archiveDir.resolve("${yesterday}_physical-3x.jpg").writeBytes(byteArrayOf(5))
             archiveDir.resolve("$today.jpg").writeBytes(byteArrayOf(3))
             archiveDir.resolve("${today}_book.jpg").writeBytes(byteArrayOf(4))
 
@@ -128,6 +166,7 @@ class OriginalArchiveInstrumentedTest {
             assertTrue(!archiveDir.resolve("$yesterday.jpg").exists())
             assertTrue(!archiveDir.resolve("${yesterday}_book.jpg").exists())
             assertTrue(!archiveDir.resolve("${yesterday}_book-region.txt").exists())
+            assertTrue(!archiveDir.resolve("${yesterday}_physical-3x.jpg").exists())
         } finally {
             root.deleteRecursively()
         }

@@ -100,6 +100,9 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
     private val captureGeneration = AtomicLong(0L)
     private var captureStartedAtElapsedMs = 0L
     private val cameraComparisonInFlight = AtomicBoolean(false)
+    private val scheduledThreeXInFlight = AtomicBoolean(false)
+    private var scheduledThreeXConsecutiveFailures = 0
+    private var scheduledThreeXDisabledForSession = false
     private var imageCapture: ImageCapture? = null
     private var cameraProvider: ProcessCameraProvider? = null
     private var camera: Camera? = null
@@ -108,12 +111,16 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
     private var cameraBindGeneration = 0
     private var cameraRecoveryNoticePending = false
     private var cameraRecoveryFailureReported = false
+    private var activePhysicalCapture: PhysicalYuvCameraCapture.Handle? = null
+    private var scheduledOneXTemp: File? = null
+    private var scheduledPhysicalTemp: File? = null
     private var nextFocusAttemptElapsedMs = 0L
     @Volatile private var destroyed = false
     private lateinit var reporter: TelegramReporter
     private lateinit var voice: StudentVoiceCommandController
     private lateinit var tts: TextToSpeech
     private lateinit var tone: ToneGenerator
+    private lateinit var cueTone: ToneGenerator
     private lateinit var motionAnalyzer: MotionAnalyzer
     private val activityMonitor = StudyActivityMonitor()
     private val preferences by lazy { getSharedPreferences("student-study", MODE_PRIVATE) }
@@ -133,6 +140,14 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             mainHandler.postDelayed(this, CAPTURE_INTERVAL_MS)
         }
     }
+    private val breakResumeReminder = object : Runnable {
+        override fun run() {
+            if (destroyed || !awaitingBreakResume) return
+            speakStudentCue("쉬는 시간이 끝났습니다. 자리로 돌아와 시작할게라고 말하세요")
+            mainHandler.postDelayed(this, BREAK_RESUME_REMINDER_INTERVAL_MS)
+        }
+    }
+    private var awaitingBreakResume = false
 
     override fun onCreate() {
         super.onCreate()
@@ -144,6 +159,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         // Student feedback must follow media volume so it remains audible when
         // notification volume is muted but video/music playback is enabled.
         tone = ToneGenerator(AudioManager.STREAM_MUSIC, 90)
+        cueTone = ToneGenerator(AudioManager.STREAM_ALARM, 100)
         tts = TextToSpeech(this) { status ->
             if (status == TextToSpeech.SUCCESS) {
                 configureTts()
@@ -204,6 +220,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             bindCamera()
             if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) voice.start()
             broadcastState("텔레그램 명령 대기")
+            if (awaitingBreakResume) startBreakResumeReminders()
         }
         registerThermalListener()
         mainHandler.post(ticker)
@@ -221,10 +238,18 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             }
             ACTION_STOP_SERVICE -> stopSelf()
         }
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // Defense for OEM builds that deliver this callback despite stopWithTask=true.
+        // Removing the recent-app task is an explicit request to stop camera and microphone work.
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+        super.onTaskRemoved(rootIntent)
+    }
 
     override fun handle(command: TelegramCommand) {
         when (command) {
@@ -277,6 +302,9 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         }
         completedProblemCount = 0
         countdownPaused = false
+        clearBreakResumeWait()
+        scheduledThreeXConsecutiveFailures = 0
+        scheduledThreeXDisabledForSession = false
         val nowElapsed = SystemClock.elapsedRealtime()
         session = newSessionMachine()
         sessionClockOffsetMs = -nowElapsed
@@ -296,6 +324,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         val started = session.snapshot()
         reporter.sendImmediate("세션 시작 · ${settingsText(oneLine = true)}")
         broadcastState(if (started.status == SessionStatus.START_COUNTDOWN) "${teacherCountdownMs / 1_000}초 뒤 시작" else statusText(started))
+        if (started.status == SessionStatus.RUNNING) announcePhaseStart(started.phase)
     }
 
     private fun pauseSession() = synchronized(sessionLock) {
@@ -319,6 +348,10 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
 
     private fun resumeSession() = synchronized(sessionLock) {
         if (!sessionActive) { reporter.sendImmediate("진행 중인 세션이 없습니다"); return@synchronized }
+        if (awaitingBreakResume) {
+            resumeAfterBreak("선생님 명령")
+            return@synchronized
+        }
         if (countdownPaused && session.snapshot().status == SessionStatus.START_COUNTDOWN) {
             sessionClockOffsetMs = countdownPausedAtSessionMs - SystemClock.elapsedRealtime()
             countdownPaused = false
@@ -338,6 +371,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         if (!sessionActive) { reporter.sendImmediate("진행 중인 세션이 없습니다"); return@synchronized }
         val snapshot = session.snapshot()
         sessionActive = false
+        clearBreakResumeWait()
         clearSessionState()
         updateMonitor(snapshot.copy(status = SessionStatus.COMPLETED))
         reporter.finishSession("세션 종료 · 완료한 문제 ${completedProblemCount}개 · 몽타주 대기 ${reporter.pendingUploadCount()}건")
@@ -348,6 +382,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         if (sessionActive) {
             reporter.finishSession("선생님 명령으로 현재 회차 종료 · 완료한 문제 ${completedProblemCount}개")
             sessionActive = false
+            clearBreakResumeWait()
             clearSessionState()
         }
         startSession()
@@ -428,6 +463,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
 
     private fun goToPhase(remotePhase: RemoteSessionPhase, remainingSeconds: Int?) = synchronized(sessionLock) {
         if (!sessionActive) initializeRemoteSession()
+        clearBreakResumeWait()
         countdownPaused = false
         preferences.edit().putBoolean(KEY_COUNTDOWN_PAUSED, false).apply()
         val phase = when (remotePhase) {
@@ -444,6 +480,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         updateMonitor(updated)
         broadcastState(statusText(updated))
         reporter.sendImmediate("단계 이동 완료 · ${statusText(updated)}")
+        announcePhaseStart(updated.phase)
     }
 
     private fun nextPhase() = synchronized(sessionLock) {
@@ -459,7 +496,11 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         } else when (current.phase) {
             SessionPhase.MEDITATION -> positionAt(SessionPhase.STUDY, schedule.studyDurationMs, paused = false)
             SessionPhase.STUDY -> positionAt(SessionPhase.BREAK, schedule.breakDurationMs, paused = false)
-            SessionPhase.BREAK, SessionPhase.COMPLETE -> {
+            SessionPhase.BREAK -> {
+                enterBreakResumeWait()
+                return@synchronized
+            }
+            SessionPhase.COMPLETE -> {
                 val snapshot = session.snapshot()
                 sessionActive = false
                 clearSessionState()
@@ -474,6 +515,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         updateMonitor(updated)
         broadcastState(statusText(updated))
         reporter.sendImmediate("다음 단계 · ${statusText(updated)}")
+        announcePhaseStart(updated.phase)
     }
 
     private fun finishIfCompleted(snapshot: SessionSnapshot, reason: String): Boolean {
@@ -489,12 +531,21 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
     private fun tickSession() {
         if (!sessionActive) return
         synchronized(sessionLock) {
-            if (countdownPaused) return@synchronized
+            if (countdownPaused || awaitingBreakResume) return@synchronized
             val before = session.snapshot()
             val current = session.dispatch(Tick(sessionNow()))
+            if (BreakResumePolicy.shouldEnterWaiting(before, current)) {
+                enterBreakResumeWait()
+                return@synchronized
+            }
             if (current.status != before.status || current.phase != before.phase || current.phaseRemainingMs / 60_000 != before.phaseRemainingMs / 60_000) {
                 persistSnapshot(current)
                 broadcastState(statusText(current))
+            }
+            if ((before.status == SessionStatus.START_COUNTDOWN && current.status == SessionStatus.RUNNING) ||
+                (current.phase != before.phase && current.status == SessionStatus.RUNNING)
+            ) {
+                announcePhaseStart(current.phase)
             }
             updateMonitor(current)
             if (current.status == SessionStatus.COMPLETED) {
@@ -506,7 +557,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
     }
 
     private fun maybeCapture() {
-        if (cameraComparisonInFlight.get()) return
+        if (cameraComparisonInFlight.get() || scheduledThreeXInFlight.get()) return
         val current = snapshot()
         if (!sessionActive || current.status != SessionStatus.RUNNING) return
         if (captureInFlight.get() && SystemClock.elapsedRealtime() - captureStartedAtElapsedMs > CAPTURE_STALL_MS) {
@@ -546,22 +597,11 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
                 override fun onImageSaved(output: ImageCapture.OutputFileResults) {
                     val epoch = System.currentTimeMillis()
                     val elapsed = SystemClock.elapsedRealtime()
-                    runCatching {
-                        cameraExecutor.execute {
-                            if (generation != captureGeneration.get()) {
-                                temp.delete()
-                                return@execute
-                            }
-                            runCatching { reporter.recordCapture(temp, epoch, elapsed) }
-                                .onFailure { reporter.sendImmediate("촬영 처리 실패: ${it.message.orEmpty()}") }
-                            temp.delete()
-                            if (captureGeneration.get() == generation) captureInFlight.set(false)
-                            broadcastLatestCapture(epoch)
-                            logThermal("capture_ok")
-                        }
-                    }.onFailure {
-                        temp.delete()
-                        if (captureGeneration.get() == generation) captureInFlight.set(false)
+                    val shouldCaptureThreeX = reporter.isNextMontageCellFirst() && canAttemptScheduledThreeX()
+                    if (shouldCaptureThreeX) {
+                        startScheduledThreeX(temp, epoch, elapsed, generation)
+                    } else {
+                        processCapturedFiles(temp, null, epoch, elapsed, generation)
                     }
                 }
                 override fun onError(exception: ImageCaptureException) {
@@ -572,6 +612,195 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
                 }
             },
         )
+    }
+
+    private fun canAttemptScheduledThreeX(): Boolean {
+        if (scheduledThreeXDisabledForSession || cameraComparisonInFlight.get()) return false
+        if (Build.VERSION.SDK_INT >= 29) {
+            val thermal = getSystemService(PowerManager::class.java).currentThermalStatus
+            if (thermal >= PowerManager.THERMAL_STATUS_SEVERE) return false
+        }
+        return true
+    }
+
+    private fun startScheduledThreeX(
+        oneXFile: File,
+        capturedAtEpochMs: Long,
+        capturedAtElapsedMs: Long,
+        generation: Long,
+    ) {
+        if (destroyed || generation != captureGeneration.get() ||
+            !scheduledThreeXInFlight.compareAndSet(false, true)
+        ) {
+            processCapturedFiles(oneXFile, null, capturedAtEpochMs, capturedAtElapsedMs, generation)
+            return
+        }
+        val provider = cameraProvider
+        val inventory = provider?.let(::readCameraInventory)
+        val candidate = inventory?.threeXCandidate
+        val yuvSize = candidate?.maxYuvSize
+        if (provider == null || candidate == null || yuvSize == null || Build.VERSION.SDK_INT < 28) {
+            onScheduledThreeXFailure(
+                oneXFile,
+                capturedAtEpochMs,
+                capturedAtElapsedMs,
+                generation,
+                "물리 3× YUV 렌즈를 준비할 수 없습니다",
+            )
+            return
+        }
+        val physicalTarget = runCatching {
+            File.createTempFile("scheduled-physical-yuv-3x-", ".jpg", cacheDir)
+        }.getOrElse {
+            onScheduledThreeXFailure(oneXFile, capturedAtEpochMs, capturedAtElapsedMs, generation, it.message.orEmpty())
+            return
+        }
+        scheduledOneXTemp = oneXFile
+        scheduledPhysicalTemp = physicalTarget
+        cameraBindGeneration += 1
+        runCatching { provider.unbindAll() }
+        imageCapture = null
+        camera = null
+        resetBookFocus()
+        mainHandler.postDelayed({
+            if (destroyed || generation != captureGeneration.get()) {
+                oneXFile.delete()
+                physicalTarget.delete()
+                scheduledThreeXInFlight.set(false)
+                captureInFlight.set(false)
+                return@postDelayed
+            }
+            activePhysicalCapture = PhysicalYuvCameraCapture(this, ContextCompat.getMainExecutor(this)).capture(
+                PhysicalYuvCameraCapture.Request(
+                    logicalCameraId = inventory.logicalCameraId,
+                    physicalCameraId = candidate.cameraId,
+                    outputSize = yuvSize,
+                    outputFile = physicalTarget,
+                    jpegOrientationDegrees = physicalJpegOrientation(candidate.sensorOrientationDegrees),
+                    timeoutMs = SCHEDULED_THREE_X_TIMEOUT_MS,
+                ),
+            ) { result ->
+                activePhysicalCapture = null
+                result.fold(
+                    onSuccess = { frame ->
+                        val observation = PhysicalCaptureObservation(
+                            activePhysicalId = frame.activePhysicalId,
+                            physicalResultIds = frame.physicalResultIds,
+                            captureResultFocalLengthMm = frame.captureResultFocalLengthMm,
+                            exifFocalLengthMm = null,
+                        )
+                        val verified = CameraTargetPolicy.verifiesPhysicalCapture(
+                            candidate.cameraId,
+                            candidate.focalLengthMm,
+                            observation,
+                        )
+                        if (verified) {
+                            scheduledThreeXConsecutiveFailures = 0
+                            restoreCameraAfterScheduledThreeX()
+                            processCapturedFiles(
+                                oneXFile,
+                                frame.file,
+                                capturedAtEpochMs,
+                                capturedAtElapsedMs,
+                                generation,
+                            )
+                        } else {
+                            frame.file.delete()
+                            onScheduledThreeXFailure(
+                                oneXFile,
+                                capturedAtEpochMs,
+                                capturedAtElapsedMs,
+                                generation,
+                                "촬영 결과가 물리 3× 렌즈와 일치하지 않습니다",
+                            )
+                        }
+                    },
+                    onFailure = { failure ->
+                        physicalTarget.delete()
+                        onScheduledThreeXFailure(
+                            oneXFile,
+                            capturedAtEpochMs,
+                            capturedAtElapsedMs,
+                            generation,
+                            failure.message.orEmpty(),
+                        )
+                    },
+                )
+            }
+        }, CAMERA2_RELEASE_SETTLE_MS)
+    }
+
+    private fun onScheduledThreeXFailure(
+        oneXFile: File,
+        capturedAtEpochMs: Long,
+        capturedAtElapsedMs: Long,
+        generation: Long,
+        reason: String,
+    ) {
+        scheduledThreeXConsecutiveFailures += 1
+        if (scheduledThreeXConsecutiveFailures >= MAX_SCHEDULED_THREE_X_FAILURES) {
+            scheduledThreeXDisabledForSession = true
+            reporter.sendImmediate("정기 3× 촬영을 연속 2회 실패해 이번 회차에서는 1×로 대체합니다 · $reason")
+        }
+        restoreCameraAfterScheduledThreeX()
+        processCapturedFiles(oneXFile, null, capturedAtEpochMs, capturedAtElapsedMs, generation)
+    }
+
+    private fun restoreCameraAfterScheduledThreeX() {
+        activePhysicalCapture?.close()
+        activePhysicalCapture = null
+        if (!destroyed) bindCamera(force = true)
+    }
+
+    private fun processCapturedFiles(
+        oneXFile: File,
+        physicalThreeXFile: File?,
+        capturedAtEpochMs: Long,
+        capturedAtElapsedMs: Long,
+        generation: Long,
+    ) {
+        runCatching {
+            cameraExecutor.execute {
+                if (destroyed || generation != captureGeneration.get()) {
+                    oneXFile.delete()
+                    physicalThreeXFile?.delete()
+                    mainHandler.post { scheduledThreeXInFlight.set(false) }
+                    return@execute
+                }
+                var stored = false
+                try {
+                    reporter.recordCapture(
+                        oneXFile,
+                        capturedAtEpochMs,
+                        capturedAtElapsedMs,
+                        physicalThreeXFile,
+                    )
+                    stored = true
+                } catch (failure: Throwable) {
+                    runCatching { reporter.sendImmediate("촬영 처리 실패: ${failure.message.orEmpty()}") }
+                } finally {
+                    oneXFile.delete()
+                    physicalThreeXFile?.delete()
+                    scheduledOneXTemp = null
+                    scheduledPhysicalTemp = null
+                    mainHandler.post {
+                        if (generation == captureGeneration.get()) captureInFlight.set(false)
+                        scheduledThreeXInFlight.set(false)
+                        if (stored && !destroyed) {
+                            broadcastLatestCapture(capturedAtEpochMs)
+                            logThermal("capture_ok")
+                        }
+                    }
+                }
+            }
+        }.onFailure {
+            oneXFile.delete()
+            physicalThreeXFile?.delete()
+            scheduledOneXTemp = null
+            scheduledPhysicalTemp = null
+            if (generation == captureGeneration.get()) captureInFlight.set(false)
+            scheduledThreeXInFlight.set(false)
+        }
     }
 
     private fun ensureBookFocus(callback: (Result<Unit>) -> Unit) {
@@ -770,6 +999,10 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
     private fun startCameraComparison() {
         mainHandler.post {
             if (destroyed) return@post
+            if (scheduledThreeXInFlight.get()) {
+                reporter.sendImmediate("정기 3× 사진을 촬영 중입니다 · 잠시 뒤 카메라 비교를 다시 눌러주세요")
+                return@post
+            }
             if (!cameraComparisonInFlight.compareAndSet(false, true)) {
                 reporter.sendImmediate("카메라 비교 촬영이 이미 진행 중입니다")
                 return@post
@@ -889,7 +1122,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
                 target.delete()
                 return@postDelayed
             }
-            PhysicalYuvCameraCapture(this, ContextCompat.getMainExecutor(this)).capture(
+            activePhysicalCapture = PhysicalYuvCameraCapture(this, ContextCompat.getMainExecutor(this)).capture(
                 PhysicalYuvCameraCapture.Request(
                     logicalCameraId = inventory.logicalCameraId,
                     physicalCameraId = candidate.cameraId,
@@ -898,6 +1131,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
                     jpegOrientationDegrees = orientation,
                 ),
             ) { result ->
+                activePhysicalCapture = null
                 result.fold(
                     onSuccess = { frame -> handlePhysicalYuvFrame(candidate, inventory.logicalCameraId, frame) },
                     onFailure = { failure ->
@@ -1055,6 +1289,8 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
 
     private fun finishCameraComparison(message: String) {
         if (!cameraComparisonInFlight.compareAndSet(true, false)) return
+        activePhysicalCapture?.close()
+        activePhysicalCapture = null
         val provider = cameraProvider
         runCatching { provider?.unbindAll() }
         imageCapture = null
@@ -1228,8 +1464,96 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
                 broadcastState(statusText(current))
             }
             VoiceCommand.DAD_MESSAGE -> tone.startTone(ToneGenerator.TONE_PROP_ACK, 60)
-            VoiceCommand.STUDY_START -> broadcastState("공부 시작은 텔레그램에서 합니다")
+            VoiceCommand.STUDY_START -> synchronized(sessionLock) {
+                if (awaitingBreakResume) {
+                    resumeAfterBreak("학생 음성")
+                } else {
+                    broadcastState("지금은 시작 확인을 기다리는 시간이 아닙니다")
+                }
+            }
             VoiceCommand.UNDO, VoiceCommand.PAUSE, VoiceCommand.STOP -> broadcastState("세션 제어는 텔레그램에서 합니다")
+        }
+    }
+
+    private fun enterBreakResumeWait() {
+        positionAt(SessionPhase.STUDY, schedule.studyDurationMs, paused = true)
+        awaitingBreakResume = true
+        preferences.edit().putBoolean(KEY_AWAITING_BREAK_RESUME, true).commit()
+        val waiting = session.snapshot()
+        persistSnapshot(waiting)
+        updateMonitor(waiting)
+        broadcastState(statusText(waiting))
+        reporter.sendImmediate("쉬는 시간 종료 · 학생 복귀 대기 · 학생폰에서 ‘시작할게’ 또는 텔레그램 /resume")
+        startBreakResumeReminders()
+    }
+
+    private fun resumeAfterBreak(origin: String) {
+        if (!awaitingBreakResume) return
+        clearBreakResumeWait()
+        val resumed = session.dispatch(Resume("break-resume-${UUID.randomUUID()}", sessionNow()))
+        persistSnapshot(resumed)
+        updateMonitor(resumed)
+        broadcastState(statusText(resumed))
+        reporter.sendImmediate("$origin 확인 · 공부 재개 · ${statusText(resumed)}")
+        speakStudentCue(
+            if (origin == "학생 음성") {
+                "시작이 인식되었습니다. 공부를 다시 시작합니다"
+            } else {
+                "선생님 신호를 확인했습니다. 공부를 다시 시작합니다"
+            },
+            acknowledged = true,
+        )
+    }
+
+    private fun startBreakResumeReminders() {
+        mainHandler.removeCallbacks(breakResumeReminder)
+        mainHandler.post(breakResumeReminder)
+    }
+
+    private fun clearBreakResumeWait() {
+        awaitingBreakResume = false
+        mainHandler.removeCallbacks(breakResumeReminder)
+        preferences.edit().putBoolean(KEY_AWAITING_BREAK_RESUME, false).apply()
+    }
+
+    private fun announcePhaseStart(phase: SessionPhase) {
+        when (phase) {
+            SessionPhase.MEDITATION -> speakStudentCue(
+                "명상 시간 ${schedule.meditationDurationMs / 60_000}분을 시작합니다",
+            )
+            SessionPhase.STUDY -> speakStudentCue(
+                "공부 시간 ${schedule.studyDurationMs / 60_000}분을 시작합니다",
+            )
+            SessionPhase.BREAK -> speakStudentCue(
+                "쉬는 시간 ${schedule.breakDurationMs / 60_000}분을 시작합니다. 시간이 끝나면 다시 알려드리겠습니다",
+            )
+            SessionPhase.COMPLETE -> Unit
+        }
+    }
+
+    private fun speakStudentCue(text: String, acknowledged: Boolean = false) {
+        if (destroyed) return
+        mainHandler.post {
+            if (destroyed) return@post
+            voice.stop()
+            runCatching {
+                tts.setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_ALARM)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build(),
+                )
+            }
+            cueTone.startTone(
+                if (acknowledged) ToneGenerator.TONE_PROP_ACK else ToneGenerator.TONE_SUP_RINGTONE,
+                if (acknowledged) 220 else 900,
+            )
+            val delay = if (acknowledged) 280L else 980L
+            mainHandler.postDelayed({
+                if (destroyed) return@postDelayed
+                val result = tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "study-cue-${System.nanoTime()}")
+                if (result == TextToSpeech.ERROR) mainHandler.postDelayed(::restartVoiceAfterSpeech, 500L)
+            }, delay)
         }
     }
 
@@ -1241,12 +1565,21 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             voice.stop()
             tone.startTone(ToneGenerator.TONE_PROP_ACK, 70)
             mainHandler.postDelayed({
+                runCatching {
+                    tts.setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build(),
+                    )
+                }
                 tts.speak(clean, TextToSpeech.QUEUE_FLUSH, null, "telegram-${System.nanoTime()}")
             }, 180L)
         }
     }
 
     private fun restartVoiceAfterSpeech() {
+        if (destroyed) return
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
             voice.start()
         }
@@ -1296,6 +1629,9 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
     private fun snapshot(): SessionSnapshot = synchronized(sessionLock) { session.snapshot() }
 
     private fun statusText(snapshot: SessionSnapshot): String {
+        if (awaitingBreakResume) {
+            return "복귀 대기 · ‘시작할게’라고 말하세요 · 완료 ${completedProblemCount}개"
+        }
         val phase = if (snapshot.status == SessionStatus.START_COUNTDOWN) "시작 대기" else when (snapshot.phase) {
             io.remotestudy.domain.session.SessionPhase.MEDITATION -> "명상"
             io.remotestudy.domain.session.SessionPhase.STUDY -> "공부"
@@ -1316,6 +1652,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             .putLong(KEY_PHASE_REMAINING, snapshot.phaseRemainingMs)
             .putLong(KEY_COUNTDOWN_REMAINING, snapshot.countdownRemainingMs)
             .putInt(KEY_PROBLEMS, completedProblemCount)
+            .putBoolean(KEY_AWAITING_BREAK_RESUME, awaitingBreakResume)
             .commit()
     }
 
@@ -1428,6 +1765,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             .remove(KEY_COUNTDOWN_REMAINING)
             .remove(KEY_PROBLEMS)
             .remove(KEY_COUNTDOWN_PAUSED)
+            .remove(KEY_AWAITING_BREAK_RESUME)
             .commit()
     }
 
@@ -1468,6 +1806,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         val savedStatus = runCatching {
             SessionStatus.valueOf(preferences.getString(KEY_STATUS, SessionStatus.RUNNING.name)!!)
         }.getOrDefault(SessionStatus.RUNNING)
+        val savedAwaitingBreakResume = preferences.getBoolean(KEY_AWAITING_BREAK_RESUME, false)
         val savedPhase = runCatching {
             SessionPhase.valueOf(preferences.getString(KEY_PHASE, SessionPhase.MEDITATION.name)!!)
         }.getOrDefault(SessionPhase.MEDITATION)
@@ -1487,6 +1826,14 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         val totalProgress = (progressAtSave + runningAfterSave)
             .coerceAtMost(teacherCountdownMs + totalPhaseDurationMs())
         completedProblemCount = preferences.getInt(KEY_PROBLEMS, 0).coerceAtLeast(0)
+        if (savedAwaitingBreakResume) {
+            sessionActive = true
+            positionAt(SessionPhase.STUDY, schedule.studyDurationMs, paused = true)
+            awaitingBreakResume = true
+            persistSnapshot(session.snapshot())
+            updateMonitor(session.snapshot())
+            return
+        }
         rebuildAtProgress(totalProgress, savedStatus == SessionStatus.PAUSED)
         reconcileCountdownPauseAfterRebuild()
         sessionActive = session.snapshot().status != SessionStatus.COMPLETED
@@ -1599,9 +1946,16 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         focusGeneration += 1
         cameraBindGeneration += 1
         mainHandler.removeCallbacksAndMessages(null)
+        activePhysicalCapture?.close()
+        activePhysicalCapture = null
+        scheduledOneXTemp?.delete()
+        scheduledPhysicalTemp?.delete()
+        scheduledOneXTemp = null
+        scheduledPhysicalTemp = null
         voice.destroy()
         tts.stop(); tts.shutdown()
         tone.release()
+        cueTone.release()
         reporter.close()
         cameraProvider?.unbindAll()
         camera = null
@@ -1671,6 +2025,9 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         private const val COMPARISON_CAPTURE_TIMEOUT_MS = 15_000L
         private const val CAMERA2_RELEASE_SETTLE_MS = 500L
         private const val CAMERA_BIND_RETRY_MS = 2_000L
+        private const val SCHEDULED_THREE_X_TIMEOUT_MS = 12_000L
+        private const val MAX_SCHEDULED_THREE_X_FAILURES = 2
+        private const val BREAK_RESUME_REMINDER_INTERVAL_MS = 30_000L
         private const val KEY_ACTIVE = "active"
         private const val KEY_STARTED_EPOCH = "started_epoch"
         private const val KEY_SAVED_EPOCH = "saved_epoch"
@@ -1688,6 +2045,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         private const val KEY_BREAK_DURATION = "break_duration"
         private const val KEY_TEACHER_COUNTDOWN = "teacher_countdown"
         private const val KEY_COUNTDOWN_PAUSED = "countdown_paused"
+        private const val KEY_AWAITING_BREAK_RESUME = "awaiting_break_resume"
         private const val DEFAULT_TEACHER_COUNTDOWN_MS = 5_000L
     }
 }

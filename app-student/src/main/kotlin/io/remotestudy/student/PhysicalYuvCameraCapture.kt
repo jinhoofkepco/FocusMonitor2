@@ -30,6 +30,7 @@ import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.Executor
+import java.util.concurrent.CancellationException
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -39,7 +40,6 @@ import java.util.concurrent.atomic.AtomicBoolean
  * main lens on some Samsung devices. This path opens the logical camera, assigns a YUV output
  * to the requested physical camera, and also includes that ID in createCaptureRequest().
  */
-@RequiresApi(28)
 internal class PhysicalYuvCameraCapture(
     context: Context,
     private val callbackExecutor: Executor,
@@ -48,12 +48,18 @@ internal class PhysicalYuvCameraCapture(
     private val cameraManager = appContext.getSystemService(CameraManager::class.java)
 
     @SuppressLint("MissingPermission")
+    @RequiresApi(28)
     fun capture(
         request: Request,
         callback: (Result<Frame>) -> Unit,
-    ) {
+    ): Handle {
         val operation = Operation(request, callback)
         operation.start()
+        return Handle(operation::cancel)
+    }
+
+    class Handle internal constructor(private val cancelAction: () -> Unit) : AutoCloseable {
+        override fun close() = cancelAction()
     }
 
     data class Request(
@@ -75,6 +81,7 @@ internal class PhysicalYuvCameraCapture(
         val requestedPhysicalFocalLengthMm: Float?,
     )
 
+    @RequiresApi(28)
     private inner class Operation(
         private val request: Request,
         private val callback: (Result<Frame>) -> Unit,
@@ -93,6 +100,14 @@ internal class PhysicalYuvCameraCapture(
 
         private val timeout = Runnable {
             fail(IllegalStateException("물리 YUV 촬영 시간이 초과됐습니다"))
+        }
+
+        fun cancel() {
+            complete(
+                Result.failure(CancellationException("물리 YUV 촬영이 취소됐습니다")),
+                deleteOutput = true,
+                notifyCallback = false,
+            )
         }
 
         fun start() {
@@ -305,9 +320,9 @@ internal class PhysicalYuvCameraCapture(
             succeed(frame)
         }
 
-        private fun succeed(frame: Frame) = complete(Result.success(frame), deleteOutput = false)
+        private fun succeed(frame: Frame) = complete(Result.success(frame), deleteOutput = false, notifyCallback = true)
 
-        private fun fail(error: Throwable) = complete(Result.failure(error), deleteOutput = true)
+        private fun fail(error: Throwable) = complete(Result.failure(error), deleteOutput = true, notifyCallback = true)
 
         private fun failBeforeThread(error: Throwable) {
             if (!completed.compareAndSet(false, true)) return
@@ -315,7 +330,7 @@ internal class PhysicalYuvCameraCapture(
             callbackExecutor.execute { callback(Result.failure(error)) }
         }
 
-        private fun complete(result: Result<Frame>, deleteOutput: Boolean) {
+        private fun complete(result: Result<Frame>, deleteOutput: Boolean, notifyCallback: Boolean) {
             if (!completed.compareAndSet(false, true)) return
             if (::handler.isInitialized) handler.removeCallbacksAndMessages(null)
             runCatching { captureSession?.stopRepeating() }
@@ -325,7 +340,7 @@ internal class PhysicalYuvCameraCapture(
             runCatching { imageReader?.close() }
             if (deleteOutput) request.outputFile.delete()
             if (thread.isAlive) thread.quitSafely()
-            callbackExecutor.execute { callback(result) }
+            if (notifyCallback) callbackExecutor.execute { callback(result) }
         }
     }
 

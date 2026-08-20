@@ -32,7 +32,8 @@ class KoreanVoiceCommandPhraseMatcher {
         val COMMAND_PATTERNS = listOf(
             VoiceCommand.DAD_MESSAGE to Regex("^아빠$"),
             VoiceCommand.STUDY_START to Regex(
-                "^공부(를)?시작(해|해줘|해주세요|하자|할게|합니다|할까요)?$",
+                "^(공부(를)?시작(해|해줘|해주세요|하자|할게|할께|할게요|할께요|합니다|할까요)?|" +
+                    "시작(할게|할께|할게요|할께요|하겠습니다))$",
             ),
             VoiceCommand.PROBLEM_DONE to Regex(
                 "^(아빠)?((문제(를)?|이문제(를)?)?(다)?풀었(어|어요|습니다)?|벌써(요)?)$",
