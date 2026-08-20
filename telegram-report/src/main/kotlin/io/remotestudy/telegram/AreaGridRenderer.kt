@@ -44,6 +44,31 @@ internal object AreaGridRenderer {
         }
     }
 
+    /**
+     * Shows the exact full-frame coordinate space used by the cropper.  Keeping
+     * the grid and selection on the same upright bitmap makes calibration
+     * visually verifiable before it is committed.
+     */
+    fun createSelectionPreview(
+        source: File,
+        region: NormalizedBookRegion,
+        outputDirectory: File,
+    ): File {
+        outputDirectory.mkdirs()
+        val decoded = ImageFiles.decodeUpright(source, GRID_LONG_EDGE)
+        val bitmap = decoded.copy(Bitmap.Config.ARGB_8888, true)
+        decoded.recycle()
+        try {
+            drawGrid(bitmap)
+            drawSelection(bitmap, region)
+            return outputDirectory.resolve("area-selection-${UUID.randomUUID()}.jpg").also {
+                ImageFiles.writeJpeg(bitmap, it, PREVIEW_QUALITY)
+            }
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
     private fun drawGrid(bitmap: Bitmap) {
         val canvas = Canvas(bitmap)
         val cellWidth = bitmap.width / GRID_SIZE.toFloat()
@@ -89,6 +114,27 @@ internal object AreaGridRenderer {
             canvas.drawText(label, x + base, y + base, textShadow)
             canvas.drawText(label, x, y, text)
         }
+    }
+
+    private fun drawSelection(bitmap: Bitmap, region: NormalizedBookRegion) {
+        val canvas = Canvas(bitmap)
+        val base = max(3f, max(bitmap.width, bitmap.height) / 260f)
+        val left = region.left * bitmap.width
+        val top = region.top * bitmap.height
+        val right = region.right * bitmap.width
+        val bottom = region.bottom * bitmap.height
+        val shadow = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.BLACK
+            style = Paint.Style.STROKE
+            strokeWidth = base * 3f
+        }
+        val outline = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.RED
+            style = Paint.Style.STROKE
+            strokeWidth = base * 1.5f
+        }
+        canvas.drawRect(left, top, right, bottom, shadow)
+        canvas.drawRect(left, top, right, bottom, outline)
     }
 
     private const val GRID_SIZE = 10

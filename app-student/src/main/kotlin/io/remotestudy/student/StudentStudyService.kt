@@ -1,6 +1,7 @@
 package io.remotestudy.student
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -10,6 +11,9 @@ import android.content.Intent
 import android.hardware.display.DisplayManager
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.graphics.BitmapFactory
+import android.graphics.ImageFormat
+import android.hardware.camera2.CameraCharacteristics
 import android.media.AudioManager
 import android.media.AudioAttributes
 import android.media.ToneGenerator
@@ -26,6 +30,8 @@ import android.util.Size
 import android.view.Surface
 import androidx.camera.core.AspectRatio
 import androidx.camera.core.Camera
+import androidx.camera.core.CameraInfo
+import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
@@ -34,6 +40,7 @@ import androidx.camera.core.SurfaceOrientedMeteringPointFactory
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
+import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
@@ -71,7 +78,9 @@ import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
+@SuppressLint("UnsafeOptInUsageError")
 class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
     private val lifecycleRegistry = LifecycleRegistry(this)
     override val lifecycle: Lifecycle get() = lifecycleRegistry
@@ -88,14 +97,19 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
     private var countdownPausedAtSessionMs = 0L
     private var sessionActive = false
     private var captureInFlight = AtomicBoolean(false)
+    private val captureGeneration = AtomicLong(0L)
     private var captureStartedAtElapsedMs = 0L
+    private val cameraComparisonInFlight = AtomicBoolean(false)
     private var imageCapture: ImageCapture? = null
     private var cameraProvider: ProcessCameraProvider? = null
     private var camera: Camera? = null
     private var focusLocked = false
     private var focusGeneration = 0
+    private var cameraBindGeneration = 0
+    private var cameraRecoveryNoticePending = false
+    private var cameraRecoveryFailureReported = false
     private var nextFocusAttemptElapsedMs = 0L
-    private var destroyed = false
+    @Volatile private var destroyed = false
     private lateinit var reporter: TelegramReporter
     private lateinit var voice: StudentVoiceCommandController
     private lateinit var tts: TextToSpeech
@@ -222,6 +236,9 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             TelegramCommand.NextPhase -> nextPhase()
             TelegramCommand.Settings -> reporter.sendImmediate(settingsText())
             TelegramCommand.Refocus -> requestBookRefocus()
+            TelegramCommand.ShowCameraMenu -> reporter.sendCameraMenu()
+            TelegramCommand.CameraDiagnostics -> sendCameraDiagnostics()
+            TelegramCommand.CameraComparison -> startCameraComparison()
             is TelegramCommand.SetSchedule -> setSchedule(command)
             is TelegramCommand.SetCountdown -> setCountdown(command.seconds)
             is TelegramCommand.SetRemaining -> setRemaining(command.seconds)
@@ -489,19 +506,23 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
     }
 
     private fun maybeCapture() {
+        if (cameraComparisonInFlight.get()) return
         val current = snapshot()
         if (!sessionActive || current.status != SessionStatus.RUNNING) return
         if (captureInFlight.get() && SystemClock.elapsedRealtime() - captureStartedAtElapsedMs > CAPTURE_STALL_MS) {
             Log.e(TAG, "camera_stall elapsed=${SystemClock.elapsedRealtime() - captureStartedAtElapsedMs}")
+            captureGeneration.incrementAndGet()
             captureInFlight.set(false)
             bindCamera(force = true)
+            return
         }
         val capture = imageCapture ?: return
         if (!captureInFlight.compareAndSet(false, true)) return
+        val generation = captureGeneration.incrementAndGet()
         captureStartedAtElapsedMs = SystemClock.elapsedRealtime()
         ensureBookFocus { focusResult ->
             if (destroyed) {
-                captureInFlight.set(false)
+                if (captureGeneration.get() == generation) captureInFlight.set(false)
                 return@ensureBookFocus
             }
             focusResult.onFailure {
@@ -509,13 +530,13 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
                     reporter.sendImmediate("책 영역 초점 실패 · 촬영은 계속하고 1분 뒤 재시도합니다")
                 }
             }
-            captureFocusedFrame(capture)
+            captureFocusedFrame(capture, generation)
         }
     }
 
-    private fun captureFocusedFrame(capture: ImageCapture) {
+    private fun captureFocusedFrame(capture: ImageCapture, generation: Long) {
         val temp = runCatching { File.createTempFile("one-x-", ".jpg", cacheDir) }.getOrElse {
-            captureInFlight.set(false)
+            if (captureGeneration.get() == generation) captureInFlight.set(false)
             return
         }
         capture.takePicture(
@@ -525,18 +546,27 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
                 override fun onImageSaved(output: ImageCapture.OutputFileResults) {
                     val epoch = System.currentTimeMillis()
                     val elapsed = SystemClock.elapsedRealtime()
-                    cameraExecutor.execute {
-                        runCatching { reporter.recordCapture(temp, epoch, elapsed) }
-                            .onFailure { reporter.sendImmediate("촬영 처리 실패: ${it.message.orEmpty()}") }
+                    runCatching {
+                        cameraExecutor.execute {
+                            if (generation != captureGeneration.get()) {
+                                temp.delete()
+                                return@execute
+                            }
+                            runCatching { reporter.recordCapture(temp, epoch, elapsed) }
+                                .onFailure { reporter.sendImmediate("촬영 처리 실패: ${it.message.orEmpty()}") }
+                            temp.delete()
+                            if (captureGeneration.get() == generation) captureInFlight.set(false)
+                            broadcastLatestCapture(epoch)
+                            logThermal("capture_ok")
+                        }
+                    }.onFailure {
                         temp.delete()
-                        captureInFlight.set(false)
-                        broadcastLatestCapture(epoch)
-                        logThermal("capture_ok")
+                        if (captureGeneration.get() == generation) captureInFlight.set(false)
                     }
                 }
                 override fun onError(exception: ImageCaptureException) {
                     temp.delete()
-                    captureInFlight.set(false)
+                    if (captureGeneration.get() == generation) captureInFlight.set(false)
                     Log.e(TAG, "capture_error code=${exception.imageCaptureError}", exception)
                     reporter.sendImmediate("카메라 촬영 실패 · 자동 재시도")
                 }
@@ -649,8 +679,11 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
 
     private fun bindCamera(force: Boolean = false) {
         if (imageCapture != null && !force) return
+        val generation = ++cameraBindGeneration
         val future = ProcessCameraProvider.getInstance(this)
         future.addListener({
+            if (destroyed || generation != cameraBindGeneration || cameraComparisonInFlight.get()) return@addListener
+            var analysisForCleanup: ImageAnalysis? = null
             runCatching {
                 val provider = future.get()
                 val selector = ResolutionSelector.Builder()
@@ -677,6 +710,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
                             .build(),
                     )
                     .build()
+                analysisForCleanup = analysis
                 analysis.setAnalyzer(analysisExecutor, motionAnalyzer)
                 provider.unbindAll()
                 val boundCamera = provider.bindToLifecycle(
@@ -689,15 +723,408 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
                 camera = boundCamera
                 imageCapture = capture
                 resetBookFocus()
-                Log.i(TAG, "camera_bound one_x resolution=${capture.resolutionInfo?.resolution}")
+                motionAnalyzer.resetBaseline()
+                Log.i(TAG, "camera_bound main resolution=${capture.resolutionInfo?.resolution}")
+                if (cameraRecoveryNoticePending) {
+                    cameraRecoveryNoticePending = false
+                    cameraRecoveryFailureReported = false
+                    runCatching {
+                        reporter.sendImmediate("기본 카메라 복구 완료 · 10초 촬영과 움직임 판정을 재개합니다")
+                    }.onFailure { noticeError ->
+                        Log.w(TAG, "camera_recovery_notice_failed", noticeError)
+                    }
+                }
             }.onFailure {
+                analysisForCleanup?.clearAnalyzer()
+                if (destroyed || generation != cameraBindGeneration || cameraComparisonInFlight.get()) return@onFailure
                 imageCapture = null
                 camera = null
                 Log.e(TAG, "camera_bind_failed", it)
                 broadcastState("카메라 연결 실패: ${it.message.orEmpty()}")
+                if (cameraRecoveryNoticePending && !cameraRecoveryFailureReported) {
+                    cameraRecoveryFailureReported = true
+                    runCatching {
+                        reporter.sendImmediate("기본 카메라 복구가 지연되고 있습니다 · 2초 후 자동 재시도합니다")
+                    }.onFailure { noticeError ->
+                        Log.w(TAG, "camera_recovery_delay_notice_failed", noticeError)
+                    }
+                }
+                mainHandler.postDelayed({
+                    if (!destroyed && generation == cameraBindGeneration && imageCapture == null &&
+                        !cameraComparisonInFlight.get()
+                    ) {
+                        bindCamera(force = true)
+                    }
+                }, CAMERA_BIND_RETRY_MS)
             }
         }, ContextCompat.getMainExecutor(this))
     }
+
+    private fun sendCameraDiagnostics() {
+        mainHandler.post {
+            if (destroyed) return@post
+            reporter.sendImmediate(cameraDiagnosticsText())
+        }
+    }
+
+    private fun startCameraComparison() {
+        mainHandler.post {
+            if (destroyed) return@post
+            if (!cameraComparisonInFlight.compareAndSet(false, true)) {
+                reporter.sendImmediate("카메라 비교 촬영이 이미 진행 중입니다")
+                return@post
+            }
+            cameraBindGeneration += 1
+            reporter.sendImmediate("카메라 비교 촬영 시작 · 약 20초 동안 평소 촬영을 잠시 멈춥니다")
+            waitForCameraComparisonSlot(SystemClock.elapsedRealtime() + COMPARISON_SLOT_TIMEOUT_MS)
+        }
+    }
+
+    private fun waitForCameraComparisonSlot(deadlineElapsedMs: Long) {
+        if (destroyed) {
+            cameraComparisonInFlight.set(false)
+            return
+        }
+        if (captureInFlight.compareAndSet(false, true)) {
+            captureGeneration.incrementAndGet()
+            captureStartedAtElapsedMs = SystemClock.elapsedRealtime()
+            captureMainComparisonFrame()
+            return
+        }
+        if (SystemClock.elapsedRealtime() >= deadlineElapsedMs) {
+            cameraComparisonInFlight.set(false)
+            reporter.sendImmediate("카메라가 다른 사진을 처리 중이라 비교 촬영을 시작하지 못했습니다 · 잠시 뒤 다시 눌러주세요")
+            return
+        }
+        mainHandler.postDelayed({ waitForCameraComparisonSlot(deadlineElapsedMs) }, COMPARISON_SLOT_RETRY_MS)
+    }
+
+    private fun captureMainComparisonFrame() {
+        val capture = imageCapture
+        val boundCamera = camera
+        if (capture == null || boundCamera == null) {
+            finishCameraComparison("기본 카메라가 준비되지 않아 비교 촬영을 중단했습니다")
+            return
+        }
+        ensureBookFocus {
+            captureComparisonFile(capture, "camera-main-") { result ->
+                result.fold(
+                    onSuccess = { file ->
+                        val cameraId = runCatching { Camera2CameraInfo.from(boundCamera.cameraInfo).cameraId }
+                            .getOrDefault("unknown")
+                        val mainZoomRatio = runCatching { boundCamera.cameraInfo.intrinsicZoomRatio }
+                            .getOrDefault(1f)
+                        executeComparisonWork(file, "A 사진") {
+                            val queued = runCatching {
+                                reporter.sendDiagnosticDocument(
+                                    file,
+                                    comparisonCaption(
+                                        label = "A · 기본 후면 카메라",
+                                        file = file,
+                                        cameraId = cameraId,
+                                        zoomRatio = mainZoomRatio,
+                                    ),
+                                )
+                            }
+                            file.delete()
+                            mainHandler.post {
+                                queued.fold(
+                                    onSuccess = { capturePhysicalThreeXFrame() },
+                                    onFailure = { finishCameraComparison("A 사진을 전송 큐에 저장하지 못했습니다: ${it.message.orEmpty()}") },
+                                )
+                            }
+                        }
+                    },
+                    onFailure = { failure ->
+                        finishCameraComparison("A 기본 카메라 촬영 실패: ${failure.message.orEmpty()}")
+                    },
+                )
+            }
+        }
+    }
+
+    private fun capturePhysicalThreeXFrame() {
+        if (destroyed) {
+            cameraComparisonInFlight.set(false)
+            captureInFlight.set(false)
+            return
+        }
+        val provider = cameraProvider
+        if (provider == null) {
+            finishCameraComparison("카메라 제공자를 찾지 못해 3× 촬영을 건너뛰었습니다")
+            return
+        }
+        val inventory = readCameraInventory(provider)
+        val candidate = inventory.threeXCandidate
+        if (candidate == null) {
+            finishCameraComparison("이 기기가 앱에 공개한 약 3× 물리 렌즈가 없습니다 · A 사진만 보냈습니다")
+            return
+        }
+        runCatching {
+            provider.unbindAll()
+            imageCapture = null
+            camera = null
+            resetBookFocus()
+            val capture = ImageCapture.Builder()
+                .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                .setResolutionSelector(highQualityCaptureSelector())
+                .setTargetRotation(currentDisplayRotation())
+                .build()
+            val physicalSelector = CameraSelector.Builder()
+                .requireLensFacing(CameraSelector.LENS_FACING_BACK)
+                .setPhysicalCameraId(candidate.cameraId)
+                .build()
+            val bound = provider.bindToLifecycle(this, physicalSelector, capture)
+            val boundId = runCatching { Camera2CameraInfo.from(bound.cameraInfo).cameraId }
+                .getOrDefault(candidate.cameraId)
+            Log.i(
+                TAG,
+                "camera_comparison_bound requestedPhysical=${candidate.cameraId} boundId=$boundId " +
+                    "estimatedZoom=${candidate.estimatedZoomRatio} resolution=${capture.resolutionInfo?.resolution}",
+            )
+            focusComparisonCamera(bound) {
+                captureComparisonFile(capture, "camera-physical-3x-") { result ->
+                    result.fold(
+                        onSuccess = { file ->
+                            executeComparisonWork(file, "B 사진") {
+                                val queued = runCatching {
+                                    reporter.sendDiagnosticDocument(
+                                        file,
+                                        comparisonCaption(
+                                            label = "B · 물리 약 3× 렌즈",
+                                            file = file,
+                                            cameraId = candidate.cameraId,
+                                            zoomRatio = candidate.estimatedZoomRatio,
+                                            extra = "physicalSelector=${candidate.cameraId} · boundLogical=$boundId · focal=${candidate.focalLengthsText}",
+                                        ),
+                                    )
+                                }
+                                file.delete()
+                                mainHandler.post {
+                                    queued.fold(
+                                        onSuccess = {
+                                            finishCameraComparison("A/B 원본을 전송 대기열에 저장했습니다 · 기본 카메라 복구 중이며 문서가 도착하면 내려받아 같은 글자를 비교해주세요")
+                                        },
+                                        onFailure = {
+                                            finishCameraComparison("B 사진을 전송 큐에 저장하지 못했습니다: ${it.message.orEmpty()}")
+                                        },
+                                    )
+                                }
+                            }
+                        },
+                        onFailure = { failure ->
+                            finishCameraComparison("B 물리 3× 촬영 실패: ${failure.message.orEmpty()} · 기본 카메라로 복구합니다")
+                        },
+                    )
+                }
+            }
+        }.onFailure { failure ->
+            finishCameraComparison("물리 3× 렌즈 연결 실패: ${failure.message.orEmpty()} · 기본 카메라로 복구합니다")
+        }
+    }
+
+    private fun executeComparisonWork(file: File, stage: String, work: () -> Unit) {
+        if (destroyed) {
+            file.delete()
+            return
+        }
+        runCatching {
+            cameraExecutor.execute {
+                if (destroyed) file.delete() else work()
+            }
+        }.onFailure { failure ->
+            file.delete()
+            if (!destroyed) mainHandler.post {
+                finishCameraComparison("$stage 처리 시작 실패: ${failure.message.orEmpty()}")
+            }
+        }
+    }
+
+    private fun focusComparisonCamera(boundCamera: Camera, afterFocus: () -> Unit) {
+        val completed = AtomicBoolean(false)
+        val point = SurfaceOrientedMeteringPointFactory(1f, 1f).createPoint(0.5f, 0.5f)
+        val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
+            .disableAutoCancel()
+            .build()
+        val future = runCatching { boundCamera.cameraControl.startFocusAndMetering(action) }.getOrElse {
+            afterFocus()
+            return
+        }
+        val timeout = Runnable {
+            if (completed.compareAndSet(false, true)) afterFocus()
+        }
+        mainHandler.postDelayed(timeout, COMPARISON_FOCUS_TIMEOUT_MS)
+        future.addListener({
+            if (!completed.compareAndSet(false, true)) return@addListener
+            mainHandler.removeCallbacks(timeout)
+            afterFocus()
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun captureComparisonFile(
+        capture: ImageCapture,
+        prefix: String,
+        callback: (Result<File>) -> Unit,
+    ) {
+        val target = runCatching { File.createTempFile(prefix, ".jpg", cacheDir) }
+            .getOrElse { callback(Result.failure(it)); return }
+        val completed = AtomicBoolean(false)
+        val timeout = Runnable {
+            if (!completed.compareAndSet(false, true)) return@Runnable
+            target.delete()
+            callback(Result.failure(IllegalStateException("촬영 시간이 초과됐습니다")))
+        }
+        mainHandler.postDelayed(timeout, COMPARISON_CAPTURE_TIMEOUT_MS)
+        runCatching {
+            capture.takePicture(
+                ImageCapture.OutputFileOptions.Builder(target).build(),
+                ContextCompat.getMainExecutor(this),
+                object : ImageCapture.OnImageSavedCallback {
+                    override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                        if (!completed.compareAndSet(false, true)) {
+                            target.delete()
+                            return
+                        }
+                        mainHandler.removeCallbacks(timeout)
+                        callback(Result.success(target))
+                    }
+
+                    override fun onError(exception: ImageCaptureException) {
+                        if (!completed.compareAndSet(false, true)) return
+                        mainHandler.removeCallbacks(timeout)
+                        target.delete()
+                        callback(Result.failure(exception))
+                    }
+                },
+            )
+        }.onFailure { failure ->
+            if (!completed.compareAndSet(false, true)) return@onFailure
+            mainHandler.removeCallbacks(timeout)
+            target.delete()
+            callback(Result.failure(failure))
+        }
+    }
+
+    private fun finishCameraComparison(message: String) {
+        if (!cameraComparisonInFlight.compareAndSet(true, false)) return
+        val provider = cameraProvider
+        runCatching { provider?.unbindAll() }
+        imageCapture = null
+        camera = null
+        resetBookFocus()
+        motionAnalyzer.resetBaseline()
+        captureInFlight.set(false)
+        cameraRecoveryNoticePending = true
+        cameraRecoveryFailureReported = false
+        if (!destroyed) {
+            bindCamera(force = true)
+            reporter.sendImmediate(message)
+        }
+    }
+
+    private fun cameraDiagnosticsText(): String {
+        val provider = cameraProvider ?: return "카메라 진단 · 아직 카메라가 준비되지 않았습니다"
+        val inventory = readCameraInventory(provider)
+        val currentResolution = imageCapture?.resolutionInfo?.resolution?.let { "${it.width}×${it.height}" } ?: "준비 중"
+        return buildString {
+            append("카메라 진단 · 앱 ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})\n")
+            append("기기 ${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE} / API ${Build.VERSION.SDK_INT}\n")
+            append("현재 기본 촬영 ").append(currentResolution).append(" · logical ").append(inventory.logicalCameraId).append('\n')
+            append("logical multi-camera: ").append(if (inventory.logicalMultiCamera) "지원" else "미지원").append('\n')
+            if (inventory.physicalCameras.isEmpty()) {
+                append("앱에 공개된 물리 렌즈 없음")
+            } else {
+                inventory.physicalCameras.forEach { lens ->
+                    append("physical ").append(lens.cameraId)
+                        .append(" · 추정 화각 ").append("%.2f×".format(Locale.US, lens.estimatedZoomRatio))
+                        .append(" · focal ").append(lens.focalLengthsText)
+                        .append(" · sensor ").append(lens.sensorSizeText)
+                        .append(" · JPEG ").append(lens.maxJpegText)
+                        .append('\n')
+                }
+                append("약 3× 후보: ").append(inventory.threeXCandidate?.cameraId ?: "없음")
+            }
+            append("\n진단은 렌즈를 바꾸지 않습니다. 실제 비교는 /camera test")
+        }
+    }
+
+    private fun readCameraInventory(provider: ProcessCameraProvider): CameraInventory {
+        val logical = runCatching {
+            CameraSelector.DEFAULT_BACK_CAMERA.filter(provider.availableCameraInfos).firstOrNull()
+        }.getOrNull()
+        if (logical == null) return CameraInventory("unknown", false, emptyList(), null)
+        val rawPhysical = logical.physicalCameraInfos.mapNotNull { info -> describePhysicalCamera(info) }
+        val estimatedRatios = CameraTargetPolicy.estimateZoomRatios(
+            rawPhysical.map {
+                PhysicalLensOptics(it.cameraId, it.focalLengthMm, it.sensorWidthMm, it.sensorAreaMm2)
+            },
+        ).associateBy(PhysicalLensTarget::cameraId)
+        val physical = rawPhysical.map { raw ->
+            PhysicalCameraDescriptor(
+                cameraId = raw.cameraId,
+                estimatedZoomRatio = estimatedRatios[raw.cameraId]?.zoomRatio ?: Float.NaN,
+                focalLengthsText = raw.focalLengthsText,
+                sensorSizeText = raw.sensorSizeText,
+                maxJpegText = raw.maxJpegText,
+            )
+        }.sortedBy(PhysicalCameraDescriptor::cameraId)
+        val selected = CameraTargetPolicy.chooseThreeX(
+            physical.map { PhysicalLensTarget(it.cameraId, it.estimatedZoomRatio) },
+        )
+        return CameraInventory(
+            logicalCameraId = runCatching { Camera2CameraInfo.from(logical).cameraId }.getOrDefault("unknown"),
+            logicalMultiCamera = logical.isLogicalMultiCameraSupported,
+            physicalCameras = physical,
+            threeXCandidate = selected?.let { choice -> physical.firstOrNull { it.cameraId == choice.cameraId } },
+        )
+    }
+
+    private fun describePhysicalCamera(info: CameraInfo): RawPhysicalCamera? = runCatching {
+        val camera2 = Camera2CameraInfo.from(info)
+        val focalLengths = camera2.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+            ?: floatArrayOf()
+        val sensorSize = camera2.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+        val maxJpeg = camera2.getCameraCharacteristic(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            ?.getOutputSizes(ImageFormat.JPEG)
+            ?.maxByOrNull { it.width.toLong() * it.height.toLong() }
+        val focalLength = focalLengths.firstOrNull()?.takeIf { it.isFinite() && it > 0f }
+        val sensorWidth = sensorSize?.width?.takeIf { it.isFinite() && it > 0f }
+        RawPhysicalCamera(
+            cameraId = camera2.cameraId,
+            focalLengthMm = focalLength ?: Float.NaN,
+            sensorWidthMm = sensorWidth ?: Float.NaN,
+            sensorAreaMm2 = sensorSize?.let { it.width * it.height } ?: Float.NaN,
+            focalLengthsText = focalLengths.takeIf { it.isNotEmpty() }
+                ?.joinToString("/") { "%.1fmm".format(Locale.US, it) } ?: "unknown",
+            sensorSizeText = sensorSize?.let { "%.1f×%.1fmm".format(Locale.US, it.width, it.height) } ?: "unknown",
+            maxJpegText = maxJpeg?.let { "${it.width}×${it.height}" } ?: "unknown",
+        )
+    }.getOrNull()
+
+    private fun comparisonCaption(
+        label: String,
+        file: File,
+        cameraId: String,
+        zoomRatio: Float,
+        extra: String? = null,
+    ): String {
+        val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(file.absolutePath, options)
+        return buildString {
+            append(label).append(" · 원본 문서\n")
+            append(options.outWidth).append('×').append(options.outHeight)
+                .append(" · cameraId=").append(cameraId)
+                .append(" · zoom=").append("%.2f×".format(Locale.US, zoomRatio))
+            extra?.let { append("\n").append(it) }
+            append("\n회전·잘라내기·확대 보정 미적용")
+        }
+    }
+
+    private fun highQualityCaptureSelector(): ResolutionSelector = ResolutionSelector.Builder()
+        .setAspectRatioStrategy(AspectRatioStrategy(AspectRatio.RATIO_4_3, AspectRatioStrategy.FALLBACK_RULE_AUTO))
+        .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
+        .setAllowedResolutionMode(ResolutionSelector.PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE)
+        .build()
 
     private fun handleVoiceCommand(command: VoiceCommand) {
         when (command) {
@@ -921,6 +1348,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             "공부 ${schedule.studyDurationMs / 60_000}분",
             "휴식 ${schedule.breakDurationMs / 60_000}분",
             "시작 대기 ${teacherCountdownMs / 1_000}초",
+            "책 상세 회전 ${reporter.currentBookRotation()}°",
         ).joinToString(separator)
     }
 
@@ -929,6 +1357,9 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             "/menu 버튼 메뉴 열기\n" +
             "/area 10×10 책 영역 격자\n" +
             "/rotate 0|90|180|270 책 상세사진 회전\n" +
+            "/camera 카메라 진단 메뉴\n" +
+            "/camera info 기기 렌즈 정보\n" +
+            "/camera test 기본 1×·물리 약 3× 원본 비교\n" +
             "/settings 현재 설정\n" +
             "/set 0 40 15 명상·공부·휴식(분)\n" +
             "/set countdown 5 시작 대기(초)\n" +
@@ -1074,7 +1505,9 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
 
     override fun onDestroy() {
         destroyed = true
+        captureGeneration.incrementAndGet()
         focusGeneration += 1
+        cameraBindGeneration += 1
         mainHandler.removeCallbacksAndMessages(null)
         voice.destroy()
         tts.stop(); tts.shutdown()
@@ -1089,6 +1522,31 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
         super.onDestroy()
     }
+
+    private data class CameraInventory(
+        val logicalCameraId: String,
+        val logicalMultiCamera: Boolean,
+        val physicalCameras: List<PhysicalCameraDescriptor>,
+        val threeXCandidate: PhysicalCameraDescriptor?,
+    )
+
+    private data class PhysicalCameraDescriptor(
+        val cameraId: String,
+        val estimatedZoomRatio: Float,
+        val focalLengthsText: String,
+        val sensorSizeText: String,
+        val maxJpegText: String,
+    )
+
+    private data class RawPhysicalCamera(
+        val cameraId: String,
+        val focalLengthMm: Float,
+        val sensorWidthMm: Float,
+        val sensorAreaMm2: Float,
+        val focalLengthsText: String,
+        val sensorSizeText: String,
+        val maxJpegText: String,
+    )
 
     companion object {
         const val ACTION_STATE = "io.remotestudy.student.STATE"
@@ -1108,6 +1566,11 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         private const val CAPTURE_STALL_MS = 30_000L
         private const val FOCUS_TIMEOUT_MS = 2_500L
         private const val FOCUS_RETRY_DELAY_MS = 60_000L
+        private const val COMPARISON_SLOT_TIMEOUT_MS = 10_000L
+        private const val COMPARISON_SLOT_RETRY_MS = 250L
+        private const val COMPARISON_FOCUS_TIMEOUT_MS = 4_000L
+        private const val COMPARISON_CAPTURE_TIMEOUT_MS = 15_000L
+        private const val CAMERA_BIND_RETRY_MS = 2_000L
         private const val KEY_ACTIVE = "active"
         private const val KEY_STARTED_EPOCH = "started_epoch"
         private const val KEY_SAVED_EPOCH = "saved_epoch"

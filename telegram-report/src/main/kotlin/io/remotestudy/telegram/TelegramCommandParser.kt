@@ -17,6 +17,8 @@ class TelegramCommandParser {
             text == "/next" -> TelegramCommand.NextPhase
             text == "/settings" -> TelegramCommand.Settings
             text == "/focus" -> TelegramCommand.Refocus
+            text == "/camera" -> TelegramCommand.ShowCameraMenu
+            text.startsWith("/camera ") -> parseCamera(text.removePrefix("/camera ").trim())
             text == "/index" -> TelegramCommand.Index
             text == "/status" -> TelegramCommand.Status
             text == "/menu" || text == "/help" -> TelegramCommand.Menu
@@ -87,6 +89,12 @@ class TelegramCommandParser {
         argument.toIntOrNull()?.takeIf { it in setOf(0, 90, 180, 270) }
             ?.let { TelegramCommand.SetBookRotation(it) }
             ?: TelegramCommand.Unknown("/rotate $argument")
+
+    private fun parseCamera(argument: String): TelegramCommand = when (argument.lowercase()) {
+        "info", "status", "진단", "정보" -> TelegramCommand.CameraDiagnostics
+        "test", "compare", "비교", "촬영" -> TelegramCommand.CameraComparison
+        else -> TelegramCommand.Unknown("/camera $argument")
+    }
 
     private fun parseRemaining(argument: String): TelegramCommand {
         parseDurationSeconds(argument, maxMinutes = 480)?.let { return TelegramCommand.SetRemaining(it) }

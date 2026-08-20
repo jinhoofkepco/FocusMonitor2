@@ -16,6 +16,7 @@ class TelegramCommandParserTest {
         assertEquals(TelegramCommand.NextPhase, parser.parse("/next"))
         assertEquals(TelegramCommand.Settings, parser.parse("/settings"))
         assertEquals(TelegramCommand.Refocus, parser.parse("/focus"))
+        assertEquals(TelegramCommand.ShowCameraMenu, parser.parse("/camera"))
         assertEquals(TelegramCommand.Index, parser.parse("/index"))
         assertEquals(TelegramCommand.Menu, parser.parse("/menu"))
         assertEquals(TelegramCommand.Menu, parser.parse("/help"))
@@ -69,6 +70,15 @@ class TelegramCommandParserTest {
         assertEquals(TelegramCommand.ShowBookRotation, parser.parse("/rotate"))
         assertEquals(TelegramCommand.SetBookRotation(180), parser.parse("/rotate 180"))
         assertTrue(parser.parse("/rotate 45") is TelegramCommand.Unknown)
+    }
+
+    @Test fun parsesCameraDiagnosticsAndComparison() {
+        assertEquals(TelegramCommand.CameraDiagnostics, parser.parse("/camera info"))
+        assertEquals(TelegramCommand.CameraDiagnostics, parser.parse("/camera 진단"))
+        assertEquals(TelegramCommand.CameraComparison, parser.parse("/camera test"))
+        assertEquals(TelegramCommand.CameraComparison, parser.parse("/camera 비교"))
+        assertEquals(TelegramCommand.CameraComparison, parser.parse("/camera@focus_monitor_bot test"))
+        assertTrue(parser.parse("/camera tele") is TelegramCommand.Unknown)
     }
 
     @Test fun rejectsUnsafeRemoteTimerValues() {

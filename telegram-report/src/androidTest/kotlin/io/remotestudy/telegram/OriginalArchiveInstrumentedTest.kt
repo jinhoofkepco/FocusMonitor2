@@ -16,7 +16,7 @@ import java.util.UUID
 
 @RunWith(AndroidJUnit4::class)
 class OriginalArchiveInstrumentedTest {
-    @Test fun storesBookFromCameraOriginalAndReusesItForButtonDetail() {
+    @Test fun reusesOnlyMatchingBookCropAndRecropsChangedRegionFromFullFrame() {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
         val root = File(context.cacheDir, "archive-test-${UUID.randomUUID()}").apply { mkdirs() }
         try {
@@ -35,22 +35,36 @@ class OriginalArchiveInstrumentedTest {
             val book = requireNotNull(stored.bookFile)
             assertTrue(stored.file.isFile)
             assertTrue(book.isFile)
+            val reopened = OriginalArchive(root.resolve("archive")).all().single()
+            assertEquals(NormalizedBookRegion(0.25f, 0.20f, 0.75f, 0.80f), reopened.bookRegion)
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeFile(book.absolutePath, bounds)
             assertEquals(600, bounds.outWidth)
             assertEquals(540, bounds.outHeight)
 
+            val storedRegion = NormalizedBookRegion(0.25f, 0.20f, 0.75f, 0.80f)
             val detail = archive.createBookCrop(
                 stored,
-                NormalizedBookRegion.DEFAULT,
+                storedRegion,
                 root.resolve("details"),
             )
             assertEquals(book.length(), detail.length())
             assertTrue(book.readBytes().contentEquals(detail.readBytes()))
 
-            val rotated = archive.createBookCrop(
+            val changedDetail = archive.createBookCrop(
                 stored,
                 NormalizedBookRegion.DEFAULT,
+                root.resolve("details"),
+            )
+            val changedBounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(changedDetail.absolutePath, changedBounds)
+            assertEquals(1032, changedBounds.outWidth)
+            assertEquals(360, changedBounds.outHeight)
+            assertTrue(!book.readBytes().contentEquals(changedDetail.readBytes()))
+
+            val rotated = archive.createBookCrop(
+                stored,
+                storedRegion,
                 root.resolve("details"),
                 rotationDegrees = 90,
             )
@@ -64,13 +78,30 @@ class OriginalArchiveInstrumentedTest {
             assertTrue(gridBitmap.width <= 1600 && gridBitmap.height <= 1600)
             gridBitmap.recycle()
 
-            val preview = AreaGridRenderer.createCropPreview(
+            val preview = AreaGridRenderer.createSelectionPreview(
                 stored.file,
                 NormalizedBookRegion(0.1f, 0.1f, 0.8f, 0.8f),
                 root.resolve("grid"),
-                rotationDegrees = 180,
             )
             assertTrue(preview.isFile && preview.length() > 0L)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun removesOrphanBookCacheAndMetadataOnOpen() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val root = File(context.cacheDir, "archive-orphan-test-${UUID.randomUUID()}").apply { mkdirs() }
+        try {
+            root.resolve("123_book.jpg").writeBytes(byteArrayOf(1))
+            root.resolve("123_book-region.txt").writeText("0.1,0.1,0.9,0.9")
+            root.resolve("unfinished.part").writeBytes(byteArrayOf(2))
+
+            OriginalArchive(root)
+
+            assertTrue(!root.resolve("123_book.jpg").exists())
+            assertTrue(!root.resolve("123_book-region.txt").exists())
+            assertTrue(!root.resolve("unfinished.part").exists())
         } finally {
             root.deleteRecursively()
         }
@@ -86,6 +117,7 @@ class OriginalArchiveInstrumentedTest {
             val archiveDir = root.resolve("archive").apply { mkdirs() }
             archiveDir.resolve("$yesterday.jpg").writeBytes(byteArrayOf(1))
             archiveDir.resolve("${yesterday}_book.jpg").writeBytes(byteArrayOf(2))
+            archiveDir.resolve("${yesterday}_book-region.txt").writeText("0.1,0.1,0.9,0.9")
             archiveDir.resolve("$today.jpg").writeBytes(byteArrayOf(3))
             archiveDir.resolve("${today}_book.jpg").writeBytes(byteArrayOf(4))
 
@@ -95,6 +127,7 @@ class OriginalArchiveInstrumentedTest {
             assertEquals(listOf(today), archive.all().map(ArchivedOriginal::capturedAtEpochMs))
             assertTrue(!archiveDir.resolve("$yesterday.jpg").exists())
             assertTrue(!archiveDir.resolve("${yesterday}_book.jpg").exists())
+            assertTrue(!archiveDir.resolve("${yesterday}_book-region.txt").exists())
         } finally {
             root.deleteRecursively()
         }

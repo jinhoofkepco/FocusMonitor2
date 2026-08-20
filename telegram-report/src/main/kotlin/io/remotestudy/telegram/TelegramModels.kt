@@ -26,6 +26,9 @@ sealed interface TelegramCommand {
     data object NextPhase : TelegramCommand
     data object Settings : TelegramCommand
     data object Refocus : TelegramCommand
+    data object ShowCameraMenu : TelegramCommand
+    data object CameraDiagnostics : TelegramCommand
+    data object CameraComparison : TelegramCommand
     data object Index : TelegramCommand
     data object Status : TelegramCommand
     data object Menu : TelegramCommand
@@ -75,6 +78,7 @@ data class ArchivedOriginal(
     val capturedAtEpochMs: Long,
     val file: File,
     val bookFile: File? = null,
+    val bookRegion: NormalizedBookRegion? = null,
 )
 
 data class NormalizedBookRegion(

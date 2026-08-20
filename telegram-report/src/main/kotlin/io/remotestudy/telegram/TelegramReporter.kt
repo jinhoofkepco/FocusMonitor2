@@ -9,6 +9,7 @@ import java.nio.file.StandardCopyOption
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.roundToInt
@@ -63,6 +64,7 @@ class TelegramReporter(
             awayEvents.clear()
             sessionStartedAtEpochMs = 0L
             sessionStartedAtElapsedMs = 0L
+            clearAreaCalibration()
             persistSessionState()
         }
     }
@@ -76,6 +78,7 @@ class TelegramReporter(
             awayEvents.clear()
             sessionStartedAtEpochMs = startedAtEpochMs
             sessionStartedAtElapsedMs = startedAtElapsedMs
+            clearAreaCalibration()
             archive.startFreshSession()
             deleteUnqueuedGeneratedFiles()
             persistSessionState()
@@ -129,9 +132,28 @@ class TelegramReporter(
         CONTROL_MENU,
     )
 
+    fun sendCameraMenu() = sendImmediate(
+        "S23 카메라 진단입니다. 비교할 책 글자를 학생 카메라 화면 정중앙에 놓고, 먼저 정보를 확인한 뒤 기본 렌즈와 공개된 약 3× 물리 렌즈의 원본을 비교하세요.",
+        CAMERA_MENU,
+    )
+
+    fun sendDiagnosticDocument(source: File, caption: String) {
+        require(source.isFile)
+        detailDir.mkdirs()
+        val queued = detailDir.resolve("camera-test-${now()}-${UUID.randomUUID()}.jpg")
+        source.copyTo(queued, overwrite = false)
+        queue.enqueue(UploadKind.DOCUMENT, queued, caption, now())
+        wakeUploader()
+    }
+
     fun sendAreaGrid() {
-        archive.startFreshSession(now())
-        val source = archive.all().lastOrNull()
+        val source = synchronized(lock) {
+            archive.startFreshSession(now())
+            archive.all().lastOrNull()?.also {
+                persistAreaCalibration(it.capturedAtEpochMs)
+                clearAreaPreview()
+            }
+        }
         if (source == null) {
             sendImmediate("설정할 사진이 없습니다. 공부를 시작해 첫 사진이 촬영된 뒤 다시 눌러주세요.")
             return
@@ -140,31 +162,38 @@ class TelegramReporter(
         queue.enqueue(
             UploadKind.PHOTO,
             grid,
-            "책 범위의 왼쪽·오른쪽 열과 위·아래 행을 보내세요.\n예: /area IJ 56\n10행 포함 예: /area IJ 5-10",
+            "${formatTime(source.capturedAtEpochMs)} 사진 기준 · 책 범위의 왼쪽 위 칸과 오른쪽 아래 칸을 보내세요.\n예: /area D2 H5\n10행 포함 예: /area D2 H10",
             now(),
         )
         wakeUploader()
     }
 
     fun sendAreaPreview(command: TelegramCommand.PreviewBookRegion) {
-        archive.startFreshSession(now())
-        val source = archive.all().lastOrNull()
+        val source = synchronized(lock) {
+            archive.startFreshSession(now())
+            loadAreaCalibration()?.let { epoch ->
+                archive.all().firstOrNull { it.capturedAtEpochMs == epoch }
+            }
+        }
         if (source == null) {
-            sendImmediate("미리 볼 사진이 없습니다. 새 사진이 촬영된 뒤 다시 시도해주세요.")
+            clearAreaCalibration()
+            sendImmediate("기준 격자 사진을 찾을 수 없습니다. /area 로 새 격자를 받아 다시 선택해주세요.")
             return
         }
-        val preview = AreaGridRenderer.createCropPreview(
+        val preview = AreaGridRenderer.createSelectionPreview(
             source.file,
             command.region,
             detailDir,
-            loadBookRotation(),
         )
+        val previewToken = UUID.randomUUID().toString().substring(0, AREA_TOKEN_LENGTH)
+        val previewKey = areaPreviewKey(previewToken, source.capturedAtEpochMs, command.region)
+        persistAreaPreview(previewKey)
         queue.enqueue(
             UploadKind.PHOTO,
             preview,
-            "선택 영역 ${command.label} · 이 범위로 설정할까요?",
+            "선택 영역 ${command.label} · 빨간 테두리 안을 책 영역으로 설정할까요?\n격자 확인은 회전하지 않으며, 확정 뒤 책 상세사진은 ${loadBookRotation()}°로 표시됩니다.",
             now(),
-            replyMarkup = areaConfirmation(command.region),
+            replyMarkup = areaConfirmation(previewKey),
         )
         wakeUploader()
     }
@@ -176,8 +205,12 @@ class TelegramReporter(
 
     fun updateBookRotation(degrees: Int) {
         require(degrees in setOf(0, 90, 180, 270))
-        rootDirectory.resolve("book-rotation.txt").writeText(degrees.toString())
+        synchronized(lock) {
+            atomicWriteText(rootDirectory.resolve("book-rotation.txt"), degrees.toString())
+        }
     }
+
+    fun currentBookRotation(): Int = loadBookRotation()
 
     fun sendIndex() {
         val text = synchronized(lock) {
@@ -216,9 +249,12 @@ class TelegramReporter(
     }
 
     fun updateBookRegion(region: NormalizedBookRegion) {
-        rootDirectory.resolve("book-region.txt").writeText(
-            listOf(region.left, region.top, region.right, region.bottom).joinToString(","),
-        )
+        synchronized(lock) {
+            atomicWriteText(
+                rootDirectory.resolve("book-region.txt"),
+                listOf(region.left, region.top, region.right, region.bottom).joinToString(","),
+            )
+        }
     }
 
     fun finishSession(summary: String) {
@@ -321,6 +357,7 @@ class TelegramReporter(
                         val command = parser.parse(text)
                         when (command) {
                             TelegramCommand.Menu -> sendControlMenu()
+                            TelegramCommand.ShowCameraMenu -> sendCameraMenu()
                             TelegramCommand.ShowAreaGrid -> sendAreaGrid()
                             is TelegramCommand.PreviewBookRegion -> sendAreaPreview(command)
                             TelegramCommand.ShowBookRotation -> sendRotationMenu()
@@ -360,7 +397,17 @@ class TelegramReporter(
             return
         }
         AREA_SET_BUTTON.matchEntire(data)?.let { match ->
-            val values = match.groupValues.drop(1).map(String::toInt)
+            val previewKey = data.removePrefix("area:set:")
+            val calibrationEpoch = match.groupValues[2].toLong()
+            if (loadAreaCalibration() != calibrationEpoch ||
+                archive.all().none { it.capturedAtEpochMs == calibrationEpoch } ||
+                loadAreaPreview() != previewKey
+            ) {
+                runCatching { api.answerCallbackQuery(callbackId, "이전 선택입니다") }
+                sendImmediate("이전 영역 선택의 확인 버튼입니다. 가장 최근 빨간 테두리를 확인하거나 /area 로 다시 선택해주세요.")
+                return
+            }
+            val values = match.groupValues.drop(3).map(String::toInt)
             val region = runCatching {
                 NormalizedBookRegion(values[0] / 100f, values[1] / 100f, values[2] / 100f, values[3] / 100f)
             }.getOrNull()
@@ -369,7 +416,14 @@ class TelegramReporter(
                 return
             }
             commandHandler.handle(TelegramCommand.SetBookRegion(region))
+            clearAreaCalibration()
+            clearAreaPreview()
             runCatching { api.answerCallbackQuery(callbackId, "책 영역을 적용했습니다") }
+            return
+        }
+        if (LEGACY_PINNED_AREA_SET_BUTTON.matches(data) || LEGACY_AREA_SET_BUTTON.matches(data)) {
+            runCatching { api.answerCallbackQuery(callbackId, "새 격자가 필요합니다") }
+            sendImmediate("업데이트 전 확인 버튼은 좌표를 보증할 수 없습니다. /area 로 새 격자를 받아주세요.")
             return
         }
         val command = when (data) {
@@ -380,6 +434,11 @@ class TelegramReporter(
             "cmd:status" -> TelegramCommand.Status
             "cmd:settings" -> TelegramCommand.Settings
             "cmd:focus" -> TelegramCommand.Refocus
+            "cmd:camera" -> {
+                sendCameraMenu()
+                runCatching { api.answerCallbackQuery(callbackId, "카메라 메뉴를 열었습니다") }
+                return
+            }
             "cmd:index" -> TelegramCommand.Index
             "cmd:recent" -> TelegramCommand.Book(BookSelection.RecentMinutes(5))
             "cmd:area", "area:grid" -> {
@@ -396,6 +455,8 @@ class TelegramReporter(
             "rotate:90" -> TelegramCommand.SetBookRotation(90)
             "rotate:180" -> TelegramCommand.SetBookRotation(180)
             "rotate:270" -> TelegramCommand.SetBookRotation(270)
+            "camera:info" -> TelegramCommand.CameraDiagnostics
+            "camera:test" -> TelegramCommand.CameraComparison
             "cmd:stop" -> return sendCallbackMenu(callbackId, "공부를 종료할까요?", CONFIRM_STOP_MENU)
             "cmd:restart" -> return sendCallbackMenu(callbackId, "현재 진행을 버리고 처음부터 다시 시작할까요?", CONFIRM_RESTART_MENU)
             "confirm:stop" -> TelegramCommand.Stop
@@ -437,8 +498,21 @@ class TelegramReporter(
         append("]]}")
     }
 
-    private fun areaConfirmation(region: NormalizedBookRegion): String =
-        """{"inline_keyboard":[[{"text":"✅ 확정","callback_data":"area:set:${(region.left * 100).roundToInt()}:${(region.top * 100).roundToInt()}:${(region.right * 100).roundToInt()}:${(region.bottom * 100).roundToInt()}"},{"text":"↩ 다시 선택","callback_data":"area:grid"}]]}"""
+    private fun areaConfirmation(previewKey: String): String =
+        """{"inline_keyboard":[[{"text":"✅ 확정","callback_data":"area:set:$previewKey"},{"text":"↩ 다시 선택","callback_data":"area:grid"}]]}"""
+
+    private fun areaPreviewKey(
+        token: String,
+        capturedAtEpochMs: Long,
+        region: NormalizedBookRegion,
+    ): String = listOf(
+        token,
+        capturedAtEpochMs,
+        (region.left * 100).roundToInt(),
+        (region.top * 100).roundToInt(),
+        (region.right * 100).roundToInt(),
+        (region.bottom * 100).roundToInt(),
+    ).joinToString(":")
 
     private fun requireFile(entry: UploadEntry): File = requireNotNull(entry.filePath).let(::File).also {
         require(it.isFile) { "Queued file was removed: $it" }
@@ -466,14 +540,48 @@ class TelegramReporter(
         }
     }
 
-    private fun loadBookRegion(): NormalizedBookRegion = runCatching {
-        val values = rootDirectory.resolve("book-region.txt").readText().split(',').map(String::toFloat)
-        NormalizedBookRegion(values[0], values[1], values[2], values[3])
-    }.getOrDefault(NormalizedBookRegion.DEFAULT)
+    private fun loadBookRegion(): NormalizedBookRegion = synchronized(lock) {
+        runCatching {
+            val values = rootDirectory.resolve("book-region.txt").readText().split(',').map(String::toFloat)
+            NormalizedBookRegion(values[0], values[1], values[2], values[3])
+        }.getOrDefault(NormalizedBookRegion.DEFAULT)
+    }
 
-    private fun loadBookRotation(): Int = rootDirectory.resolve("book-rotation.txt")
-        .takeIf(File::isFile)?.readText()?.trim()?.toIntOrNull()
-        ?.takeIf { it in setOf(0, 90, 180, 270) } ?: DEFAULT_BOOK_ROTATION
+    private fun loadBookRotation(): Int = synchronized(lock) {
+        rootDirectory.resolve("book-rotation.txt")
+            .takeIf(File::isFile)?.readText()?.trim()?.toIntOrNull()
+            ?.takeIf { it in setOf(0, 90, 180, 270) } ?: DEFAULT_BOOK_ROTATION
+    }
+
+    private fun persistAreaCalibration(capturedAtEpochMs: Long) {
+        synchronized(lock) {
+            atomicWriteText(rootDirectory.resolve("area-calibration.txt"), capturedAtEpochMs.toString())
+        }
+    }
+
+    private fun loadAreaCalibration(): Long? = synchronized(lock) {
+        rootDirectory.resolve("area-calibration.txt")
+            .takeIf(File::isFile)?.readText()?.trim()?.toLongOrNull()
+    }
+
+    private fun clearAreaCalibration() {
+        synchronized(lock) {
+            rootDirectory.resolve("area-calibration.txt").delete()
+            clearAreaPreview()
+        }
+    }
+
+    private fun persistAreaPreview(key: String) {
+        synchronized(lock) { atomicWriteText(rootDirectory.resolve("area-preview.txt"), key) }
+    }
+
+    private fun loadAreaPreview(): String? = synchronized(lock) {
+        rootDirectory.resolve("area-preview.txt").takeIf(File::isFile)?.readText()?.trim()
+    }
+
+    private fun clearAreaPreview() {
+        synchronized(lock) { rootDirectory.resolve("area-preview.txt").delete() }
+    }
 
     private fun loadOffset() = rootDirectory.resolve("update-offset.txt").takeIf(File::isFile)
         ?.readText()?.trim()?.toLongOrNull() ?: 0L
@@ -483,6 +591,16 @@ class TelegramReporter(
         val temp = rootDirectory.resolve("update-offset.tmp")
         FileOutputStream(temp).use { output ->
             output.write(offset.toString().toByteArray())
+            output.flush()
+            output.fd.sync()
+        }
+        atomicReplace(temp, target)
+    }
+
+    private fun atomicWriteText(target: File, value: String) {
+        val temp = requireNotNull(target.parentFile).resolve(target.name + ".tmp")
+        FileOutputStream(temp).use { output ->
+            output.write(value.toByteArray())
             output.flush()
             output.fd.sync()
         }
@@ -560,10 +678,14 @@ class TelegramReporter(
         val TIME: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm:ss")
         val PHOTO_SEQUENCE = Regex("^#(\\d+)")
         val BOOK_BUTTON = Regex("^book:(\\d{1,19})$")
-        val AREA_SET_BUTTON = Regex("^area:set:(\\d{1,3}):(\\d{1,3}):(\\d{1,3}):(\\d{1,3})$")
-        const val CONTROL_MENU = """{"inline_keyboard":[[{"text":"▶ 시작","callback_data":"cmd:start"},{"text":"⏸ 일시정지","callback_data":"cmd:pause"},{"text":"▶ 계속","callback_data":"cmd:resume"}],[{"text":"⏭ 다음 단계","callback_data":"cmd:next"},{"text":"⏹ 종료","callback_data":"cmd:stop"},{"text":"🔄 처음부터","callback_data":"cmd:restart"}],[{"text":"📊 현재 상태","callback_data":"cmd:status"},{"text":"📷 최근 5분","callback_data":"cmd:recent"},{"text":"🎯 초점","callback_data":"cmd:focus"}],[{"text":"📐 책 영역 설정","callback_data":"cmd:area"},{"text":"🔃 책 회전","callback_data":"cmd:rotate"}],[{"text":"⏱ 시간 설정","callback_data":"menu:time"},{"text":"🖼 사진 목록","callback_data":"cmd:index"},{"text":"⚙ 현재 설정","callback_data":"cmd:settings"}]]}"""
-        const val ROTATION_MENU = """{"inline_keyboard":[[{"text":"0°","callback_data":"rotate:0"},{"text":"90°","callback_data":"rotate:90"},{"text":"180°","callback_data":"rotate:180"},{"text":"270°","callback_data":"rotate:270"}],[{"text":"‹ 기본 메뉴","callback_data":"menu:main"}]]}"""
+        val AREA_SET_BUTTON = Regex("^area:set:([0-9a-f]{$AREA_TOKEN_LENGTH}):(\\d{1,19}):(\\d{1,3}):(\\d{1,3}):(\\d{1,3}):(\\d{1,3})$")
+        val LEGACY_PINNED_AREA_SET_BUTTON = Regex("^area:set:(\\d{1,19}):(\\d{1,3}):(\\d{1,3}):(\\d{1,3}):(\\d{1,3})$")
+        val LEGACY_AREA_SET_BUTTON = Regex("^area:set:(\\d{1,3}):(\\d{1,3}):(\\d{1,3}):(\\d{1,3})$")
+        const val CONTROL_MENU = """{"inline_keyboard":[[{"text":"▶ 시작","callback_data":"cmd:start"},{"text":"⏸ 일시정지","callback_data":"cmd:pause"},{"text":"▶ 계속","callback_data":"cmd:resume"}],[{"text":"⏭ 다음 단계","callback_data":"cmd:next"},{"text":"⏹ 종료","callback_data":"cmd:stop"},{"text":"🔄 처음부터","callback_data":"cmd:restart"}],[{"text":"📊 현재 상태","callback_data":"cmd:status"},{"text":"📷 최근 5분","callback_data":"cmd:recent"},{"text":"🎯 초점","callback_data":"cmd:focus"}],[{"text":"📐 책 영역 설정","callback_data":"cmd:area"},{"text":"🔃 책 회전","callback_data":"cmd:rotate"},{"text":"🔭 카메라","callback_data":"cmd:camera"}],[{"text":"⏱ 시간 설정","callback_data":"menu:time"},{"text":"🖼 사진 목록","callback_data":"cmd:index"},{"text":"⚙ 현재 설정","callback_data":"cmd:settings"}]]}"""
+        const val ROTATION_MENU = """{"inline_keyboard":[[{"text":"0°","callback_data":"rotate:0"},{"text":"90°","callback_data":"rotate:90"},{"text":"180° (기본)","callback_data":"rotate:180"},{"text":"270°","callback_data":"rotate:270"}],[{"text":"‹ 기본 메뉴","callback_data":"menu:main"}]]}"""
+        const val CAMERA_MENU = """{"inline_keyboard":[[{"text":"📋 카메라 진단","callback_data":"camera:info"}],[{"text":"🧪 1× / 물리 3× 비교","callback_data":"camera:test"}],[{"text":"‹ 기본 메뉴","callback_data":"menu:main"}]]}"""
         const val DEFAULT_BOOK_ROTATION = 180
+        const val AREA_TOKEN_LENGTH = 8
         const val TIME_MENU = """{"inline_keyboard":[[{"text":"0·40·15","callback_data":"set:0:40:15"},{"text":"5·40·15","callback_data":"set:5:40:15"},{"text":"5·50·10","callback_data":"set:5:50:10"}],[{"text":"‹ 기본 메뉴","callback_data":"menu:main"}]]}"""
         const val CONFIRM_STOP_MENU = """{"inline_keyboard":[[{"text":"종료","callback_data":"confirm:stop"},{"text":"취소","callback_data":"menu:main"}]]}"""
         const val CONFIRM_RESTART_MENU = """{"inline_keyboard":[[{"text":"처음부터 시작","callback_data":"confirm:restart"},{"text":"취소","callback_data":"menu:main"}]]}"""
