@@ -61,4 +61,34 @@ class CameraTargetPolicyTest {
         )
         assertNull(CameraTargetPolicy.chooseThreeX(emptyList()))
     }
+
+    @Test fun verifiesRequestedPhysicalIdFromCaptureMetadata() {
+        val observation = PhysicalCaptureObservation(
+            activePhysicalId = "main",
+            physicalResultIds = setOf("tele-3x"),
+            captureResultFocalLengthMm = 5.4f,
+            exifFocalLengthMm = 5.4f,
+        )
+        assertEquals(true, CameraTargetPolicy.verifiesPhysicalCapture("tele-3x", 7f, observation))
+    }
+
+    @Test fun verifiesExpectedFocalLengthWhenPhysicalIdIsUnavailable() {
+        val observation = PhysicalCaptureObservation(
+            activePhysicalId = null,
+            physicalResultIds = emptySet(),
+            captureResultFocalLengthMm = null,
+            exifFocalLengthMm = 7.1f,
+        )
+        assertEquals(true, CameraTargetPolicy.verifiesPhysicalCapture("6", 7f, observation))
+    }
+
+    @Test fun rejectsWideCaptureClaimingToBeTelephoto() {
+        val observation = PhysicalCaptureObservation(
+            activePhysicalId = "5",
+            physicalResultIds = setOf("5"),
+            captureResultFocalLengthMm = 5.4f,
+            exifFocalLengthMm = 5.4f,
+        )
+        assertEquals(false, CameraTargetPolicy.verifiesPhysicalCapture("6", 7f, observation))
+    }
 }
