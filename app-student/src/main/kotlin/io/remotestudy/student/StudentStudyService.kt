@@ -13,10 +13,7 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
-import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CaptureResult
-import android.hardware.camera2.TotalCaptureResult
 import android.media.AudioManager
 import android.media.AudioAttributes
 import android.media.ToneGenerator
@@ -44,12 +41,10 @@ import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.camera2.interop.Camera2CameraInfo
-import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
-import androidx.exifinterface.media.ExifInterface
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
@@ -869,100 +864,110 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             finishCameraComparison("이 기기가 앱에 공개한 약 3× 물리 렌즈가 없습니다 · A 사진만 보냈습니다")
             return
         }
-        runCatching {
-            provider.unbindAll()
-            imageCapture = null
-            camera = null
-            resetBookFocus()
-            val evidence = PhysicalCaptureEvidence(candidate.cameraId)
-            val captureBuilder = ImageCapture.Builder()
-                .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
-                .setResolutionSelector(physicalCaptureSelector(candidate.maxJpegSize))
-                .setTargetRotation(currentDisplayRotation())
-            Camera2Interop.Extender(captureBuilder)
-                .setPhysicalCameraId(candidate.cameraId)
-                .setSessionCaptureCallback(object : CameraCaptureSession.CaptureCallback() {
-                    override fun onCaptureCompleted(
-                        session: CameraCaptureSession,
-                        request: android.hardware.camera2.CaptureRequest,
-                        result: TotalCaptureResult,
-                    ) {
-                        evidence.record(result)
-                    }
-                })
-            val capture = captureBuilder.build()
-            val physicalSelector = CameraSelector.Builder()
-                .requireLensFacing(CameraSelector.LENS_FACING_BACK)
-                .setPhysicalCameraId(candidate.cameraId)
-                .build()
-            val bound = provider.bindToLifecycle(this, physicalSelector, capture)
-            val boundId = runCatching { Camera2CameraInfo.from(bound.cameraInfo).cameraId }
-                .getOrDefault(candidate.cameraId)
-            Log.i(
-                TAG,
-                "camera_comparison_bound requestedPhysical=${candidate.cameraId} boundId=$boundId " +
-                    "estimatedZoom=${candidate.estimatedZoomRatio} resolution=${capture.resolutionInfo?.resolution}",
-            )
-            focusComparisonCamera(bound) {
-                captureComparisonFile(capture, "camera-physical-3x-") { result ->
-                    result.fold(
-                        onSuccess = { file ->
-                            mainHandler.postDelayed({
-                                val observation = evidence.snapshot(readExifFocalLength(file))
-                                val verified = CameraTargetPolicy.verifiesPhysicalCapture(
-                                    expectedCameraId = candidate.cameraId,
-                                    expectedFocalLengthMm = candidate.focalLengthMm,
-                                    observation = observation,
-                                )
-                                executeComparisonWork(file, "B 사진") {
-                                    val queued = runCatching {
-                                        reporter.sendDiagnosticDocument(
-                                            file,
-                                            comparisonCaption(
-                                                label = if (verified) {
-                                                    "B · 물리 약 3× 확인됨"
-                                                } else {
-                                                    "B · 물리 약 3× 확인 실패"
-                                                },
-                                                file = file,
-                                                cameraId = candidate.cameraId,
-                                                zoomRatio = candidate.estimatedZoomRatio,
-                                                extra = physicalEvidenceCaption(
-                                                    candidate = candidate,
-                                                    boundLogicalId = boundId,
-                                                    boundResolution = capture.resolutionInfo?.resolution,
-                                                    observation = observation,
-                                                ),
-                                            ),
-                                        )
-                                    }
-                                    file.delete()
-                                    mainHandler.post {
-                                        queued.fold(
-                                            onSuccess = {
-                                                val resultMessage = if (verified) {
-                                                    "물리 3× 전환 확인 성공 · A/B 원본을 전송 대기열에 저장했습니다"
-                                                } else {
-                                                    "물리 3× 전환 확인 실패 · B 사진은 참고용으로 보냈으며 기본 카메라로 복구합니다"
-                                                }
-                                                finishCameraComparison(resultMessage)
-                                            },
-                                            onFailure = {
-                                                finishCameraComparison("B 사진을 전송 큐에 저장하지 못했습니다: ${it.message.orEmpty()}")
-                                            },
-                                        )
-                                    }
-                                }
-                            }, PHYSICAL_RESULT_SETTLE_MS)
-                        },
-                        onFailure = { failure ->
-                            finishCameraComparison("B 물리 3× 촬영 실패: ${failure.message.orEmpty()} · 기본 카메라로 복구합니다")
-                        },
-                    )
-                }
+        val yuvSize = candidate.maxYuvSize
+        if (yuvSize == null) {
+            finishCameraComparison("물리 3× 렌즈가 YUV 촬영 크기를 공개하지 않았습니다 · 기본 카메라로 복구합니다")
+            return
+        }
+        val target = runCatching { File.createTempFile("camera-physical-yuv-3x-", ".jpg", cacheDir) }
+            .getOrElse {
+                finishCameraComparison("B 사진 임시파일 생성 실패: ${it.message.orEmpty()}")
+                return
             }
-        }.onFailure { failure ->
-            finishCameraComparison("물리 3× 렌즈 연결 실패: ${failure.message.orEmpty()} · 기본 카메라로 복구합니다")
+        runCatching { provider.unbindAll() }
+        imageCapture = null
+        camera = null
+        resetBookFocus()
+        val orientation = physicalJpegOrientation(candidate.sensorOrientationDegrees)
+        Log.i(
+            TAG,
+            "camera2_physical_yuv_start logical=${inventory.logicalCameraId} " +
+                "physical=${candidate.cameraId} yuv=${yuvSize.width}x${yuvSize.height} orientation=$orientation",
+        )
+        mainHandler.postDelayed({
+            if (destroyed || !cameraComparisonInFlight.get()) {
+                target.delete()
+                return@postDelayed
+            }
+            PhysicalYuvCameraCapture(this, ContextCompat.getMainExecutor(this)).capture(
+                PhysicalYuvCameraCapture.Request(
+                    logicalCameraId = inventory.logicalCameraId,
+                    physicalCameraId = candidate.cameraId,
+                    outputSize = yuvSize,
+                    outputFile = target,
+                    jpegOrientationDegrees = orientation,
+                ),
+            ) { result ->
+                result.fold(
+                    onSuccess = { frame -> handlePhysicalYuvFrame(candidate, inventory.logicalCameraId, frame) },
+                    onFailure = { failure ->
+                        target.delete()
+                        finishCameraComparison(
+                            "B Camera2 물리 YUV 촬영 실패: ${failure.message.orEmpty()} · 기본 카메라로 복구합니다",
+                        )
+                    },
+                )
+            }
+        }, CAMERA2_RELEASE_SETTLE_MS)
+    }
+
+    private fun handlePhysicalYuvFrame(
+        candidate: PhysicalCameraDescriptor,
+        logicalCameraId: String,
+        frame: PhysicalYuvCameraCapture.Frame,
+    ) {
+        val observation = PhysicalCaptureObservation(
+            activePhysicalId = frame.activePhysicalId,
+            physicalResultIds = frame.physicalResultIds,
+            captureResultFocalLengthMm = frame.captureResultFocalLengthMm,
+            exifFocalLengthMm = null,
+        )
+        val verified = CameraTargetPolicy.verifiesPhysicalCapture(
+            expectedCameraId = candidate.cameraId,
+            expectedFocalLengthMm = candidate.focalLengthMm,
+            observation = observation,
+        )
+        Log.i(
+            TAG,
+            "camera2_physical_yuv_result requested=${candidate.cameraId} active=${frame.activePhysicalId} " +
+                "physicalResults=${frame.physicalResultIds} focal=${frame.captureResultFocalLengthMm} verified=$verified",
+        )
+        executeComparisonWork(frame.file, "B 사진") {
+            val queued = runCatching {
+                reporter.sendDiagnosticDocument(
+                    frame.file,
+                    comparisonCaption(
+                        label = if (verified) "B · Camera2 물리 약 3× 확인됨" else "B · Camera2 물리 약 3× 확인 실패",
+                        file = frame.file,
+                        cameraId = candidate.cameraId,
+                        zoomRatio = candidate.estimatedZoomRatio,
+                        extra = physicalEvidenceCaption(
+                            candidate = candidate,
+                            boundLogicalId = logicalCameraId,
+                            boundResolution = frame.size,
+                            observation = observation,
+                        ) + "\nroute=Camera2 logical+physical YUV · requestedPhysicalFocal=" +
+                            formatFocal(frame.requestedPhysicalFocalLengthMm),
+                    ),
+                )
+            }
+            frame.file.delete()
+            mainHandler.post {
+                queued.fold(
+                    onSuccess = {
+                        finishCameraComparison(
+                            if (verified) {
+                                "Camera2 물리 3× 확인 성공 · A/B 원본을 전송 대기열에 저장했습니다"
+                            } else {
+                                "Camera2 물리 3× 확인 실패 · B 사진은 참고용으로 보냈으며 기본 카메라로 복구합니다"
+                            },
+                        )
+                    },
+                    onFailure = {
+                        finishCameraComparison("B 사진을 전송 큐에 저장하지 못했습니다: ${it.message.orEmpty()}")
+                    },
+                )
+            }
         }
     }
 
@@ -1083,6 +1088,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
                         .append(" · focal ").append(lens.focalLengthsText)
                         .append(" · sensor ").append(lens.sensorSizeText)
                         .append(" · JPEG ").append(lens.maxJpegText)
+                        .append(" · YUV ").append(lens.maxYuvText)
                         .append('\n')
                 }
                 append("약 3× 후보: ").append(inventory.threeXCandidate?.cameraId ?: "없음")
@@ -1111,6 +1117,9 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
                 sensorSizeText = raw.sensorSizeText,
                 maxJpegSize = raw.maxJpegSize,
                 maxJpegText = raw.maxJpegText,
+                maxYuvSize = raw.maxYuvSize,
+                maxYuvText = raw.maxYuvText,
+                sensorOrientationDegrees = raw.sensorOrientationDegrees,
             )
         }.sortedBy(PhysicalCameraDescriptor::cameraId)
         val selected = CameraTargetPolicy.chooseThreeX(
@@ -1132,6 +1141,9 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         val maxJpeg = camera2.getCameraCharacteristic(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             ?.getOutputSizes(ImageFormat.JPEG)
             ?.maxByOrNull { it.width.toLong() * it.height.toLong() }
+        val maxYuv = camera2.getCameraCharacteristic(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            ?.getOutputSizes(ImageFormat.YUV_420_888)
+            ?.maxByOrNull { it.width.toLong() * it.height.toLong() }
         val focalLength = focalLengths.firstOrNull()?.takeIf { it.isFinite() && it > 0f }
         val sensorWidth = sensorSize?.width?.takeIf { it.isFinite() && it > 0f }
         RawPhysicalCamera(
@@ -1144,13 +1156,10 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             sensorSizeText = sensorSize?.let { "%.1f×%.1fmm".format(Locale.US, it.width, it.height) } ?: "unknown",
             maxJpegSize = maxJpeg,
             maxJpegText = maxJpeg?.let { "${it.width}×${it.height}" } ?: "unknown",
+            maxYuvSize = maxYuv,
+            maxYuvText = maxYuv?.let { "${it.width}×${it.height}" } ?: "unknown",
+            sensorOrientationDegrees = camera2.getCameraCharacteristic(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90,
         )
-    }.getOrNull()
-
-    private fun readExifFocalLength(file: File): Float? = runCatching {
-        ExifInterface(file).getAttributeDouble(ExifInterface.TAG_FOCAL_LENGTH, Double.NaN)
-            .takeIf { it.isFinite() && it > 0.0 }
-            ?.toFloat()
     }.getOrNull()
 
     private fun physicalEvidenceCaption(
@@ -1161,7 +1170,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
     ): String = buildString {
         append("requestedPhysical=").append(candidate.cameraId)
             .append(" · boundLogical=").append(boundLogicalId)
-            .append(" · requestedJPEG=").append(candidate.maxJpegText)
+            .append(" · requestedYUV=").append(candidate.maxYuvText)
             .append(" · boundResolution=").append(boundResolution?.let { "${it.width}×${it.height}" } ?: "unknown")
         append("\nactivePhysical=").append(observation.activePhysicalId ?: "unknown")
             .append(" · physicalResults=")
@@ -1195,15 +1204,17 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         }
     }
 
-    private fun physicalCaptureSelector(target: Size?): ResolutionSelector = ResolutionSelector.Builder()
-        .setAspectRatioStrategy(AspectRatioStrategy(AspectRatio.RATIO_4_3, AspectRatioStrategy.FALLBACK_RULE_AUTO))
-        .setResolutionStrategy(
-            target?.let {
-                ResolutionStrategy(it, ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER)
-            } ?: ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY,
-        )
-        .setAllowedResolutionMode(ResolutionSelector.PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE)
-        .build()
+
+    private fun physicalJpegOrientation(sensorOrientationDegrees: Int): Int {
+        val displayDegrees = when (currentDisplayRotation()) {
+            Surface.ROTATION_0 -> 0
+            Surface.ROTATION_90 -> 90
+            Surface.ROTATION_180 -> 180
+            Surface.ROTATION_270 -> 270
+            else -> 0
+        }
+        return (sensorOrientationDegrees - displayDegrees + 360) % 360
+    }
 
     private fun handleVoiceCommand(command: VoiceCommand) {
         when (command) {
@@ -1617,6 +1628,9 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         val sensorSizeText: String,
         val maxJpegSize: Size?,
         val maxJpegText: String,
+        val maxYuvSize: Size?,
+        val maxYuvText: String,
+        val sensorOrientationDegrees: Int,
     )
 
     private data class RawPhysicalCamera(
@@ -1628,41 +1642,10 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         val sensorSizeText: String,
         val maxJpegSize: Size?,
         val maxJpegText: String,
+        val maxYuvSize: Size?,
+        val maxYuvText: String,
+        val sensorOrientationDegrees: Int,
     )
-
-    private class PhysicalCaptureEvidence(private val expectedCameraId: String) {
-        private val lock = Any()
-        private var activePhysicalId: String? = null
-        private var captureResultFocalLengthMm: Float? = null
-        private val physicalResultIds = linkedSetOf<String>()
-
-        fun record(result: TotalCaptureResult) = synchronized(lock) {
-            if (Build.VERSION.SDK_INT >= 29) {
-                result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)?.let {
-                    activePhysicalId = it
-                }
-            }
-            val physicalResults = if (Build.VERSION.SDK_INT >= 28) {
-                result.physicalCameraResults
-            } else {
-                emptyMap()
-            }
-            physicalResultIds += physicalResults.keys
-            captureResultFocalLengthMm = physicalResults[expectedCameraId]
-                ?.get(CaptureResult.LENS_FOCAL_LENGTH)
-                ?: result.get(CaptureResult.LENS_FOCAL_LENGTH)
-                ?: captureResultFocalLengthMm
-        }
-
-        fun snapshot(exifFocalLengthMm: Float?): PhysicalCaptureObservation = synchronized(lock) {
-            PhysicalCaptureObservation(
-                activePhysicalId = activePhysicalId,
-                physicalResultIds = physicalResultIds.toSet(),
-                captureResultFocalLengthMm = captureResultFocalLengthMm,
-                exifFocalLengthMm = exifFocalLengthMm,
-            )
-        }
-    }
 
     companion object {
         const val ACTION_STATE = "io.remotestudy.student.STATE"
@@ -1686,7 +1669,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         private const val COMPARISON_SLOT_RETRY_MS = 250L
         private const val COMPARISON_FOCUS_TIMEOUT_MS = 4_000L
         private const val COMPARISON_CAPTURE_TIMEOUT_MS = 15_000L
-        private const val PHYSICAL_RESULT_SETTLE_MS = 300L
+        private const val CAMERA2_RELEASE_SETTLE_MS = 500L
         private const val CAMERA_BIND_RETRY_MS = 2_000L
         private const val KEY_ACTIVE = "active"
         private const val KEY_STARTED_EPOCH = "started_epoch"
