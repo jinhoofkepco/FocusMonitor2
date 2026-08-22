@@ -61,6 +61,8 @@ import io.remotestudy.domain.session.StartOrigin
 import io.remotestudy.domain.session.StartRequested
 import io.remotestudy.domain.session.Tick
 import io.remotestudy.domain.session.StudySchedule
+import io.remotestudy.telegram.CaptureTimerPhase
+import io.remotestudy.telegram.CaptureTimerState
 import io.remotestudy.telegram.NormalizedBookRegion
 import io.remotestudy.telegram.RemoteSessionPhase
 import io.remotestudy.telegram.TelegramCommand
@@ -73,6 +75,9 @@ import io.remotestudy.voice.VoiceCommand
 import io.remotestudy.voice.VoiceCommandError
 import io.remotestudy.voice.VoiceCommandStatus
 import java.io.File
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.Executors
@@ -103,6 +108,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
     private val scheduledThreeXInFlight = AtomicBoolean(false)
     private var scheduledThreeXConsecutiveFailures = 0
     private var scheduledThreeXDisabledForSession = false
+    private var lastSnapshotCheckpointElapsedMs = 0L
     private var imageCapture: ImageCapture? = null
     private var cameraProvider: ProcessCameraProvider? = null
     private var camera: Camera? = null
@@ -116,6 +122,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
     private var scheduledPhysicalTemp: File? = null
     private var nextFocusAttemptElapsedMs = 0L
     @Volatile private var destroyed = false
+    private var shutdownSnapshotPersisted = false
     private lateinit var reporter: TelegramReporter
     private lateinit var voice: StudentVoiceCommandController
     private lateinit var tts: TextToSpeech
@@ -219,7 +226,15 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             reporter.start()
             bindCamera()
             if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) voice.start()
-            broadcastState("텔레그램 명령 대기")
+            val restored = snapshot()
+            broadcastState(if (sessionActive) statusText(restored) else "텔레그램 명령 대기")
+            if (sessionActive && (restored.status == SessionStatus.PAUSED || countdownPaused || awaitingBreakResume)) {
+                reporter.sendImmediate(
+                    "[전환 알림] 학생 앱 재실행 · ${statusText(restored)}\n" +
+                        "발생 시각 · ${currentClockText()}\n" +
+                        "종료되어 있던 시간은 차감하지 않았습니다. 계속하려면 /resume",
+                )
+            }
             if (awaitingBreakResume) startBreakResumeReminders()
         }
         registerThermalListener()
@@ -246,6 +261,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
     override fun onTaskRemoved(rootIntent: Intent?) {
         // Defense for OEM builds that deliver this callback despite stopWithTask=true.
         // Removing the recent-app task is an explicit request to stop camera and microphone work.
+        pauseForServiceShutdown("최근 앱에서 종료")
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
         super.onTaskRemoved(rootIntent)
@@ -258,8 +274,9 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             TelegramCommand.Resume -> resumeSession()
             TelegramCommand.Stop -> stopSession()
             TelegramCommand.Restart -> restartSession()
+            is TelegramCommand.BeginSchedule -> beginSchedule(command)
             TelegramCommand.NextPhase -> nextPhase()
-            TelegramCommand.Settings -> reporter.sendImmediate(settingsText())
+            TelegramCommand.Settings -> sendSettingsAndCurrent()
             TelegramCommand.Refocus -> requestBookRefocus()
             TelegramCommand.ShowCameraMenu -> reporter.sendCameraMenu()
             TelegramCommand.CameraDiagnostics -> sendCameraDiagnostics()
@@ -268,7 +285,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             is TelegramCommand.SetCountdown -> setCountdown(command.seconds)
             is TelegramCommand.SetRemaining -> setRemaining(command.seconds)
             is TelegramCommand.GoToPhase -> goToPhase(command.phase, command.remainingSeconds)
-            TelegramCommand.Status -> reporter.sendImmediate(statusText(snapshot()))
+            TelegramCommand.Status -> sendDetailedStatus()
             TelegramCommand.Menu -> reporter.sendControlMenu()
             TelegramCommand.ShowAreaGrid -> reporter.sendAreaGrid()
             is TelegramCommand.PreviewBookRegion -> reporter.sendAreaPreview(command)
@@ -300,6 +317,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             reporter.sendImmediate("이미 세션이 진행 중입니다 · ${statusText(session.snapshot())}")
             return@synchronized
         }
+        invalidateCaptureForSessionBoundary()
         completedProblemCount = 0
         countdownPaused = false
         clearBreakResumeWait()
@@ -324,7 +342,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         val started = session.snapshot()
         reporter.sendImmediate("세션 시작 · ${settingsText(oneLine = true)}")
         broadcastState(if (started.status == SessionStatus.START_COUNTDOWN) "${teacherCountdownMs / 1_000}초 뒤 시작" else statusText(started))
-        if (started.status == SessionStatus.RUNNING) announcePhaseStart(started.phase)
+        if (started.status == SessionStatus.RUNNING) announcePhaseStart(started, "새 회차")
     }
 
     private fun pauseSession() = synchronized(sessionLock) {
@@ -369,6 +387,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
 
     private fun stopSession() = synchronized(sessionLock) {
         if (!sessionActive) { reporter.sendImmediate("진행 중인 세션이 없습니다"); return@synchronized }
+        invalidateCaptureForSessionBoundary()
         val snapshot = session.snapshot()
         sessionActive = false
         clearBreakResumeWait()
@@ -389,30 +408,37 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
     }
 
     private fun setSchedule(command: TelegramCommand.SetSchedule) = synchronized(sessionLock) {
-        val oldSchedule = schedule
+        if (sessionActive) {
+            reporter.sendImmediate(
+                "⚠️ 진행 중인 타이머는 바꾸지 않았습니다 · 현재 ${statusText(session.snapshot())}\n" +
+                    "새 시간으로 처음부터 시작하려면 /begin ${command.meditationMinutes} " +
+                    "${command.studyMinutes} ${command.breakMinutes}",
+            )
+            return@synchronized
+        }
         schedule = StudySchedule(
             command.meditationMinutes * 60_000L,
             command.studyMinutes * 60_000L,
             command.breakMinutes * 60_000L,
         )
         saveTimerSettings()
-        val current = session.snapshot()
-        if (sessionActive && current.status in setOf(SessionStatus.RUNNING, SessionStatus.PAUSED)) {
-            val elapsedInPhase = (phaseDuration(oldSchedule, current.phase) - current.phaseRemainingMs).coerceAtLeast(0L)
-            val newRemaining = (phaseDuration(schedule, current.phase) - elapsedInPhase).coerceAtLeast(0L)
-            positionAt(current.phase, newRemaining, current.status == SessionStatus.PAUSED)
-            val updated = session.snapshot()
-            if (!finishIfCompleted(updated, "시간 단축으로 세션 완료")) {
-                persistSnapshot(updated)
-                updateMonitor(updated)
-                broadcastState(statusText(updated))
-            }
-        } else if (sessionActive && current.status == SessionStatus.START_COUNTDOWN) {
-            rebuildAtProgress((teacherCountdownMs - current.countdownRemainingMs).coerceAtLeast(0L), paused = false)
-            reconcileCountdownPauseAfterRebuild()
-            persistSnapshot(session.snapshot())
+        reporter.sendImmediate("다음 회차 시간 저장 완료 · ${settingsText(oneLine = true)}")
+    }
+
+    private fun beginSchedule(command: TelegramCommand.BeginSchedule) = synchronized(sessionLock) {
+        if (sessionActive) {
+            reporter.finishSession("새 시간표 시작으로 이전 회차 종료 · 완료한 문제 ${completedProblemCount}개")
+            sessionActive = false
+            clearBreakResumeWait()
+            clearSessionState()
         }
-        reporter.sendImmediate("시간 설정 즉시 적용 · ${settingsText(oneLine = true)}")
+        schedule = StudySchedule(
+            command.meditationMinutes * 60_000L,
+            command.studyMinutes * 60_000L,
+            command.breakMinutes * 60_000L,
+        )
+        saveTimerSettings()
+        startSession()
     }
 
     private fun setCountdown(seconds: Int) = synchronized(sessionLock) {
@@ -479,8 +505,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         persistSnapshot(updated)
         updateMonitor(updated)
         broadcastState(statusText(updated))
-        reporter.sendImmediate("단계 이동 완료 · ${statusText(updated)}")
-        announcePhaseStart(updated.phase)
+        announcePhaseStart(updated, "선생님 단계 이동")
     }
 
     private fun nextPhase() = synchronized(sessionLock) {
@@ -514,12 +539,12 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         persistSnapshot(updated)
         updateMonitor(updated)
         broadcastState(statusText(updated))
-        reporter.sendImmediate("다음 단계 · ${statusText(updated)}")
-        announcePhaseStart(updated.phase)
+        announcePhaseStart(updated, "선생님 다음 단계")
     }
 
     private fun finishIfCompleted(snapshot: SessionSnapshot, reason: String): Boolean {
         if (snapshot.status != SessionStatus.COMPLETED) return false
+        invalidateCaptureForSessionBoundary()
         sessionActive = false
         clearSessionState()
         updateMonitor(snapshot)
@@ -529,26 +554,36 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
     }
 
     private fun tickSession() {
-        if (!sessionActive) return
         synchronized(sessionLock) {
+            // Telegram commands run on a polling thread. Recheck under the
+            // same lock used by /stop and /begin so a late ticker can never
+            // advance or resurrect the just-ended session.
+            if (!sessionActive) return@synchronized
             if (countdownPaused || awaitingBreakResume) return@synchronized
             val before = session.snapshot()
             val current = session.dispatch(Tick(sessionNow()))
             if (BreakResumePolicy.shouldEnterWaiting(before, current)) {
-                enterBreakResumeWait()
+                enterBreakResumeWait(crossedMultiplePhases = before.phase != SessionPhase.BREAK)
                 return@synchronized
             }
-            if (current.status != before.status || current.phase != before.phase || current.phaseRemainingMs / 60_000 != before.phaseRemainingMs / 60_000) {
+            val checkpointNow = SystemClock.elapsedRealtime()
+            val visibleStateChanged = current.status != before.status || current.phase != before.phase ||
+                current.phaseRemainingMs / 60_000 != before.phaseRemainingMs / 60_000
+            if (visibleStateChanged ||
+                checkpointNow - lastSnapshotCheckpointElapsedMs >= SNAPSHOT_CHECKPOINT_INTERVAL_MS) {
                 persistSnapshot(current)
+            }
+            if (visibleStateChanged) {
                 broadcastState(statusText(current))
             }
             if ((before.status == SessionStatus.START_COUNTDOWN && current.status == SessionStatus.RUNNING) ||
                 (current.phase != before.phase && current.status == SessionStatus.RUNNING)
             ) {
-                announcePhaseStart(current.phase)
+                announcePhaseStart(current, "자동 전환")
             }
             updateMonitor(current)
             if (current.status == SessionStatus.COMPLETED) {
+                invalidateCaptureForSessionBoundary()
                 sessionActive = false
                 clearSessionState()
                 reporter.finishSession("세션 완료 · 완료한 문제 ${completedProblemCount}개")
@@ -558,21 +593,27 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
 
     private fun maybeCapture() {
         if (cameraComparisonInFlight.get() || scheduledThreeXInFlight.get()) return
-        val current = snapshot()
-        if (!sessionActive || current.status != SessionStatus.RUNNING) return
-        if (captureInFlight.get() && SystemClock.elapsedRealtime() - captureStartedAtElapsedMs > CAPTURE_STALL_MS) {
-            Log.e(TAG, "camera_stall elapsed=${SystemClock.elapsedRealtime() - captureStartedAtElapsedMs}")
-            captureGeneration.incrementAndGet()
-            captureInFlight.set(false)
+        val capture = imageCapture ?: return
+        val generation = synchronized(sessionLock) {
+            val current = session.snapshot()
+            if (!sessionActive || current.status != SessionStatus.RUNNING) return
+            if (captureInFlight.get() && SystemClock.elapsedRealtime() - captureStartedAtElapsedMs > CAPTURE_STALL_MS) {
+                Log.e(TAG, "camera_stall elapsed=${SystemClock.elapsedRealtime() - captureStartedAtElapsedMs}")
+                captureGeneration.incrementAndGet()
+                captureInFlight.set(false)
+                null
+            } else {
+                if (!captureInFlight.compareAndSet(false, true)) return
+                captureGeneration.incrementAndGet()
+            }
+        }
+        if (generation == null) {
             bindCamera(force = true)
             return
         }
-        val capture = imageCapture ?: return
-        if (!captureInFlight.compareAndSet(false, true)) return
-        val generation = captureGeneration.incrementAndGet()
         captureStartedAtElapsedMs = SystemClock.elapsedRealtime()
         ensureBookFocus { focusResult ->
-            if (destroyed) {
+            if (destroyed || captureGeneration.get() != generation) {
                 if (captureGeneration.get() == generation) captureInFlight.set(false)
                 return@ensureBookFocus
             }
@@ -595,17 +636,24 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             ContextCompat.getMainExecutor(this),
             object : ImageCapture.OnImageSavedCallback {
                 override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                    if (destroyed || generation != captureGeneration.get()) {
+                        temp.delete()
+                        return
+                    }
                     val epoch = System.currentTimeMillis()
                     val elapsed = SystemClock.elapsedRealtime()
+                    tickSession()
+                    val timerState = currentCaptureTimerState()
                     val shouldCaptureThreeX = reporter.isNextMontageCellFirst() && canAttemptScheduledThreeX()
                     if (shouldCaptureThreeX) {
-                        startScheduledThreeX(temp, epoch, elapsed, generation)
+                        startScheduledThreeX(temp, epoch, elapsed, generation, timerState)
                     } else {
-                        processCapturedFiles(temp, null, epoch, elapsed, generation)
+                        processCapturedFiles(temp, null, epoch, elapsed, generation, timerState)
                     }
                 }
                 override fun onError(exception: ImageCaptureException) {
                     temp.delete()
+                    if (destroyed || generation != captureGeneration.get()) return
                     if (captureGeneration.get() == generation) captureInFlight.set(false)
                     Log.e(TAG, "capture_error code=${exception.imageCaptureError}", exception)
                     reporter.sendImmediate("카메라 촬영 실패 · 자동 재시도")
@@ -628,11 +676,12 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         capturedAtEpochMs: Long,
         capturedAtElapsedMs: Long,
         generation: Long,
+        timerState: CaptureTimerState?,
     ) {
         if (destroyed || generation != captureGeneration.get() ||
             !scheduledThreeXInFlight.compareAndSet(false, true)
         ) {
-            processCapturedFiles(oneXFile, null, capturedAtEpochMs, capturedAtElapsedMs, generation)
+            processCapturedFiles(oneXFile, null, capturedAtEpochMs, capturedAtElapsedMs, generation, timerState)
             return
         }
         val provider = cameraProvider
@@ -646,13 +695,21 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
                 capturedAtElapsedMs,
                 generation,
                 "물리 3× YUV 렌즈를 준비할 수 없습니다",
+                timerState,
             )
             return
         }
         val physicalTarget = runCatching {
             File.createTempFile("scheduled-physical-yuv-3x-", ".jpg", cacheDir)
         }.getOrElse {
-            onScheduledThreeXFailure(oneXFile, capturedAtEpochMs, capturedAtElapsedMs, generation, it.message.orEmpty())
+            onScheduledThreeXFailure(
+                oneXFile,
+                capturedAtEpochMs,
+                capturedAtElapsedMs,
+                generation,
+                it.message.orEmpty(),
+                timerState,
+            )
             return
         }
         scheduledOneXTemp = oneXFile
@@ -666,6 +723,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             if (destroyed || generation != captureGeneration.get()) {
                 oneXFile.delete()
                 physicalTarget.delete()
+                restoreCameraAfterScheduledThreeX()
                 scheduledThreeXInFlight.set(false)
                 captureInFlight.set(false)
                 return@postDelayed
@@ -681,6 +739,15 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
                 ),
             ) { result ->
                 activePhysicalCapture = null
+                if (destroyed || generation != captureGeneration.get()) {
+                    result.getOrNull()?.file?.delete()
+                    oneXFile.delete()
+                    physicalTarget.delete()
+                    restoreCameraAfterScheduledThreeX()
+                    scheduledThreeXInFlight.set(false)
+                    captureInFlight.set(false)
+                    return@capture
+                }
                 result.fold(
                     onSuccess = { frame ->
                         val observation = PhysicalCaptureObservation(
@@ -697,12 +764,14 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
                         if (verified) {
                             scheduledThreeXConsecutiveFailures = 0
                             restoreCameraAfterScheduledThreeX()
+                            tickSession()
                             processCapturedFiles(
                                 oneXFile,
                                 frame.file,
-                                capturedAtEpochMs,
-                                capturedAtElapsedMs,
+                                frame.capturedAtEpochMs,
+                                frame.capturedAtElapsedMs,
                                 generation,
+                                currentCaptureTimerState(),
                             )
                         } else {
                             frame.file.delete()
@@ -712,6 +781,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
                                 capturedAtElapsedMs,
                                 generation,
                                 "촬영 결과가 물리 3× 렌즈와 일치하지 않습니다",
+                                timerState,
                             )
                         }
                     },
@@ -723,6 +793,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
                             capturedAtElapsedMs,
                             generation,
                             failure.message.orEmpty(),
+                            timerState,
                         )
                     },
                 )
@@ -736,14 +807,23 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         capturedAtElapsedMs: Long,
         generation: Long,
         reason: String,
+        timerState: CaptureTimerState?,
     ) {
+        if (destroyed || generation != captureGeneration.get()) {
+            oneXFile.delete()
+            scheduledPhysicalTemp?.delete()
+            restoreCameraAfterScheduledThreeX()
+            scheduledThreeXInFlight.set(false)
+            captureInFlight.set(false)
+            return
+        }
         scheduledThreeXConsecutiveFailures += 1
         if (scheduledThreeXConsecutiveFailures >= MAX_SCHEDULED_THREE_X_FAILURES) {
             scheduledThreeXDisabledForSession = true
             reporter.sendImmediate("정기 3× 촬영을 연속 2회 실패해 이번 회차에서는 1×로 대체합니다 · $reason")
         }
         restoreCameraAfterScheduledThreeX()
-        processCapturedFiles(oneXFile, null, capturedAtEpochMs, capturedAtElapsedMs, generation)
+        processCapturedFiles(oneXFile, null, capturedAtEpochMs, capturedAtElapsedMs, generation, timerState)
     }
 
     private fun restoreCameraAfterScheduledThreeX() {
@@ -758,24 +838,29 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         capturedAtEpochMs: Long,
         capturedAtElapsedMs: Long,
         generation: Long,
+        timerState: CaptureTimerState?,
     ) {
         runCatching {
             cameraExecutor.execute {
-                if (destroyed || generation != captureGeneration.get()) {
-                    oneXFile.delete()
-                    physicalThreeXFile?.delete()
-                    mainHandler.post { scheduledThreeXInFlight.set(false) }
-                    return@execute
-                }
                 var stored = false
                 try {
-                    reporter.recordCapture(
-                        oneXFile,
-                        capturedAtEpochMs,
-                        capturedAtElapsedMs,
-                        physicalThreeXFile,
-                    )
-                    stored = true
+                    // The final generation check and archive mutation share
+                    // the same lock as /stop, /restart and /begin. This closes
+                    // the last race where an old frame could pass its check,
+                    // then be written after startFreshSession reset the
+                    // reporter to the new session.
+                    synchronized(sessionLock) {
+                        if (!destroyed && sessionActive && generation == captureGeneration.get()) {
+                            reporter.recordCapture(
+                                oneXFile,
+                                capturedAtEpochMs,
+                                capturedAtElapsedMs,
+                                physicalThreeXFile,
+                                timerState,
+                            )
+                            stored = true
+                        }
+                    }
                 } catch (failure: Throwable) {
                     runCatching { reporter.sendImmediate("촬영 처리 실패: ${failure.message.orEmpty()}") }
                 } finally {
@@ -801,6 +886,16 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             if (generation == captureGeneration.get()) captureInFlight.set(false)
             scheduledThreeXInFlight.set(false)
         }
+    }
+
+    /**
+     * Separates camera callbacks from Telegram session identity. A frame that
+     * started in the previous session may finish later, but its generation can
+     * no longer be archived into the new session's montage.
+     */
+    private fun invalidateCaptureForSessionBoundary() {
+        captureGeneration.incrementAndGet()
+        if (!scheduledThreeXInFlight.get()) captureInFlight.set(false)
     }
 
     private fun ensureBookFocus(callback: (Result<Unit>) -> Unit) {
@@ -1475,7 +1570,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         }
     }
 
-    private fun enterBreakResumeWait() {
+    private fun enterBreakResumeWait(crossedMultiplePhases: Boolean = false) {
         positionAt(SessionPhase.STUDY, schedule.studyDurationMs, paused = true)
         awaitingBreakResume = true
         preferences.edit().putBoolean(KEY_AWAITING_BREAK_RESUME, true).commit()
@@ -1483,7 +1578,12 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         persistSnapshot(waiting)
         updateMonitor(waiting)
         broadcastState(statusText(waiting))
-        reporter.sendImmediate("쉬는 시간 종료 · 학생 복귀 대기 · 학생폰에서 ‘시작할게’ 또는 텔레그램 /resume")
+        reporter.sendImmediate(
+            "[전환 알림] 휴식 종료 · 학생 복귀 대기\n" +
+                "발생 시각 · ${currentClockText()}\n" +
+                (if (crossedMultiplePhases) "앱 처리 지연 중 공부·휴식 경계를 함께 통과했습니다.\n" else "") +
+                "학생폰에서 '시작할게' 또는 텔레그램 /resume",
+        )
         startBreakResumeReminders()
     }
 
@@ -1494,7 +1594,14 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         persistSnapshot(resumed)
         updateMonitor(resumed)
         broadcastState(statusText(resumed))
-        reporter.sendImmediate("$origin 확인 · 공부 재개 · ${statusText(resumed)}")
+        reporter.sendImmediate(
+            buildString {
+                append("[전환 알림] ").append(origin).append(" 확인 · 공부 재개 · ")
+                    .append(formatDuration(resumed.phaseRemainingMs)).append(" 남음")
+                append("\n발생 시각 · ").append(currentClockText())
+                nextTransitionDescription(resumed)?.let { append("\n").append(it) }
+            },
+        )
         speakStudentCue(
             if (origin == "학생 음성") {
                 "시작이 인식되었습니다. 공부를 다시 시작합니다"
@@ -1516,20 +1623,35 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         preferences.edit().putBoolean(KEY_AWAITING_BREAK_RESUME, false).apply()
     }
 
-    private fun announcePhaseStart(phase: SessionPhase) {
+    private fun announcePhaseStart(snapshot: SessionSnapshot, origin: String) {
+        val phase = snapshot.phase
+        TimerPresentation.phaseStartMessage(
+            snapshot = snapshot,
+            origin = origin,
+            sessionActive = sessionActive,
+            awaitingBreakResume = awaitingBreakResume,
+            nowEpochMs = System.currentTimeMillis(),
+            zoneId = TIMER_ZONE_ID,
+        )?.let(reporter::sendImmediate)
         when (phase) {
             SessionPhase.MEDITATION -> speakStudentCue(
-                "명상 시간 ${schedule.meditationDurationMs / 60_000}분을 시작합니다",
+                "명상 시간을 시작합니다. ${TimerPresentation.spokenDuration(snapshot.phaseRemainingMs)}입니다",
             )
             SessionPhase.STUDY -> speakStudentCue(
-                "공부 시간 ${schedule.studyDurationMs / 60_000}분을 시작합니다",
+                "공부 시간을 시작합니다. ${TimerPresentation.spokenDuration(snapshot.phaseRemainingMs)}입니다",
             )
             SessionPhase.BREAK -> speakStudentCue(
-                "쉬는 시간 ${schedule.breakDurationMs / 60_000}분을 시작합니다. 시간이 끝나면 다시 알려드리겠습니다",
+                "쉬는 시간을 시작합니다. ${TimerPresentation.spokenDuration(snapshot.phaseRemainingMs)}입니다. " +
+                    "쉬는 시간이 끝나면 다시 알려드리겠습니다",
             )
             SessionPhase.COMPLETE -> Unit
         }
     }
+
+    private fun formatDuration(durationMs: Long): String = TimerPresentation.formatDuration(durationMs)
+
+    private fun currentClockText(): String =
+        TRANSITION_TIME_FORMAT.format(Instant.ofEpochMilli(System.currentTimeMillis()))
 
     private fun speakStudentCue(text: String, acknowledged: Boolean = false) {
         if (destroyed) return
@@ -1628,20 +1750,63 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
 
     private fun snapshot(): SessionSnapshot = synchronized(sessionLock) { session.snapshot() }
 
-    private fun statusText(snapshot: SessionSnapshot): String {
-        if (awaitingBreakResume) {
-            return "복귀 대기 · ‘시작할게’라고 말하세요 · 완료 ${completedProblemCount}개"
+    private fun currentCaptureTimerState(): CaptureTimerState? = synchronized(sessionLock) {
+        val current = session.snapshot()
+        if (!sessionActive || current.status != SessionStatus.RUNNING) return@synchronized null
+        val phase = when (current.phase) {
+            SessionPhase.MEDITATION -> CaptureTimerPhase.MEDITATION
+            SessionPhase.STUDY -> CaptureTimerPhase.STUDY
+            SessionPhase.BREAK -> CaptureTimerPhase.BREAK
+            SessionPhase.COMPLETE -> return@synchronized null
         }
-        val phase = if (snapshot.status == SessionStatus.START_COUNTDOWN) "시작 대기" else when (snapshot.phase) {
-            io.remotestudy.domain.session.SessionPhase.MEDITATION -> "명상"
-            io.remotestudy.domain.session.SessionPhase.STUDY -> "공부"
-            io.remotestudy.domain.session.SessionPhase.BREAK -> "휴식"
-            io.remotestudy.domain.session.SessionPhase.COMPLETE -> "완료"
-        }
-        val seconds = if (snapshot.status == SessionStatus.START_COUNTDOWN) snapshot.countdownRemainingMs / 1_000 else snapshot.phaseRemainingMs / 1_000
-        val paused = if (countdownPaused && snapshot.status == SessionStatus.START_COUNTDOWN) " · 일시정지" else ""
-        return "$phase · %02d:%02d$paused · 완료 ${completedProblemCount}개".format(seconds / 60, seconds % 60)
+        CaptureTimerState(phase, current.phaseRemainingMs.coerceAtLeast(0L))
     }
+
+    private fun sendDetailedStatus() {
+        // A status read must never consume a phase boundary without running the
+        // same transition alerts and break-resume policy as the regular ticker.
+        tickSession()
+        synchronized(sessionLock) {
+            reporter.sendImmediate(detailedStatusText(session.snapshot()))
+        }
+    }
+
+    private fun sendSettingsAndCurrent() {
+        tickSession()
+        synchronized(sessionLock) {
+            reporter.sendImmediate(settingsAndCurrentText())
+        }
+    }
+
+    private fun detailedStatusText(snapshot: SessionSnapshot): String = buildString {
+        append(statusText(snapshot))
+        append("\n설정 · 명상 ${schedule.meditationDurationMs / 60_000}분 · 공부 ${schedule.studyDurationMs / 60_000}분")
+        append(" · 휴식 ${schedule.breakDurationMs / 60_000}분 · 시작 대기 ${teacherCountdownMs / 1_000}초")
+        nextTransitionDescription(snapshot)?.let { append("\n").append(it) }
+    }
+
+    private fun settingsAndCurrentText(): String = buildString {
+        append(settingsText())
+        if (sessionActive) append("\n\n현재 · ").append(statusText(session.snapshot()))
+        nextTransitionDescription(session.snapshot())?.let { append("\n").append(it) }
+    }
+
+    private fun statusText(snapshot: SessionSnapshot): String = TimerPresentation.statusText(
+        snapshot = snapshot,
+        sessionActive = sessionActive,
+        awaitingBreakResume = awaitingBreakResume,
+        countdownPaused = countdownPaused,
+        completedProblemCount = completedProblemCount,
+    )
+
+    private fun nextTransitionDescription(snapshot: SessionSnapshot): String? =
+        TimerPresentation.nextTransitionDescription(
+            snapshot = snapshot,
+            sessionActive = sessionActive,
+            awaitingBreakResume = awaitingBreakResume,
+            nowEpochMs = System.currentTimeMillis(),
+            zoneId = TIMER_ZONE_ID,
+        )
 
     private fun persistSnapshot(snapshot: SessionSnapshot) {
         preferences.edit()
@@ -1652,8 +1817,35 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             .putLong(KEY_PHASE_REMAINING, snapshot.phaseRemainingMs)
             .putLong(KEY_COUNTDOWN_REMAINING, snapshot.countdownRemainingMs)
             .putInt(KEY_PROBLEMS, completedProblemCount)
+            .putBoolean(KEY_COUNTDOWN_PAUSED, countdownPaused)
             .putBoolean(KEY_AWAITING_BREAK_RESUME, awaitingBreakResume)
             .commit()
+        lastSnapshotCheckpointElapsedMs = SystemClock.elapsedRealtime()
+    }
+
+    private fun pauseForServiceShutdown(reason: String) {
+        synchronized(sessionLock) {
+            if (shutdownSnapshotPersisted) return
+            shutdownSnapshotPersisted = true
+            if (!sessionActive) return
+
+            val before = session.snapshot()
+            val paused = when {
+                before.status == SessionStatus.START_COUNTDOWN -> {
+                    countdownPaused = true
+                    countdownPausedAtSessionMs = sessionNow()
+                    preferences.edit().putBoolean(KEY_COUNTDOWN_PAUSED, true).commit()
+                    before
+                }
+                before.status == SessionStatus.RUNNING -> {
+                    session.dispatch(Pause("shutdown-${UUID.randomUUID()}", sessionNow()))
+                }
+                else -> before
+            }
+            persistSnapshot(paused)
+            updateMonitor(paused)
+            Log.i(TAG, "timer_paused_for_shutdown reason=$reason state=${statusText(paused)}")
+        }
     }
 
     private fun initializeRemoteSession() {
@@ -1788,8 +1980,9 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             "/camera 카메라 진단 메뉴\n" +
             "/camera info 기기 렌즈 정보\n" +
             "/camera test 기본 1×·물리 약 3× 원본 비교\n" +
-            "/settings 현재 설정\n" +
-            "/set 0 40 15 명상·공부·휴식(분)\n" +
+            "/settings 기본 설정과 현재 상태\n" +
+            "/set 0 40 15 다음 회차 기본시간 저장(분)\n" +
+            "/begin 0 40 15 설정 후 새 회차 시작\n" +
             "/set countdown 5 시작 대기(초)\n" +
             "/start /restart /pause /resume /stop\n" +
             "/time 25:30 현재 남은 시간\n" +
@@ -1802,7 +1995,6 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         if (!preferences.getBoolean(KEY_ACTIVE, false)) return
         val startedEpoch = preferences.getLong(KEY_STARTED_EPOCH, 0L)
         if (startedEpoch <= 0L) return
-        val savedEpoch = preferences.getLong(KEY_SAVED_EPOCH, startedEpoch)
         val savedStatus = runCatching {
             SessionStatus.valueOf(preferences.getString(KEY_STATUS, SessionStatus.RUNNING.name)!!)
         }.getOrDefault(SessionStatus.RUNNING)
@@ -1816,15 +2008,11 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         )
         val countdownRemaining = preferences.getLong(KEY_COUNTDOWN_REMAINING, 0L)
         val progressAtSave = sessionProgressMs(savedStatus, savedPhase, phaseRemaining, countdownRemaining)
-        countdownPaused = preferences.getBoolean(KEY_COUNTDOWN_PAUSED, false) &&
-            savedStatus == SessionStatus.START_COUNTDOWN
-        val runningAfterSave = if (
-            savedStatus in setOf(SessionStatus.RUNNING, SessionStatus.START_COUNTDOWN) && !countdownPaused
-        ) {
-            (System.currentTimeMillis() - savedEpoch).coerceAtLeast(0L)
-        } else 0L
-        val totalProgress = (progressAtSave + runningAfterSave)
-            .coerceAtMost(teacherCountdownMs + totalPhaseDurationMs())
+        // Camera/microphone work stops with the service, so time while the app
+        // process is absent must never be counted as study time. Every restored
+        // active session requires an explicit /resume.
+        countdownPaused = savedStatus == SessionStatus.START_COUNTDOWN
+        val totalProgress = progressAtSave.coerceAtMost(teacherCountdownMs + totalPhaseDurationMs())
         completedProblemCount = preferences.getInt(KEY_PROBLEMS, 0).coerceAtLeast(0)
         if (savedAwaitingBreakResume) {
             sessionActive = true
@@ -1834,10 +2022,14 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
             updateMonitor(session.snapshot())
             return
         }
-        rebuildAtProgress(totalProgress, savedStatus == SessionStatus.PAUSED)
+        rebuildAtProgress(totalProgress, savedStatus in setOf(SessionStatus.RUNNING, SessionStatus.PAUSED))
         reconcileCountdownPauseAfterRebuild()
         sessionActive = session.snapshot().status != SessionStatus.COMPLETED
-        if (!sessionActive) clearSessionState()
+        if (!sessionActive) {
+            clearSessionState()
+        } else {
+            persistSnapshot(session.snapshot())
+        }
         updateMonitor(session.snapshot())
     }
 
@@ -1941,6 +2133,7 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
     }
 
     override fun onDestroy() {
+        pauseForServiceShutdown("학생 앱 종료")
         destroyed = true
         captureGeneration.incrementAndGet()
         focusGeneration += 1
@@ -2047,5 +2240,9 @@ class StudentStudyService : Service(), LifecycleOwner, TelegramCommandHandler {
         private const val KEY_COUNTDOWN_PAUSED = "countdown_paused"
         private const val KEY_AWAITING_BREAK_RESUME = "awaiting_break_resume"
         private const val DEFAULT_TEACHER_COUNTDOWN_MS = 5_000L
+        private const val SNAPSHOT_CHECKPOINT_INTERVAL_MS = 5_000L
+        private val TIMER_ZONE_ID: ZoneId = ZoneId.systemDefault()
+        private val TRANSITION_TIME_FORMAT: DateTimeFormatter =
+            DateTimeFormatter.ofPattern("HH:mm:ss").withZone(TIMER_ZONE_ID)
     }
 }

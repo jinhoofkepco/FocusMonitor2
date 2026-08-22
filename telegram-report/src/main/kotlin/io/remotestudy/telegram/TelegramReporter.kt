@@ -27,9 +27,11 @@ class TelegramReporter(
     private val montageDir = rootDirectory.resolve("montages")
     private val detailDir = rootDirectory.resolve("details")
     private val parser = TelegramCommandParser()
-    private val uploadExecutor = Executors.newSingleThreadExecutor { Thread(it, "telegram-upload") }
+    private val mediaUploadExecutor = Executors.newSingleThreadExecutor { Thread(it, "telegram-media-upload") }
+    private val messageUploadExecutor = Executors.newSingleThreadExecutor { Thread(it, "telegram-message-upload") }
     private val pollingExecutor = Executors.newSingleThreadExecutor { Thread(it, "telegram-long-poll") }
-    private val uploadRunning = AtomicBoolean(false)
+    private val mediaUploadRunning = AtomicBoolean(false)
+    private val messageUploadRunning = AtomicBoolean(false)
     private val pollingRunning = AtomicBoolean(false)
     private val closed = AtomicBoolean(false)
     private val lock = Any()
@@ -92,6 +94,7 @@ class TelegramReporter(
         capturedAtEpochMs: Long,
         elapsedRealtimeMs: Long,
         physicalThreeXJpeg: File? = null,
+        timerState: CaptureTimerState? = null,
     ) {
         synchronized(lock) {
             var archived = archive.store(cameraJpeg, capturedAtEpochMs, loadBookRegion())
@@ -102,7 +105,12 @@ class TelegramReporter(
                 composer = it
             }
             val montageSource = archived.physicalThreeXFile ?: archived.file
-            activeComposer.add(montageSource, capturedAtEpochMs, badge = if (archived.physicalThreeXFile != null) "3×" else null)
+            activeComposer.add(
+                montageSource,
+                capturedAtEpochMs,
+                badge = if (archived.physicalThreeXFile != null) "3×" else null,
+                timerState = timerState,
+            )
             if (activeComposer.isComplete) {
                 val result = activeComposer.finish(++montageSequence)
                 activeComposer.close()
@@ -272,21 +280,32 @@ class TelegramReporter(
 
     fun finishSession(summary: String) {
         synchronized(lock) {
+            var finalMontageId: String? = null
             composer?.takeIf { it.size > 0 }?.let { partial ->
                 val result = partial.finish(++montageSequence)
                 val elapsedMinutes = (SystemClock.elapsedRealtime() - sessionStartedAtElapsedMs).coerceAtLeast(0L) / 60_000L
-                queue.enqueue(
+                finalMontageId = queue.enqueue(
                     UploadKind.PHOTO,
                     result.file,
                     buildCaption(result, elapsedMinutes, emptyList()),
                     now(),
                     replyMarkup = montageButtons(result),
-                )
+                ).id
                 montageIndex += MontageIndexEntry(result.sequence, result.firstCapturedAtEpochMs, result.lastCapturedAtEpochMs)
             }
             composer?.close()
             composer = null
-            queue.enqueue(UploadKind.MESSAGE_AND_PIN, null, summary, now())
+            // A six-cell montage may already have completed just before the
+            // session boundary, leaving no partial composer here. In that
+            // common case the most recent queued PHOTO is still the barrier.
+            val sessionPhotoBarrierId = finalMontageId ?: queue.latestPhotoId()
+            queue.enqueue(
+                UploadKind.MESSAGE_AND_PIN,
+                null,
+                summary,
+                now(),
+                dependsOnId = sessionPhotoBarrierId,
+            )
             persistSessionState()
         }
         wakeUploader()
@@ -295,27 +314,85 @@ class TelegramReporter(
     fun pendingUploadCount(): Int = queue.size()
 
     private fun startUploadLoop() {
-        if (!uploadRunning.compareAndSet(false, true)) return
-        uploadExecutor.execute {
+        startMediaUploadLoop()
+        startMessageUploadLoop()
+    }
+
+    private fun startMediaUploadLoop() {
+        if (!mediaUploadRunning.compareAndSet(false, true)) return
+        mediaUploadExecutor.execute {
             while (!closed.get()) {
-                val entry = queue.due(now())
+                val entry = queue.dueMedia(now())
                 if (entry == null) {
-                    val next = queue.nextWakeEpochMs()
-                    val sleep = if (next == null) 1_000L else (next - now()).coerceIn(250L, 10_000L)
+                    val next = queue.nextMediaWakeEpochMs()
+                    val sleep = if (next == null) 1_000L else (next - now()).coerceIn(250L, 1_000L)
                     runCatching { Thread.sleep(sleep) }
                     continue
                 }
-                val success = runCatching { upload(entry) }.isSuccess
-                if (success) {
-                    queue.acknowledge(entry.id)
-                    entry.filePath?.let { path ->
-                        if (entry.kind == UploadKind.PHOTO || entry.kind == UploadKind.DOCUMENT) File(path).delete()
+                val result = runCatching {
+                    if (entry.kind == UploadKind.MESSAGE_AND_PIN) {
+                        val sent = api.sendMessage(entry.text, entry.replyMarkup)
+                        queue.convertMessageToPin(
+                            entry.id,
+                            requireNotNull(sent.messageId) { "Telegram did not return a message id" },
+                            now(),
+                        ) ?: error("Session summary queue entry disappeared")
+                    } else {
+                        upload(entry)
+                        queue.acknowledge(entry.id)
+                        entry.filePath?.let { path -> File(path).delete() }
                     }
-                } else {
-                    queue.retry(entry.id, now())
+                }
+                result.exceptionOrNull()?.let { failure ->
+                    if (UploadFailurePolicy.isPermanent(failure)) {
+                        runCatching {
+                            dropPermanentUpload(entry, failure, notifyTeacher = true)
+                        }.onFailure {
+                            // Journal I/O failed while dropping; keep the
+                            // original entry retryable so it cannot vanish.
+                            runCatching { queue.retry(entry.id, now()) }
+                        }
+                    } else {
+                        queue.retry(entry.id, now())
+                    }
                 }
             }
-            uploadRunning.set(false)
+            mediaUploadRunning.set(false)
+        }
+    }
+
+    private fun startMessageUploadLoop() {
+        if (!messageUploadRunning.compareAndSet(false, true)) return
+        messageUploadExecutor.execute {
+            while (!closed.get()) {
+                val entry = queue.dueMessage(now())
+                if (entry == null) {
+                    val next = queue.nextMessageWakeEpochMs()
+                    val sleep = if (next == null) 1_000L else (next - now()).coerceIn(250L, 1_000L)
+                    runCatching { Thread.sleep(sleep) }
+                    continue
+                }
+                val result = runCatching {
+                    upload(entry)
+                    queue.acknowledge(entry.id)
+                }
+                result.exceptionOrNull()?.let { failure ->
+                    if (UploadFailurePolicy.isPermanent(failure)) {
+                        runCatching {
+                            dropPermanentUpload(
+                                entry,
+                                failure,
+                                notifyTeacher = entry.kind == UploadKind.PIN,
+                            )
+                        }.onFailure {
+                            runCatching { queue.retry(entry.id, now()) }
+                        }
+                    } else {
+                        queue.retry(entry.id, now())
+                    }
+                }
+            }
+            messageUploadRunning.set(false)
         }
     }
 
@@ -324,11 +401,30 @@ class TelegramReporter(
             UploadKind.PHOTO -> api.sendPhoto(requireFile(entry), entry.text, entry.replyMarkup)
             UploadKind.DOCUMENT -> api.sendDocument(requireFile(entry), entry.text)
             UploadKind.MESSAGE -> api.sendMessage(entry.text, entry.replyMarkup)
-            UploadKind.MESSAGE_AND_PIN -> {
-                val message = api.sendMessage(entry.text)
-                api.pinChatMessage(requireNotNull(message.messageId))
-            }
+            UploadKind.MESSAGE_AND_PIN -> error("MESSAGE_AND_PIN must be converted by the media worker")
+            UploadKind.PIN -> api.pinChatMessage(entry.text.toLong())
         }
+    }
+
+    private fun dropPermanentUpload(entry: UploadEntry, failure: Throwable, notifyTeacher: Boolean) {
+        queue.acknowledge(entry.id)
+        entry.filePath?.let { File(it).delete() }
+        if (!notifyTeacher) return
+        val subject = entry.text.lineSequence().firstOrNull().orEmpty().take(100)
+        val notice = when (entry.kind) {
+            UploadKind.PHOTO, UploadKind.DOCUMENT ->
+                "⚠️ 업로드 1건 건너뜀 · ${subject.ifBlank { entry.kind.name }}"
+            UploadKind.MESSAGE_AND_PIN -> "⚠️ 회차 종료 요약 전송 실패"
+            UploadKind.PIN -> "⚠️ 회차 종료 요약은 전송됐지만 채팅 고정 실패"
+            UploadKind.MESSAGE -> return
+        }
+        queue.enqueue(
+            UploadKind.MESSAGE,
+            null,
+            "$notice\n사유 · ${UploadFailurePolicy.shortReason(failure)}\n이후 항목 전송은 계속합니다.",
+            now(),
+        )
+        wakeUploader()
     }
 
     private fun startPollingLoop() {
@@ -389,7 +485,7 @@ class TelegramReporter(
     }
 
     private fun wakeUploader() {
-        if (!uploadRunning.get()) startUploadLoop()
+        if (!mediaUploadRunning.get() || !messageUploadRunning.get()) startUploadLoop()
     }
 
     private fun handleCallback(update: TelegramUpdate) {
@@ -449,6 +545,14 @@ class TelegramReporter(
             sendImmediate("업데이트 전 확인 버튼은 좌표를 보증할 수 없습니다. /area 로 새 격자를 받아주세요.")
             return
         }
+        if (LEGACY_TIME_SET_BUTTON.matches(data)) {
+            sendCallbackMenu(
+                callbackId,
+                "이전 버전의 시간 버튼은 현재 회차를 뜻하는지 새 회차를 뜻하는지 불분명해 적용하지 않았습니다. 아래에서 ‘새 회차’를 선택하세요.",
+                TIME_MENU,
+            )
+            return
+        }
         val command = when (data) {
             "cmd:start" -> TelegramCommand.Start
             "cmd:pause" -> TelegramCommand.Pause
@@ -486,12 +590,12 @@ class TelegramReporter(
             "confirm:restart" -> TelegramCommand.Restart
             "menu:time" -> return sendCallbackMenu(
                 callbackId,
-                "시간 조합을 선택하세요. 직접 설정은 /set 명상 공부 휴식 형식입니다.",
+                "선택하면 현재 진행을 끝내고 해당 시간으로 새 회차를 시작합니다. 직접 명령은 /begin 명상 공부 휴식 형식입니다.",
                 TIME_MENU,
             )
-            "set:0:40:15" -> TelegramCommand.SetSchedule(0, 40, 15)
-            "set:5:40:15" -> TelegramCommand.SetSchedule(5, 40, 15)
-            "set:5:50:10" -> TelegramCommand.SetSchedule(5, 50, 10)
+            "begin:0:40:15" -> TelegramCommand.BeginSchedule(0, 40, 15)
+            "begin:5:40:15" -> TelegramCommand.BeginSchedule(5, 40, 15)
+            "begin:5:50:10" -> TelegramCommand.BeginSchedule(5, 50, 10)
             "menu:main" -> return sendCallbackMenu(callbackId, "원하는 기능을 누르세요.", CONTROL_MENU)
             else -> {
                 runCatching { api.answerCallbackQuery(callbackId, "지원하지 않는 버튼입니다") }
@@ -554,8 +658,14 @@ class TelegramReporter(
     ) = buildString {
         append('#').append(result.sequence).append(" · ")
             .append(formatTime(result.firstCapturedAtEpochMs)).append('–')
-            .append(formatTime(result.lastCapturedAtEpochMs)).append(" · 공부 ")
-            .append(elapsedMinutes).append("분 경과")
+            .append(formatTime(result.lastCapturedAtEpochMs))
+        val timerCaption = CaptureTimerCaption.format(result.timerStates)
+        if (timerCaption == null) {
+            append(" · 회차 총 ").append(elapsedMinutes).append("분 경과")
+        } else {
+            append(" · ").append(timerCaption)
+            append("\n회차 총 ").append(elapsedMinutes).append("분 경과")
+        }
         if (away.isNotEmpty()) {
             append("\n이탈 ").append(away.size).append("회(")
             append(away.joinToString { "${formatTime(it.atEpochMs)}, ${it.durationMs / 1_000}초" })
@@ -688,7 +798,8 @@ class TelegramReporter(
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
         synchronized(lock) { composer?.close(); composer = null }
-        uploadExecutor.shutdownNow()
+        mediaUploadExecutor.shutdownNow()
+        messageUploadExecutor.shutdownNow()
         pollingExecutor.shutdownNow()
     }
 
@@ -704,12 +815,13 @@ class TelegramReporter(
         val AREA_SET_BUTTON = Regex("^area:set:([0-9a-f]{$AREA_TOKEN_LENGTH}):(\\d{1,19}):(\\d{1,3}):(\\d{1,3}):(\\d{1,3}):(\\d{1,3})$")
         val LEGACY_PINNED_AREA_SET_BUTTON = Regex("^area:set:(\\d{1,19}):(\\d{1,3}):(\\d{1,3}):(\\d{1,3}):(\\d{1,3})$")
         val LEGACY_AREA_SET_BUTTON = Regex("^area:set:(\\d{1,3}):(\\d{1,3}):(\\d{1,3}):(\\d{1,3})$")
+        val LEGACY_TIME_SET_BUTTON = Regex("^set:\\d{1,3}:\\d{1,3}:\\d{1,3}$")
         const val CONTROL_MENU = """{"inline_keyboard":[[{"text":"▶ 시작","callback_data":"cmd:start"},{"text":"⏸ 일시정지","callback_data":"cmd:pause"},{"text":"▶ 계속","callback_data":"cmd:resume"}],[{"text":"⏭ 다음 단계","callback_data":"cmd:next"},{"text":"⏹ 종료","callback_data":"cmd:stop"},{"text":"🔄 처음부터","callback_data":"cmd:restart"}],[{"text":"📊 현재 상태","callback_data":"cmd:status"},{"text":"📷 최근 5분","callback_data":"cmd:recent"},{"text":"🎯 초점","callback_data":"cmd:focus"}],[{"text":"📐 책 영역 설정","callback_data":"cmd:area"},{"text":"🔃 책 회전","callback_data":"cmd:rotate"},{"text":"🔭 카메라","callback_data":"cmd:camera"}],[{"text":"⏱ 시간 설정","callback_data":"menu:time"},{"text":"🖼 사진 목록","callback_data":"cmd:index"},{"text":"⚙ 현재 설정","callback_data":"cmd:settings"}]]}"""
         const val ROTATION_MENU = """{"inline_keyboard":[[{"text":"0°","callback_data":"rotate:0"},{"text":"90°","callback_data":"rotate:90"},{"text":"180° (기본)","callback_data":"rotate:180"},{"text":"270°","callback_data":"rotate:270"}],[{"text":"‹ 기본 메뉴","callback_data":"menu:main"}]]}"""
         const val CAMERA_MENU = """{"inline_keyboard":[[{"text":"📋 카메라 진단","callback_data":"camera:info"}],[{"text":"🧪 1× / 물리 3× 비교","callback_data":"camera:test"}],[{"text":"‹ 기본 메뉴","callback_data":"menu:main"}]]}"""
         const val DEFAULT_BOOK_ROTATION = 180
         const val AREA_TOKEN_LENGTH = 8
-        const val TIME_MENU = """{"inline_keyboard":[[{"text":"0·40·15","callback_data":"set:0:40:15"},{"text":"5·40·15","callback_data":"set:5:40:15"},{"text":"5·50·10","callback_data":"set:5:50:10"}],[{"text":"‹ 기본 메뉴","callback_data":"menu:main"}]]}"""
+        const val TIME_MENU = """{"inline_keyboard":[[{"text":"▶ 새 회차 · 0·40·15","callback_data":"begin:0:40:15"}],[{"text":"▶ 새 회차 · 5·40·15","callback_data":"begin:5:40:15"}],[{"text":"▶ 새 회차 · 5·50·10","callback_data":"begin:5:50:10"}],[{"text":"‹ 기본 메뉴","callback_data":"menu:main"}]]}"""
         const val CONFIRM_STOP_MENU = """{"inline_keyboard":[[{"text":"종료","callback_data":"confirm:stop"},{"text":"취소","callback_data":"menu:main"}]]}"""
         const val CONFIRM_RESTART_MENU = """{"inline_keyboard":[[{"text":"처음부터 시작","callback_data":"confirm:restart"},{"text":"취소","callback_data":"menu:main"}]]}"""
     }

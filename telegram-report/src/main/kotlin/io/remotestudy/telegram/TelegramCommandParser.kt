@@ -26,6 +26,7 @@ class TelegramCommandParser {
             text.startsWith("/area ") -> parseArea(text.removePrefix("/area ").trim())
             text == "/rotate" -> TelegramCommand.ShowBookRotation
             text.startsWith("/rotate ") -> parseRotation(text.removePrefix("/rotate ").trim())
+            text.startsWith("/begin ") -> parseBegin(text.removePrefix("/begin ").trim())
             text.startsWith("/set ") -> parseSetting(text.removePrefix("/set ").trim())
             text.startsWith("/time ") -> parseRemaining(text.removePrefix("/time ").trim())
             text.startsWith("/phase ") -> parsePhase(text.removePrefix("/phase ").trim())
@@ -36,17 +37,28 @@ class TelegramCommandParser {
 
     private fun parseSetting(argument: String): TelegramCommand {
         val fields = argument.lowercase().split(Regex("\\s+")).filter(String::isNotBlank)
-        if (fields.size == 3) {
-            val values = fields.map { it.toIntOrNull() ?: return TelegramCommand.Unknown("/set $argument") }
-            if (values[0] in 0..120 && values[1] in 1..480 && values[2] in 1..240) {
-                return TelegramCommand.SetSchedule(values[0], values[1], values[2])
-            }
+        parseScheduleValues(fields)?.let { values ->
+            return TelegramCommand.SetSchedule(values[0], values[1], values[2])
         }
         if (fields.size == 2 && fields[0] in setOf("countdown", "대기")) {
             val seconds = fields[1].toIntOrNull()
             if (seconds != null && seconds in 0..60) return TelegramCommand.SetCountdown(seconds)
         }
         return TelegramCommand.Unknown("/set $argument")
+    }
+
+    private fun parseBegin(argument: String): TelegramCommand {
+        val fields = argument.lowercase().split(Regex("\\s+")).filter(String::isNotBlank)
+        val values = parseScheduleValues(fields) ?: return TelegramCommand.Unknown("/begin $argument")
+        return TelegramCommand.BeginSchedule(values[0], values[1], values[2])
+    }
+
+    private fun parseScheduleValues(fields: List<String>): List<Int>? {
+        if (fields.size != 3) return null
+        val values = fields.map { it.toIntOrNull() ?: return null }
+        return values.takeIf {
+            values[0] in 0..120 && values[1] in 1..480 && values[2] in 1..240
+        }
     }
 
     private fun parseArea(argument: String): TelegramCommand {

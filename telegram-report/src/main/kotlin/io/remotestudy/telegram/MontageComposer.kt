@@ -31,12 +31,18 @@ class MontageComposer(
     }
     private var count = 0
     private val times = mutableListOf<Long>()
+    private val timerStates = mutableListOf<CaptureTimerState?>()
     private var closed = false
 
     val isComplete: Boolean get() = count >= expectedCells
     val size: Int get() = count
 
-    fun add(jpeg: File, capturedAtEpochMs: Long, badge: String? = null) {
+    fun add(
+        jpeg: File,
+        capturedAtEpochMs: Long,
+        badge: String? = null,
+        timerState: CaptureTimerState? = null,
+    ) {
         check(!closed && !isComplete)
         val cell = ImageFiles.decodeUpright(jpeg, CELL_LONG_EDGE)
         try {
@@ -63,6 +69,7 @@ class MontageComposer(
             cell.recycle()
         }
         times += capturedAtEpochMs
+        timerStates += timerState
         count++
     }
 
@@ -71,7 +78,15 @@ class MontageComposer(
         outputDir.mkdirs()
         val file = outputDir.resolve("montage-${times.first()}-${sequence.toString().padStart(5, '0')}.jpg")
         ImageFiles.writeJpeg(canvasBitmap, file, 80)
-        return MontageResult(sequence, times.first(), times.last(), file, count, times.toList())
+        return MontageResult(
+            sequence = sequence,
+            firstCapturedAtEpochMs = times.first(),
+            lastCapturedAtEpochMs = times.last(),
+            file = file,
+            cells = count,
+            capturedAtEpochMs = times.toList(),
+            timerStates = timerStates.toList(),
+        )
     }
 
     override fun close() {
@@ -87,6 +102,7 @@ class MontageComposer(
         val file: File,
         val cells: Int,
         val capturedAtEpochMs: List<Long>,
+        val timerStates: List<CaptureTimerState?> = emptyList(),
     )
 
     private companion object {

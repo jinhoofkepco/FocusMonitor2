@@ -7,6 +7,6 @@ import io.remotestudy.domain.session.SessionStatus
 internal object BreakResumePolicy {
     fun shouldEnterWaiting(before: SessionSnapshot, after: SessionSnapshot): Boolean =
         before.status == SessionStatus.RUNNING &&
-            before.phase == SessionPhase.BREAK &&
+            before.phase != SessionPhase.COMPLETE &&
             after.status == SessionStatus.COMPLETED
 }

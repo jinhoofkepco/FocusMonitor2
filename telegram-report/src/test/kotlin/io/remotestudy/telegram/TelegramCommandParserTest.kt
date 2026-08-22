@@ -24,6 +24,11 @@ class TelegramCommandParserTest {
 
     @Test fun parsesRemoteTimerControls() {
         assertEquals(TelegramCommand.SetSchedule(0, 40, 15), parser.parse("/set 0 40 15"))
+        assertEquals(TelegramCommand.BeginSchedule(0, 40, 15), parser.parse("/begin 0 40 15"))
+        assertEquals(
+            TelegramCommand.BeginSchedule(5, 40, 15),
+            parser.parse("/begin@focus_monitor_bot 5 40 15"),
+        )
         assertEquals(TelegramCommand.SetCountdown(0), parser.parse("/set countdown 0"))
         assertEquals(TelegramCommand.SetCountdown(5), parser.parse("/set 대기 5"))
         assertEquals(TelegramCommand.SetRemaining(25 * 60), parser.parse("/time 25"))
@@ -84,6 +89,13 @@ class TelegramCommandParserTest {
     @Test fun rejectsUnsafeRemoteTimerValues() {
         assertTrue(parser.parse("/set -1 40 15") is TelegramCommand.Unknown)
         assertTrue(parser.parse("/set 0 0 15") is TelegramCommand.Unknown)
+        assertTrue(parser.parse("/begin -1 40 15") is TelegramCommand.Unknown)
+        assertTrue(parser.parse("/begin 0 0 15") is TelegramCommand.Unknown)
+        assertTrue(parser.parse("/begin 0 40 0") is TelegramCommand.Unknown)
+        assertTrue(parser.parse("/begin 0 40") is TelegramCommand.Unknown)
+        assertTrue(parser.parse("/begin 121 40 15") is TelegramCommand.Unknown)
+        assertTrue(parser.parse("/begin 0 481 15") is TelegramCommand.Unknown)
+        assertTrue(parser.parse("/begin 0 40 241") is TelegramCommand.Unknown)
         assertTrue(parser.parse("/set countdown 61") is TelegramCommand.Unknown)
         assertTrue(parser.parse("/time 481") is TelegramCommand.Unknown)
         assertTrue(parser.parse("/phase study 10:99") is TelegramCommand.Unknown)

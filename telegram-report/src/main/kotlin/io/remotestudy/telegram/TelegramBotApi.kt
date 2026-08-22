@@ -32,7 +32,7 @@ class TelegramBotApi(private val config: TelegramConfig) {
     fun setMyCommands(): TelegramApiResult = postForm(
         "setMyCommands",
         mapOf(
-            "commands" to """[{"command":"menu","description":"조작 버튼 열기"},{"command":"camera","description":"카메라 진단·1×/3× 비교"},{"command":"area","description":"10×10 격자로 책 영역 설정"},{"command":"rotate","description":"책 상세사진 회전"},{"command":"status","description":"현재 공부 상태"},{"command":"start","description":"처음부터 시작"},{"command":"pause","description":"일시정지"},{"command":"resume","description":"계속하기"},{"command":"focus","description":"책 초점 다시 맞추기"},{"command":"index","description":"오늘 사진 목록"},{"command":"b","description":"책 사진 요청"}]""",
+            "commands" to """[{"command":"menu","description":"조작 버튼 열기"},{"command":"begin","description":"시간을 정하고 새 회차 시작"},{"command":"camera","description":"카메라 진단·1×/3× 비교"},{"command":"area","description":"10×10 격자로 책 영역 설정"},{"command":"rotate","description":"책 상세사진 회전"},{"command":"status","description":"현재 공부 상태"},{"command":"start","description":"처음부터 시작"},{"command":"pause","description":"일시정지"},{"command":"resume","description":"계속하기"},{"command":"focus","description":"책 초점 다시 맞추기"},{"command":"index","description":"오늘 사진 목록"},{"command":"b","description":"책 사진 요청"}]""",
         ),
     ).result()
 

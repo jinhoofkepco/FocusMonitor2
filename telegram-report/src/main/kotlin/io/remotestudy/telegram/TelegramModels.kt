@@ -17,6 +17,21 @@ data class TelegramConfig(
     }
 }
 
+enum class CaptureTimerPhase {
+    MEDITATION,
+    STUDY,
+    BREAK,
+}
+
+data class CaptureTimerState(
+    val phase: CaptureTimerPhase,
+    val phaseRemainingMs: Long,
+) {
+    init {
+        require(phaseRemainingMs >= 0L) { "phaseRemainingMs must not be negative" }
+    }
+}
+
 sealed interface TelegramCommand {
     data object Start : TelegramCommand
     data object Pause : TelegramCommand
@@ -38,6 +53,11 @@ sealed interface TelegramCommand {
     data object ShowBookRotation : TelegramCommand
     data class SetBookRotation(val degrees: Int) : TelegramCommand
     data class SetSchedule(
+        val meditationMinutes: Int,
+        val studyMinutes: Int,
+        val breakMinutes: Int,
+    ) : TelegramCommand
+    data class BeginSchedule(
         val meditationMinutes: Int,
         val studyMinutes: Int,
         val breakMinutes: Int,
@@ -98,7 +118,7 @@ data class NormalizedBookRegion(
     }
 }
 
-enum class UploadKind { PHOTO, DOCUMENT, MESSAGE, MESSAGE_AND_PIN }
+enum class UploadKind { PHOTO, DOCUMENT, MESSAGE, MESSAGE_AND_PIN, PIN }
 
 data class UploadEntry(
     val id: String,
@@ -108,6 +128,7 @@ data class UploadEntry(
     val attempts: Int,
     val nextAttemptEpochMs: Long,
     val replyMarkup: String? = null,
+    val dependsOnId: String? = null,
 )
 
 interface TelegramCommandHandler {

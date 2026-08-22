@@ -22,6 +22,7 @@ import android.media.ImageReader
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
 import android.util.Size
 import androidx.annotation.RequiresApi
 import androidx.core.content.ContextCompat
@@ -79,6 +80,8 @@ internal class PhysicalYuvCameraCapture(
         val physicalResultIds: Set<String>,
         val captureResultFocalLengthMm: Float?,
         val requestedPhysicalFocalLengthMm: Float?,
+        val capturedAtEpochMs: Long,
+        val capturedAtElapsedMs: Long,
     )
 
     @RequiresApi(28)
@@ -316,6 +319,8 @@ internal class PhysicalYuvCameraCapture(
                 captureResultFocalLengthMm = requestedResult?.get(CaptureResult.LENS_FOCAL_LENGTH)
                     ?: result.get(CaptureResult.LENS_FOCAL_LENGTH),
                 requestedPhysicalFocalLengthMm = requestedResult?.get(CaptureResult.LENS_FOCAL_LENGTH),
+                capturedAtEpochMs = System.currentTimeMillis(),
+                capturedAtElapsedMs = SystemClock.elapsedRealtime(),
             )
             succeed(frame)
         }

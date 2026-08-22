@@ -8,14 +8,14 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class BreakResumePolicyTest {
-    @Test fun entersWaitingOnlyWhenARunningBreakEnds() {
+    @Test fun entersWaitingWheneverARunningTickCrossesTheBreakEnd() {
         assertTrue(
             BreakResumePolicy.shouldEnterWaiting(
                 snapshot(SessionStatus.RUNNING, SessionPhase.BREAK, 1L),
                 snapshot(SessionStatus.COMPLETED, SessionPhase.COMPLETE, 0L),
             ),
         )
-        assertFalse(
+        assertTrue(
             BreakResumePolicy.shouldEnterWaiting(
                 snapshot(SessionStatus.RUNNING, SessionPhase.STUDY, 1L),
                 snapshot(SessionStatus.COMPLETED, SessionPhase.COMPLETE, 0L),

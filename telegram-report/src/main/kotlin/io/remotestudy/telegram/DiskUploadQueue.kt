@@ -27,6 +27,7 @@ class DiskUploadQueue(private val journal: File) {
         text: String,
         nowEpochMs: Long,
         replyMarkup: String? = null,
+        dependsOnId: String? = null,
     ): UploadEntry {
         val entry = UploadEntry(
             id = UUID.randomUUID().toString(),
@@ -36,6 +37,7 @@ class DiskUploadQueue(private val journal: File) {
             attempts = 0,
             nextAttemptEpochMs = nowEpochMs,
             replyMarkup = replyMarkup,
+            dependsOnId = dependsOnId,
         )
         entries[entry.id] = entry
         append("PUT", entry)
@@ -43,17 +45,85 @@ class DiskUploadQueue(private val journal: File) {
     }
 
     @Synchronized
-    fun due(nowEpochMs: Long): UploadEntry? = entries.values.firstOrNull {
-        it.nextAttemptEpochMs <= nowEpochMs
+    fun due(nowEpochMs: Long): UploadEntry? = dueMessage(nowEpochMs) ?: dueMedia(nowEpochMs)
+
+    @Synchronized
+    fun dueMessage(nowEpochMs: Long): UploadEntry? {
+        val firstVisibleMessage = entries.values.firstOrNull {
+            it.kind == UploadKind.MESSAGE
+        }
+        if (firstVisibleMessage != null &&
+            firstVisibleMessage.nextAttemptEpochMs <= nowEpochMs
+        ) {
+            return firstVisibleMessage
+        }
+        // A pin retry is not a visible chat message, so it never blocks status
+        // and transition messages.
+        return entries.values.firstOrNull {
+            it.kind == UploadKind.PIN && it.nextAttemptEpochMs <= nowEpochMs
+        }
+    }
+
+    @Synchronized
+    fun dueMedia(nowEpochMs: Long): UploadEntry? {
+        val first = entries.values.firstOrNull {
+            it.kind == UploadKind.PHOTO || it.kind == UploadKind.DOCUMENT ||
+                it.kind == UploadKind.MESSAGE_AND_PIN
+        } ?: return null
+        return first.takeIf {
+            it.nextAttemptEpochMs <= nowEpochMs && it.dependsOnId?.let(entries::containsKey) != true
+        }
     }
 
     @Synchronized
     fun nextWakeEpochMs(): Long? = entries.values.minOfOrNull(UploadEntry::nextAttemptEpochMs)
 
     @Synchronized
+    fun nextMessageWakeEpochMs(): Long? = entries.values
+        .let { values ->
+            listOfNotNull(
+                values.firstOrNull { it.kind == UploadKind.MESSAGE }?.nextAttemptEpochMs,
+                values.filter { it.kind == UploadKind.PIN }.minOfOrNull(UploadEntry::nextAttemptEpochMs),
+            ).minOrNull()
+        }
+
+    /**
+     * Persists the successful sendMessage result before pinning it. A later
+     * pin failure therefore retries only pinChatMessage and never resends the
+     * already-visible session summary.
+     */
+    @Synchronized
+    fun convertMessageToPin(id: String, messageId: Long, nowEpochMs: Long): UploadEntry? {
+        val current = entries[id]?.takeIf { it.kind == UploadKind.MESSAGE_AND_PIN } ?: return null
+        val updated = current.copy(
+            kind = UploadKind.PIN,
+            filePath = null,
+            text = messageId.toString(),
+            attempts = 0,
+            nextAttemptEpochMs = nowEpochMs,
+            replyMarkup = null,
+            dependsOnId = null,
+        )
+        // Append before changing memory so an I/O failure leaves the original
+        // durable entry intact instead of creating an untracked pin request.
+        append("PUT", updated)
+        entries[id] = updated
+        return updated
+    }
+
+    @Synchronized
+    fun nextMediaWakeEpochMs(): Long? = entries.values
+        .firstOrNull {
+            it.kind == UploadKind.PHOTO || it.kind == UploadKind.DOCUMENT ||
+                it.kind == UploadKind.MESSAGE_AND_PIN
+        }
+        ?.nextAttemptEpochMs
+
+    @Synchronized
     fun acknowledge(id: String) {
-        if (entries.remove(id) == null) return
+        if (!entries.containsKey(id)) return
         appendRaw("{\"op\":\"ACK\",\"id\":\"${escape(id)}\"}")
+        entries.remove(id)
         compactIfNeeded()
     }
 
@@ -71,6 +141,7 @@ class DiskUploadQueue(private val journal: File) {
 
     @Synchronized fun size(): Int = entries.size
     @Synchronized fun snapshot(): List<UploadEntry> = entries.values.toList()
+    @Synchronized fun latestPhotoId(): String? = entries.values.lastOrNull { it.kind == UploadKind.PHOTO }?.id
 
     private fun replay() {
         if (!journal.isFile) return
@@ -88,6 +159,7 @@ class DiskUploadQueue(private val journal: File) {
                         attempts = fields["attempts"]?.toInt() ?: 0,
                         nextAttemptEpochMs = fields["next"]?.toLong() ?: 0L,
                         replyMarkup = fields["markup"].orEmpty().ifBlank { null },
+                        dependsOnId = fields["depends"].orEmpty().ifBlank { null },
                     )
                 }.getOrNull()?.let { entries[id] = it }
             }
@@ -99,7 +171,8 @@ class DiskUploadQueue(private val journal: File) {
         "{\"op\":\"$op\",\"id\":\"${escape(entry.id)}\",\"kind\":\"${entry.kind}\"," +
             "\"file\":\"${escape(entry.filePath.orEmpty())}\",\"text\":\"${escape(entry.text)}\"," +
             "\"attempts\":\"${entry.attempts}\",\"next\":\"${entry.nextAttemptEpochMs}\"," +
-            "\"markup\":\"${escape(entry.replyMarkup.orEmpty())}\"}",
+            "\"markup\":\"${escape(entry.replyMarkup.orEmpty())}\"," +
+            "\"depends\":\"${escape(entry.dependsOnId.orEmpty())}\"}",
     )
 
     private fun appendRaw(line: String) {
@@ -123,7 +196,8 @@ class DiskUploadQueue(private val journal: File) {
                         "{\"op\":\"PUT\",\"id\":\"${escape(entry.id)}\",\"kind\":\"${entry.kind}\"," +
                             "\"file\":\"${escape(entry.filePath.orEmpty())}\",\"text\":\"${escape(entry.text)}\"," +
                             "\"attempts\":\"${entry.attempts}\",\"next\":\"${entry.nextAttemptEpochMs}\"," +
-                            "\"markup\":\"${escape(entry.replyMarkup.orEmpty())}\"}\n",
+                            "\"markup\":\"${escape(entry.replyMarkup.orEmpty())}\"," +
+                            "\"depends\":\"${escape(entry.dependsOnId.orEmpty())}\"}\n",
                     )
                 }
                 writer.flush()
