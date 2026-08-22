@@ -1,107 +1,147 @@
-# Remote Study Android debug prototype
+# FocusMonitor2 Telegram student app
 
-학생폰 카메라로 책과 자리 판정 구역을 보여 주고, 선생님폰과 1:1로 근거리 소통하는 **비배포 Android debug 프로토타입**입니다. 스토어 배포·운영용 release 앱이 아니며, 1차 범위는 두 Android 기기의 근거리 연결입니다.
+선생님용 Android 앱과 Nearby 연결을 제거하고, 학생 앱이 텔레그램 봇으로 사진·상태를 보내며 명령을 받는 개인용 Android 프로토타입입니다. 선생님은 텔레그램만 사용합니다.
 
-## 현재 실행 화면
+## 동작
 
-1. 학생 앱은 별도 배치 조작 없이 카메라 준비 즉시 시작할 수 있습니다. 선생님 앱의 `1·2·3배 비교`를 누르면 학생폰이 각 배율에서 자동 초점 완료를 기다려 촬영합니다. 선생님은 세 사진을 확대 비교해 배율을 고르고, 이어서 그 실제 배율 사진 위의 노란 영역을 이동하거나 네 모서리를 끌어 책 범위를 정합니다.
-2. 학생폰과 선생님폰이 서로 발견되면 이 개인용 프로토타입은 Nearby 연결 요청을 양쪽에서 자동 승인합니다.
-3. 학생 앱은 기본 `sensorLandscape` 가로 화면으로 고정되며 카메라 전체 화면 위 왼쪽에 좁은 상태 카드, 오른쪽에 연결 상태, 아래 한 줄 접이식 메뉴를 둡니다. 양쪽 앱의 조작 메뉴는 접으면 오른쪽 아래 `⋮` 버튼 하나만 남습니다. 선생님은 설정에서 시간·촬영 간격·판정 감도·알림 사용/무음·재알림 제한을 변경할 수 있습니다.
-4. 타이머 시작·일시정지·재개·처음부터는 선생님 앱만 제어합니다. 선생님 제어 버튼은 학생 상태에 따라 자동으로 바뀌며 시작 시 저장된 설정을 먼저 전달하고 항상 첫 명상 사이클부터 진행합니다. 학생의 음성 시작·정지 명령은 타이머를 변경하지 않습니다.
-5. 학생폰의 monotonic clock으로 기본 `명상 5분 → 공부 40분 → 휴식 15분`을 진행하고 상태를 선생님폰에 동기화합니다.
-6. 공부 단계에서 기준 화면 차이와 자리 구역/책 영역의 프레임 간 미세 움직임을 함께 사용합니다. 복귀는 3개 연속 프레임으로 확인하고 동일 경고는 기본 5분 동안 재발송하지 않습니다. 연결 장애는 자리 비움으로 해석하지 않습니다.
-7. 명상·공부 중 촬영은 `1배 전체 썸네일`과 `선택한 1/2/3배 책 상세`로 이원화됩니다. 1배 썸네일은 전체 `4:3` 프레임을 회전·픽셀화하지 않고 `1600px/JPEG 85`로 만들어 얼굴과 눈의 움직임을 확인하면서 반복 전송 부담을 제한합니다. 상세 촬영은 선택 배율로 전환한 뒤 PreviewView와 같은 좌표계의 책 중심에 초점을 요청하고, 초점 완료 결과를 최대 설정 시간까지 기다립니다. 실패하면 한 번 재시도하며 그래도 실패하면 불분명한 사진을 보내지 않고 오류를 표시합니다. 비교·영역 설정 사진은 최대 4000px/JPEG 95로 생성합니다. 상세 촬영 뒤 즉시 1배로 복귀하고 줌 전환 중에는 움직임 분석을 중지합니다. 학생폰은 실제 적용 해상도를 회신하고, 50MP가 CameraX에 공개되지 않거나 bind가 실패하면 12MP로 복구합니다. 썸네일만 자동 전송하며 상세 ROI는 사진을 눌렀을 때 전송합니다.
-   파일은 Nearby의 실제 전송 완료 뒤에만 전송됨으로 표시합니다. 썸네일은 전송 중 1장과 대기 중 최신 1장만 유지하며, 15초간 바이트 진행이 없으면 취소하고 최신 항목으로 교체합니다. 실패하면 연결 중 2초 간격으로 최초 시도 뒤 최대 3회 재시도하고, 재연결하면 남은 ROI·음성 및 최신 썸네일을 다시 보냅니다.
-8. 선생님 가운데 1배 썸네일은 회전 없이 비율을 유지한 `FIT_CENTER`로 전체가 보입니다. 책 상세·비교·영역 설정 사진만 180도 변환해 표시하며, 영역 좌표를 저장할 때 카메라 좌표로 되돌립니다. 비교 화면과 전체화면 상세 ROI는 손가락 확대·이동을 지원합니다. 최근 썸네일은 최대 12개이며 메모리에는 480px 미리보기로 축소 보관합니다.
-9. 두 앱 모두 세로·가로 화면을 지원하며 회전 중 학생 세션과 책 영역을 유지합니다.
-10. Android 13 이상 학생폰은 하나의 `AudioRecord` 입력을 segmented `SpeechRecognizer`에 계속 공급해 시스템 마이크 재시작음을 반복하지 않습니다. 한국어 정확도를 위해 시스템 음성서비스를 우선하고 오프라인 인식을 강제하지 않으며, 후보 문장과 힌트 어휘를 넓혔습니다. 정확한 partial result를 즉시 처리하고 짧은 endpoint 힌트를 사용하며, S23 시험에서 `풀었어`가 `벌써/벌써요`로 인식되는 경우도 문제 완료로 제한 허용합니다. `아빠 풀었어/아빠 벌써`도 메시지 모드로 들어가지 않고 즉시 문제 완료로 처리합니다. 세션 장애는 0.6/1.2/2.4초로 최대 3회만 자동 복구한 뒤 오류를 표시합니다. `아빠`만 단독으로 말하면 확인음 뒤 다음 발화를 메시지로 보내고, `아빠 녹음`은 이어지는 음성을 녹음해 자동 전송합니다.
-11. 학생은 최대 60초 음성 메시지를 보내고 선생님은 이를 재생할 수 있습니다. 선생님은 텍스트 또는 최대 60초 음성으로 답하며, 학생폰은 수신 즉시 확인음을 내고 텍스트 답변을 한국어 TTS로 읽거나 음성 답변을 자동 재생합니다. 학생의 텍스트·음성·`풀었어`는 모두 선생님 대화 기록에 들어가며, 열린 대화창도 즉시 갱신되고 새 메시지는 Android 알림으로 표시됩니다. 실시간 통화는 아닙니다.
-12. 선생님 앱의 `처음부터·재연결`은 이전 Nearby 세대와 payload ID를 폐기하고, 타이머·문제 수·사진 전송 상태만 초기화한 뒤 자동 재검색합니다. 시간·책 영역·카메라 설정은 유지합니다. 학생 앱에는 세션을 유지한 채 연결만 새로 만드는 `재연결` 버튼이 있습니다. 연결 재시작은 무선 장치 정리를 먼저 끝내고 2·4·8·16초 간격으로 후퇴하며, 성공하면 다시 2초부터 시작합니다. 선생 앱은 연결 중 foreground service를 사용해 다른 앱을 보는 동안에도 같은 Activity 프로세스의 Nearby 수신·사진 저장·메시지 알림을 유지합니다.
+- 학생 화면이 보이는 상태에서 카메라·마이크·알림 권한을 한 번 승인하면 `camera|microphone|dataSync` foreground service가 시작됩니다. 화면을 끄거나 홈 버튼으로 다른 앱을 열어도 계속 동작하지만, 갤럭시 최근 앱 화면에서 학생 앱을 위로 밀어 제거하면 실행 중 회차를 `PAUSED`로 저장한 뒤 서비스·마이크·카메라·텔레그램 폴링이 함께 종료되고 자동 재시작하지 않습니다. 앱을 다시 열거나 서비스가 재시작되면 저장한 남은 시간 그대로 일시정지 상태를 복원하며, 꺼져 있던 시간은 차감하지 않습니다. 선생님이 `/resume`을 보내야 타이머가 다시 흐릅니다.
+- 공부 시작/일시정지/재개/종료는 텔레그램의 `/start`, `/begin`, `/pause`, `/resume`, `/stop`으로만 제어합니다. `/start`는 비활성 상태에서 저장된 기본값으로 시작하고, `/begin 0 40 15`는 기존 회차가 있으면 종료한 뒤 명상 0분·공부 40분·휴식 15분의 새 회차를 원자적으로 시작합니다.
+- 기본 후면 카메라 원본을 10초마다 한 장만 촬영합니다. 긴 변 2000px, JPEG q90으로 디스크에 보관하고 날짜가 바뀌면 전날 원본과 책 사진을 모두 지웁니다. 기존 1x→상세 줌 왕복 촬영은 사용하지 않습니다.
+- 6장을 모아 3×2 몽타주를 만들고 1분마다 `sendPhoto`로 전송합니다. 각 400px 셀에는 `HH:mm:ss`가 굽혀지고, 캡션의 `#N`은 세션 안에서 계속 증가합니다. 캡션은 마지막 사진을 촬영한 시점의 실제 단계(명상·공부·휴식)와 그 단계의 남은 시간을 표시합니다. 한 몽타주 안에서 단계가 바뀌면 `공부→휴식`처럼 경계도 함께 표시하며, 세션 시작 뒤 총경과 시간을 공부시간으로 잘못 표기하지 않습니다.
+- 매 몽타주의 1번 시점에는 1× 전체 사진을 자리 판정용으로 먼저 확보한 뒤 검증된 물리 3× YUV 원본을 한 장 추가합니다. 첫 칸에는 `3×`가 표시되고 1번 버튼은 크롭하지 않은 3× 전체 원본을, 2~6번 버튼은 1× 책 영역 크롭을 문서로 보냅니다. 3×는 버튼을 누를 때만 전송하고 실패 시 1×로 대체합니다.
+- `/b 14:03`, `/b 14:03:20`, `/b 14:03-14:05`, `/b -5`로 원본의 책 영역을 요청합니다. 상세 사진은 최대 8장이고, 텔레그램 재압축을 피하도록 오직 `sendDocument`를 사용합니다.
+- `/index`는 현재 세션 몽타주 번호와 시각 범위를 한 메시지로 보냅니다. 세션 종료 요약은 전송 후 고정됩니다.
+- 자리 이탈·복귀·책 움직임 없음·움직임 재개·`풀었어`·학생 음성 인식 메시지와 단계 전환 알림은 몽타주를 기다리지 않습니다. 텍스트 전용 업로드 작업을 사진·문서 작업과 분리해, 큰 사진 한 장의 업로드가 진행 중이어도 중요한 상태 메시지를 별도 연결로 전송합니다.
+- 일반 텔레그램 텍스트는 학생폰에서 확인음 뒤 한국어 TTS로 읽습니다. `/`로 시작하는 알 수 없는 입력에는 명령 도움말을 보냅니다.
+- `/menu`를 보내면 시작·일시정지·계속·다음 단계·종료·새 회차·상태·최근 사진·초점·카메라 진단·시간 설정 버튼이 열립니다. 시간 프리셋 버튼은 진행 중 값을 조용히 바꾸는 버튼이 아니라 기존 회차를 종료하고 선택한 조합으로 새 회차를 시작하는 버튼입니다. `/` 입력 시 텔레그램 명령 추천 목록도 표시됩니다.
+- `/area`는 한 장의 전체 사진을 기준으로 A–J, 1–10의 10×10 격자를 표시합니다. `/area D2 H5`처럼 왼쪽 위 칸과 오른쪽 아래 칸을 보내면 같은 사진 위에 실제 저장 범위를 빨간 테두리로 표시하고, `확정`을 누른 뒤부터 그 좌표를 사용합니다. 새 격자를 열면 이전 확인 버튼은 거부하므로 서로 다른 사진의 좌표가 섞이지 않습니다.
+- 책 상세사진은 기본 180° 회전합니다. `/rotate` 버튼 메뉴 또는 `/rotate 0|90|180|270`으로 바꾸면 이후 숫자 버튼과 `/b` 상세사진에 즉시 적용됩니다. 전체 썸네일과 영역 설정 격자는 회전하지 않습니다.
+- `/camera`는 S23 카메라 진단 메뉴입니다. `/camera info`는 논리·물리 렌즈 ID, 센서 크기·초점거리로 계산한 화각 배율, 최대 JPEG·YUV 크기를 보냅니다. `/camera test`는 기본 후면 A와 약 3× 물리 렌즈 B를 순서대로 촬영해 재압축 없는 문서 원본으로 보냅니다. B는 CameraX JPEG를 쓰지 않고 Camera2에서 논리 카메라를 연 뒤 물리 ID가 지정된 최대 YUV 프레임을 받아 JPEG q95로 변환하며, CaptureResult의 물리 ID·초점거리로 실제 렌즈 전환을 검증합니다. 비교 뒤에는 기본 후면 CameraX 카메라와 움직임 분석 복구를 시도하고, 실패하면 2초 간격으로 다시 연결합니다.
+- 학생 확인음은 알림 볼륨이 아닌 미디어 볼륨을 사용합니다. TTS는 설치된 한국어 로컬 음성 중 품질 우선으로 선택하고 미디어 출력·속도 0.88·기본 피치로 읽습니다.
+- 명상·공부·쉬는 시간 시작은 알람 음량 경로의 큰 효과음과 한국어 음성으로 안내합니다. 텔레그램에도 각 경계에서 `[전환 알림]`을 텍스트 전용 업로드 작업으로 보내며 실제 발생 시각과 다음 전환 예정 시각을 함께 기록합니다. 쉬는 시간이 끝나면 다음 공부 시간을 `복귀 대기`로 멈추고 30초마다 복귀 안내를 반복합니다. 학생이 `시작할게/시작할께/시작할게요/공부 시작`이라고 말하거나 선생님이 `/resume`을 보내면 확인 안내 후 다음 공부 시간을 시작합니다.
 
-## 모듈과 I/O
+## 텔레그램 설정 — 학생폰만으로 가능
 
-| 모듈 | 입력 | 출력 | 핵심 불변조건 |
-|---|---|---|---|
-| `core-domain` | session command, monotonic elapsed time | immutable `SessionSnapshot` | 네트워크·Android·wall clock과 무관, command/event ID 중복 무시 |
-| `core-protocol` | typed `StudyMessage` | 32 KiB 이하 versioned bytes | 크기·enum·trailing bytes 검증 |
-| `core-sync` | `StudyMessage`, 연결 상태, elapsed time, inbound bytes | encoded 전송, 한 번만 노출되는 inbound message, pending 목록 | ACK 전 재시도, inbound 중복 제거, snapshot coalesce; outbox와 수신 ID는 메모리에만 존재 |
-| `activity-detection` | `setActive`, 기준 차이·자리 미세 움직임·책 움직임 | `AWAY`, `NO_BOOK_MOVEMENT` 및 두 복구 이벤트 | 3프레임 복귀 확인, hysteresis, 재알림 cooldown, stale time 무시 |
-| `transport-api` | bytes/file, approve/reject | connection/message/file event | 개인용 앱에서 발견된 상대 요청 자동 승인 |
-| `transport-nearby` | transport port 호출 | Nearby P2P point-to-point, payload별 file success/failure | UI와 Google Play services 타입 격리, 파일 완료 이벤트 exactly-once 방출 |
-| `camera-capture` | lifecycle, capture 요청, 배율·초점 대기 설정, baseline arm | `FrameObservation`, 1배 thumbnail, 1/2/3배 comparison·calibration·book ROI | Preview/ImageCapture/ImageAnalysis 동시 사용, 분석 1fps 이하, AF 완료 확인·1회 재시도, 상세 촬영 뒤 1x 복귀, 임시 원본과 종료 중 자산 cleanup |
-| `voice-command` | start/stop, AudioRecord PCM | segmented SpeechRecognizer의 제한된 한국어 command | Android 13+, 고정 버퍼, 자동 재시작 없음, 미지원 시 명시적 오류 |
-| `voice-message` | main-thread record/stop/cancel/play, output file | AAC `.m4a` `RecordedVoiceMessage`, playback callback | 최대 60초, `.part` 성공 후 commit, 취소·실패 파일 cleanup, recorder·player 각각 활성 작업 1개 |
-| `app-voice-lab` | 세 가지 Android 음성인식 방식, 실제 발화 | 인식 문장·명령 수·세션 수·오류 코드·복사 가능한 로그 | 학생 앱과 별도 설치되며 학생 앱 음성 동작을 변경하지 않음 |
-| `app-student` | touch/voice/teacher request, camera observation, teacher reply | authoritative session state, thumbnail/ROI, alert, student voice message, TTS/playback | 타이머·촬영·판정 기준은 학생폰 |
-| `app-teacher` | pairing approval, settings/start/media request, text/voice reply | concise state, 최근 썸네일 12개, 전체화면 ROI, notifications | 설정 후 첫 사이클 시작, 썸네일 자동 수신과 ROI 요청 전송 분리 |
+1. 텔레그램 `@BotFather`에서 개인 봇을 만들고 토큰을 복사합니다.
+2. 선생님 계정에서 새 봇을 열어 `/연결` 또는 `/connect`를 보냅니다.
+3. 학생 앱 첫 화면에 BotFather 토큰을 붙여넣고 `내 텔레그램 채팅 찾기`를 누릅니다.
+4. 앱이 표시한 텔레그램 이름·username·chat ID를 확인하고 `연결`을 누릅니다.
+5. 텔레그램에서 `학생폰 연결 완료` 메시지를 확인합니다. 이후 `/start`로 공부를 시작합니다.
 
-상세 계약은 [`docs/remote-study-mvp-system-design-v0.1.md`](docs/remote-study-mvp-system-design-v0.1.md), 장기 wire schema는 [`docs/remote-study-protocol-v1.proto`](docs/remote-study-protocol-v1.proto)에 있습니다. 현재 빌드는 코드 생성 도구를 강제하지 않도록 같은 개념의 수동 검증 codec을 사용합니다.
+학생폰에는 텔레그램 앱을 설치할 필요가 없습니다. 학생 앱이 Bot API에 직접 접속하며 텔레그램 앱은 선생님 폰에만 있으면 됩니다.
 
-기존 2배 좌표 계약 문서인 [`docs/book-detail-2x-contract.md`](docs/book-detail-2x-contract.md)의 중앙 crop 원칙을 1/2/3배 선택 배율에 일반화해 적용합니다.
+토큰은 Android Keystore에서 생성한 AES-GCM 키로 암호화되어 학생폰에만 저장됩니다. 설정 화면은 `/연결`을 보낸 개인 채팅 후보를 보여주기만 하며 명령을 실행하지 않습니다. 사용자가 이름과 ID를 승인한 뒤부터 해당 `chat_id` 화이트리스트가 적용됩니다. 학생 화면의 `텔레그램 연결 초기화`는 암호화 토큰과 기존 봇의 미전송 큐를 함께 삭제합니다.
 
-## 빌드와 테스트
+개발용으로는 커밋되지 않는 루트 `local.properties`에 미리 넣어 빌드할 수도 있습니다.
+
+```properties
+sdk.dir=/absolute/path/to/Android/sdk
+TELEGRAM_BOT_TOKEN=replace_with_real_token
+TELEGRAM_CHAT_ID=123456789
+```
+
+형식은 `local.properties.example`에도 있습니다. 런타임에 저장된 설정이 BuildConfig보다 우선합니다. 둘 다 비어 있으면 APK는 권한이나 촬영 서비스를 시작하지 않고 텔레그램 연결 화면만 표시합니다.
+
+`chat_id`가 다른 update는 명령 파싱 전에 버립니다. 앱은 시작할 때 기존 webhook을 해제한 뒤 `getUpdates(timeout=50)` 롱폴링을 하나만 실행하고, 각 명령 결과가 디스크 큐에 기록된 뒤에만 offset을 원자적으로 저장합니다.
+
+> `local.properties`로 미리 넣은 봇 토큰은 BuildConfig를 통해 APK 안에 들어가므로 공개 APK에 사용하지 마세요. GitHub 배포 APK는 토큰 없이 만들고 학생폰 최초 실행 설정을 사용합니다. chat ID 화이트리스트는 다른 채팅의 명령 실행을 막지만 유출된 토큰 자체를 보호하지는 않습니다.
+
+## 모듈 경계
+
+| 모듈 | 입력 | 출력/불변조건 |
+|---|---|---|
+| `telegram-report` | 1x JPEG, 촬영 시각·단계·남은 시간, 상태 변화, Telegram update | 실제 단계·경계를 표시하는 `sendPhoto` 몽타주와 `sendDocument` 상세 경로를 함수·큐 타입으로 분리; 한 JSONL durable queue를 텍스트·미디어 전용 worker가 안전하게 나눠 처리; 성공 ACK; 지수 backoff; 원자적 update offset |
+| `app-student` | 권한 승인, Telegram 명령, 카메라/음성 | foreground service가 세션·기본 단일 촬영·물리 렌즈 A/B 진단·판정·봇을 소유; Activity는 최신 전체 사진과 책 영역 편집만 담당 |
+| `core-domain` | monotonic session command | Android/네트워크와 무관한 `SessionSnapshot` |
+| `activity-detection` | 1fps 화면 변화량 | 이탈/복귀와 책 움직임 상태 변화; 기존 cooldown 유지 |
+| `voice-command` | 연속 한국어 음성 인식 | `풀었어/벌써` 문제 완료, `아빠` 다음 발화 메시지 |
+| `camera-capture`, `voice-message` | 기존 실기기 튜닝 코드 | 소스 변경 없이 보존; 새 Telegram 세션 촬영 경로에는 포함하지 않음 |
+
+삭제된 모듈은 `app-teacher`, `transport-nearby`, `transport-api`, `core-protocol`, `core-sync`입니다.
+
+## 디스크와 메모리
+
+- `files/telegram-report/upload-queue.jsonl`: PUT/RETRY/ACK append journal. append마다 fsync하고 주기적으로 atomic compaction합니다.
+- `files/telegram-report/update-offset.txt`: 명령 처리 성공 뒤 atomic replace합니다.
+- `files/telegram-report/originals`: 오늘 촬영한 1× 전체·책 크롭과 매분 첫 물리 3× 원본. 날짜가 바뀐 뒤 앱 시작·세션 시작·첫 촬영 시 전날 파일을 모두 삭제합니다. 비트맵/YUV 메모리는 처리 직후 해제하고 장기 보관은 파일로만 합니다.
+- 몽타주는 캔버스 한 장만 유지합니다. 셀마다 power-of-two sample decode → draw → 즉시 recycle합니다.
+- 미전송 몽타주·상세 파일은 새 세션 정리에서도 보호하며, 성공 응답을 받은 뒤에만 삭제합니다.
+
+## 빌드와 확인
 
 필요 환경은 JDK 17, Android SDK 35, build-tools 35.0.1입니다.
-
-다음 명령은 현재 포함된 모든 모듈의 JVM/Android unit-test task를 실행하고 두 debug APK를 조립합니다. 테스트 소스가 없는 모듈도 compile/test task로 통합 여부를 확인합니다.
 
 ```bash
 ./gradlew --no-daemon \
   :activity-detection:test \
   :core-domain:test \
-  :core-protocol:test \
-  :core-sync:test \
-  :transport-api:test \
-  :camera-capture:testDebugUnitTest \
-  :transport-nearby:testDebugUnitTest \
-  :voice-command:testDebugUnitTest \
-  :voice-message:testDebugUnitTest \
+  :telegram-report:testDebugUnitTest \
   :app-student:testDebugUnitTest \
-  :app-teacher:testDebugUnitTest \
+  :voice-command:testDebugUnitTest \
+  :camera-capture:testDebugUnitTest \
+  :voice-message:testDebugUnitTest \
   :app-voice-lab:testDebugUnitTest \
   :app-student:assembleDebug \
-  :app-teacher:assembleDebug \
-  :app-voice-lab:assembleDebug
+  :app-student:lintDebug \
+  :telegram-report:lintDebug
 ```
 
-Android 기기 또는 emulator가 연결된 경우 Camera asset processor의 instrumented test도 실행합니다. 이 테스트는 자산 분리와 원본 삭제를 검증하지만 실제 카메라 하드웨어 촬영 시험을 대신하지는 않습니다.
+Android 기기나 emulator가 연결돼 있으면 Keystore 암호화 저장·복호화·초기화 시험도 실행합니다.
 
 ```bash
-./gradlew --no-daemon :camera-capture:connectedDebugAndroidTest
+./gradlew --no-daemon \
+  :telegram-report:connectedDebugAndroidTest \
+  :app-student:connectedDebugAndroidTest
 ```
 
-### 현재 검증 결과 (2026-08-15)
+학생 APK는 `app-student/build/outputs/apk/debug/app-student-debug.apk`입니다. 선생님 APK는 더 이상 만들지 않습니다.
 
-- JVM/Android unit test 68개: 실패 0, 오류 0, skip 0
-- API 35 emulator camera instrumented test 1개: 통과
-- 학생/선생님/Nearby/camera/두 음성 모듈 Android lint: 오류 0
-- API 35 emulator에 두 debug APK 설치 및 cold launch 성공; 접이식 메뉴·설정 화면·세로/가로 회전·학생 카메라 화면 확인
-- 실제 두 Android 기기 사이의 Nearby 승인·재연결·사진/음성 왕복과 거리·발열 시험은 아직 실행하지 않음
+## 선생님 시간 원격조종
 
-APK:
+- `/settings` — 다음 회차 기본값과, 회차가 진행 중이면 실제 현재 상태·다음 전환 예정 시각까지 함께 확인
+- `/set 0 40 15` — 세션이 비활성일 때 다음 회차 기본값을 명상 0분·공부 40분·휴식 15분으로 저장. 진행 중이거나 일시정지된 회차가 있으면 적용하지 않고 `/begin` 또는 `/stop` 사용을 안내
+- `/begin 0 40 15` — 기존 회차가 있으면 명시적으로 종료하고, 세 값을 저장하는 작업과 새 회차 생성을 하나의 원자적 작업으로 처리한 뒤 첫 단계부터 시작
+- `/set countdown 0` — `/start`의 시작 대기시간을 0초로 설정(즉시 시작). 허용 범위 0~60초
+- `/start` — 회차가 비활성일 때 저장된 기본값으로 첫 단계부터 새 세션 시작
+- `/restart` — 진행 중 회차를 종료하고 저장된 설정으로 첫 단계부터 다시 시작
+- `/pause`, `/resume`, `/stop` — 일시정지·재개·종료
+- `/time 25` 또는 `/time 25:30` — 현재 단계의 남은 시간을 즉시 25분 또는 25분 30초로 변경
+- `/phase meditation`, `/phase study`, `/phase break` — 해당 단계의 전체 시간으로 즉시 이동. `명상`, `공부`, `휴식`도 사용 가능
+- `/phase study 10` — 공부 단계로 이동하면서 남은 시간을 10분으로 지정
+- `/next` — 다음 단계로 즉시 이동. 휴식에서 실행하면 학생 복귀 대기로 전환
+- `/status` — 다음 회차 기본 설정, 실제 현재 상태(시작 대기·명상·공부·휴식·일시정지·복귀 대기), 남은 시간, 다음 전환 예정 시각과 완료 문제 수를 한 번에 확인
+- `/focus` — 유지 중인 책 영역 초점을 해제하고 다음 촬영 전에 다시 맞춤
 
-- `app-student/build/outputs/apk/debug/app-student-debug.apk`
-- `app-teacher/build/outputs/apk/debug/app-teacher-debug.apk`
-- `app-voice-lab/build/outputs/apk/debug/app-voice-lab-debug.apk`
+시간 프리셋 버튼도 `/begin`과 같은 새 회차 명령입니다. 예를 들어 `0·40·15` 버튼을 누르면 기존 회차를 종료하고 해당 설정으로 새 회차를 시작합니다. 설정만 다음 회차용으로 저장하려면 세션이 비활성인 상태에서 `/set`을 사용합니다.
 
-두 실제 Android 기기에 각각 설치한 뒤 근거리 기기, Bluetooth, Wi-Fi, 위치(구형 Android), 카메라, 마이크, 알림 권한을 허용합니다. 같은 Wi-Fi에서 시험하되 Nearby Connections가 Bluetooth/BLE/Wi-Fi를 조합하므로 두 기기의 Bluetooth도 켭니다.
+모든 시간 명령은 Telegram `chat_id` 화이트리스트를 통과한 선생님 채팅에서만 실행됩니다. 다음 회차 기본값과 현재 회차 snapshot은 학생폰에 저장됩니다. 최근 앱 제거, 서비스 재시작 또는 프로세스 복원 시 실행 중이던 회차는 `PAUSED`로 돌아오며 종료돼 있던 시간은 남은 시간에서 빼지 않습니다. 복원 메시지와 `/status`를 확인한 뒤 `/resume`으로 계속합니다.
 
-## 현재 한계와 기기 검증 항목
+새 몽타주 아래에는 촬영 순서대로 `1 2 3 4 5 6` 버튼이 붙습니다. 버튼을 누르면 해당 칸의 촬영 시각에 저장한 고해상도 책 영역을 `sendDocument`로 전송합니다. 이미 전송된 과거 몽타주에는 버튼이 소급해서 생기지 않으므로 `/b HH:MM:SS`를 사용합니다.
 
-- 설계 사용 거리는 100m 이내지만 **Nearby 연결이 100m를 보장하지 않습니다**. 벽, 전파 간섭, 기기 안테나, 절전 정책에 따라 훨씬 짧아질 수 있으므로 실제 학생폰·선생님폰 두 대로 연결·재연결·파일 전송을 거리별 시험해야 합니다.
-- `core-sync`의 reliable outbox와 inbound dedup 기록은 in-memory입니다. 연결이 잠시 끊긴 동안에는 재시도하지만 앱 프로세스가 종료되면 pending message와 dedup 기록이 사라집니다. Room 같은 영속 outbox는 아직 없습니다.
-- 두 실제 기기에서 70분 이상 세션, 10초 캡처, 화면 켜짐/꺼짐, background 전환을 함께 시험해야 합니다.
-- 기준 단말뿐 아니라 실제 사용할 제조사·기종별로 CameraX use-case 동시 bind, 해상도, EXIF 회전, 초점, JPEG 처리 시간과 메모리를 확인해야 합니다.
-- 40분 이상 촬영에서 배터리 감소, 발열, thermal throttling, camera stall을 측정하지 않았습니다. 목표치를 확정하려면 실기기 soak test가 필요합니다.
-- 자리 차이 `0.18`, 책 움직임 `0.012`, 10초/30초 값은 초기값입니다. 실제 책상 구도, 조명 변화, 그림자, 손 위치를 포함한 영상으로 오탐·미탐을 측정하고 기기/환경별 임계값을 보정해야 합니다.
-- 외부 3G/5G relay, 프로세스 종료 복구, 장기 보관, 다중 학생은 구현 범위 밖입니다.
+평상시 카메라는 기본 후면 JPEG를 한 번만 촬영합니다. 몽타주용 전체 화면은 긴 변 2,000px로 별도 축소하고, 책 영역은 원본 JPEG에서 먼저 잘라 긴 변 최대 4,000px/JPEG 95로 저장합니다. 최초 촬영 전에 책 영역 중앙 AF를 최대 두 번 시도하고 성공한 초점은 자동취소 없이 유지합니다. 책 영역 변경·카메라 재연결·`/focus` 명령 때만 다시 맞춥니다.
 
-## 구현 기준
+책 영역을 바꾼 뒤 변경 전에 찍은 사진을 다시 요청하면 좌표 정확성을 우선해 2,000px 전체 보관본에서 새 영역을 다시 자릅니다. 따라서 과거 사진은 새 영역으로 정확히 나오지만, 변경 뒤 촬영되는 4,000px급 책 캐시보다 해상도가 낮을 수 있습니다.
 
-- Gradle 8.11.1 / Android Gradle Plugin 8.6.1 / Kotlin 2.1.21
-- compileSdk/targetSdk 35, minSdk 26, Java/Kotlin 17
-- CameraX 1.5.3
-- Google Play services Nearby 19.3.0
-- framework Views 기반의 가벼운 UI
+`/camera test`는 진단용이며 평상시 촬영 렌즈를 영구 변경하지 않습니다. 물리 렌즈 특성의 `초점거리 ÷ 센서 너비`를 가장 큰 센서(기본 렌즈 기준)와 비교해 화각 배율을 계산하고, 2.4–3.8× 범위에서 3×에 가장 가까운 후보만 B로 선택합니다. B는 `OutputConfiguration.setPhysicalCameraId`와 `createCaptureRequest(..., physicalIds)`를 모두 적용한 Camera2 YUV 경로입니다. B 캡션의 `activePhysical`, `physicalResults`, `resultFocal` 중 물리 ID 또는 기대 초점거리가 확인되어야만 `물리 약 3× 확인됨`으로 표시합니다. 확인할 수 없으면 사진은 참고용으로 보내되 성공으로 취급하지 않습니다. 후보가 없거나 세션 구성·촬영에 실패하면 오류를 텔레그램으로 알리고 기본 CameraX 카메라를 다시 연결합니다. A/B 문서의 화각과 확인 메타데이터를 비교하고, S23에서 렌즈를 손가락으로 번갈아 가리는 시험까지 통과한 뒤 다음 버전에서 상시 3× 상세 촬영 여부를 정합니다.
 
-FocusMonitor 소스는 라이선스가 없어 복사하지 않았습니다. 비대 Activity, 인증 없는 평문 HTTP, polling, 전체 프레임 축소 저장 같은 실패 원인만 반면교사로 삼았습니다.
+## 실기기 완료 시험
+
+아래 항목은 토큰·chat ID가 들어간 APK와 실제 S23에서 확인해야 합니다.
+
+1. `/begin 0 40 15` 뒤 39:59까지 공부, 40:00 경계에서 휴식 전환을 확인하고, 몽타주 캡션의 실제 단계·마지막 사진 남은 시간·경계와 연속된 `#N`을 확인.
+2. 기내모드 3분 뒤 복구하고 밀린 JSONL 큐 전부 수신 확인.
+3. 네 가지 `/b` 요청이 30초 안에 도착하고 상세 파일이 Telegram 문서로 표시되는지 확인.
+4. 미전송 상태에서 프로세스를 강제 종료하거나 최근 앱에서 제거한 뒤 앱을 다시 열어 큐와 몽타주 번호가 이어지고, 회차가 `PAUSED`로 복원되며 꺼져 있던 시간은 차감되지 않는지 확인. `/resume` 전에는 타이머가 흐르지 않아야 합니다.
+5. 40분 동안 `adb logcat -s RemoteStudyService`를 저장하고 `camera_stall` 0회 및 `thermal_status` 추이를 확인.
+6. `/camera info` 뒤 `/camera test`를 한 번 실행해 A/B 문서가 모두 오고, 3× 렌즈를 가렸을 때 B만 어두워지며 이후 10초 촬영이 다시 이어지는지 확인.
+
+현재 자동 검증은 Telegram parser/JSONL 재시작·ACK/backoff 단위 테스트, 학생 APK assemble, 학생/Telegram 모듈 lint 오류 0까지 포함합니다. 실제 Bot API 왕복과 40분 발열·카메라 스톨은 비밀값과 실기기가 없으면 자동 검증할 수 없습니다.
+
+## 이전 선생 앱과 달라진 점
+
+- 일반 텔레그램 텍스트는 학생폰에서 짧은 확인음 뒤 한국어 TTS로 즉시 읽습니다.
+- `풀었어/벌써`와 `아빠` 다음 발화는 텔레그램 텍스트 메시지로 즉시 전송됩니다.
+- 대화 기록과 새 메시지 알림은 별도 선생 앱 대신 텔레그램 채팅과 텔레그램 알림이 담당합니다.
+- 현재 Telegram 버전은 학생의 실제 녹음 음성파일 전송과 선생님의 Telegram 음성메시지 자동재생을 지원하지 않습니다.
+- 시간은 기본 명상 5분·공부 40분·휴식 15분입니다. 텔레그램에서 다음 회차 설정, `/begin` 원자적 새 회차 시작, 현재 남은 시간 변경과 단계 이동이 가능하며 `/status`에서 기본 설정·실제 상태·다음 전환을 함께 확인합니다. 촬영 간격은 10초로 고정되어 있습니다.
+- 책 영역은 학생 화면뿐 아니라 Telegram `/area`의 10×10 격자와 빨간 선택 테두리로도 설정할 수 있습니다.

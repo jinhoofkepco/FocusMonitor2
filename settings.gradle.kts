@@ -18,15 +18,11 @@ rootProject.name = "RemoteStudy"
 
 include(
     ":app-student",
-    ":app-teacher",
     ":activity-detection",
     ":camera-capture",
     ":core-domain",
-    ":core-protocol",
-    ":core-sync",
-    ":transport-api",
-    ":transport-nearby",
     ":voice-command",
     ":voice-message",
     ":app-voice-lab",
+    ":telegram-report",
 )

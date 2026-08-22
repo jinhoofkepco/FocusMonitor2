@@ -1,0 +1,3 @@
+sdk.dir=/path/to/Android/sdk
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=0
